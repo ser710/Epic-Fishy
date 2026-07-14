@@ -1,0 +1,3273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Epic Fishy</title>
+<meta name="description" content="Track your fishing gear, weather, tides, live radar, catches, spots, and a shared community in one place." />
+
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#070f0f" />
+<link rel="icon" href="icons/icon-192.png" />
+<link rel="apple-touch-icon" href="icons/icon-180.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Epic Fishy" />
+
+<script src="https://cdn.tailwindcss.com"></script>
+
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?deps=react@18.3.1,react-dom@18.3.1"
+  }
+}
+</script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+<style>
+  html, body { margin: 0; padding: 0; background: #020707; height: 100%; }
+  #root { min-height: 100vh; display: flex; align-items: flex-start; justify-content: center; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div style="color:#9fb8b5;text-align:center;padding:60px 20px;font-family:sans-serif;font-size:14px;">
+    Loading Epic Fishy...
+  </div>
+</div>
+
+<script type="module" src="firebase-bootstrap.js"></script>
+
+<script>
+
+    window.storage = {
+      async get(key, shared) {
+        const k = (shared ? "shared:" : "personal:") + key;
+        const raw = localStorage.getItem(k);
+        if (raw === null) throw new Error("key not found");
+        return { key, value: raw, shared: !!shared };
+      },
+      async set(key, value, shared) {
+        const k = (shared ? "shared:" : "personal:") + key;
+        localStorage.setItem(k, value);
+        return { key, value, shared: !!shared };
+      },
+      async delete(key, shared) {
+        const k = (shared ? "shared:" : "personal:") + key;
+        localStorage.removeItem(k);
+        return { key, deleted: true, shared: !!shared };
+      },
+      async list(prefix, shared) {
+        const tag = shared ? "shared:" : "personal:";
+        const pfx = tag + (prefix || "");
+        const keys = Object.keys(localStorage)
+          .filter((k) => k.startsWith(pfx))
+          .map((k) => k.slice(tag.length));
+        return { keys, prefix, shared: !!shared };
+      },
+    };
+
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("sw.js").catch(() => {});
+      });
+    }
+
+    // Watchdog: if the app hasn't mounted within 9s, show a clear message
+    // instead of leaving the screen blank so problems are easy to diagnose.
+    window.__tackleAppMounted = false;
+    window.addEventListener("error", function (e) {
+      showLoadError("A script failed to load or run (" + (e.message || "unknown error") + ").");
+    });
+    setTimeout(function () {
+      if (!window.__tackleAppMounted) {
+        showLoadError("The app is taking too long to start. This usually means a required script " +
+          "(React, icons, or the code translator) couldn't load.");
+      }
+    }, 9000);
+
+    function showLoadError(detail) {
+      if (window.__tackleAppMounted) return;
+      var root = document.getElementById("root");
+      if (!root || root.dataset.errorShown) return;
+      root.dataset.errorShown = "1";
+      root.innerHTML =
+        '<div style="color:#f5faf9;background:#0d1e1d;border:1px solid #1f4a47;' +
+        'padding:20px;border-radius:12px;max-width:340px;margin:60px auto;' +
+        'font-family:sans-serif;font-size:14px;line-height:1.6;text-align:center;">' +
+        '<strong>Couldn\'t load Epic Fishy</strong><br/><br/>' +
+        detail + "<br/><br/>" +
+        'Try: reloading, switching Wi-Fi/mobile data, turning off Data Saver, ' +
+        'or opening in an Incognito tab.' +
+        "</div>";
+    }
+
+</script>
+
+<script type="text/babel" data-presets="react" data-type="module">
+import React from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  Fish, Circle, Disc, Weight, Anchor, Wrench, Package, Plus, X, Search,
+  Trash2, AlertTriangle, ChevronLeft, Minus, Wind, Droplets, Gauge,
+  Sunrise, Sunset, Waves, MapPin, RefreshCw, CloudRain, Sun, Cloud,
+  CloudFog, CloudSnow, CloudLightning, TrendingUp, TrendingDown, ArrowUp,
+  Ruler, Scale, Trophy, Calendar, Pencil, Camera, ChevronDown, ExternalLink, Settings
+} from "lucide-react";
+
+const CATEGORIES = [
+  { id: "lures", label: "Lures & Baits", icon: Fish },
+  { id: "hooks", label: "Hooks", icon: Circle },
+  { id: "line", label: "Line & Leader", icon: Disc },
+  { id: "weights", label: "Weights & Sinkers", icon: Weight },
+  { id: "rods", label: "Rods & Reels", icon: Anchor },
+  { id: "tools", label: "Tools", icon: Wrench },
+  { id: "other", label: "Other", icon: Package },
+];
+
+const CONDITIONS = ["Good", "Needs replacing", "Rusty / damaged"];
+const STORAGE_KEY = "tackle-items-v1";
+const LOCATION_KEY = "tackle-location-v1";
+const CATCH_KEY = "catch-records-v1";
+const NICKNAME_KEY = "tackle-community-nickname";
+const LICENSE_KEY = "tackle-license-v1";
+const MAIN_VIEWS = ["tackle", "conditions", "catches", "spots", "community", "knots"];
+
+function weightToLb(value, unit) {
+  const v = Number(value) || 0;
+  return unit === "kg" ? v * 2.20462 : v;
+}
+
+function lengthToIn(value, unit) {
+  const v = Number(value) || 0;
+  return unit === "cm" ? v / 2.54 : v;
+}
+
+function uid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function compressImage(file, maxDim = 640, quality = 0.62) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxDim) {
+          height = Math.round(height * (maxDim / width));
+          width = maxDim;
+        } else if (height >= width && height > maxDim) {
+          width = Math.round(width * (maxDim / height));
+          height = maxDim;
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = () => reject(new Error("Couldn't read that image"));
+      img.src = e.target.result;
+    };
+    reader.onerror = () => reject(new Error("Couldn't read that file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function haversineMiles(lat1, lon1, lat2, lon2) {
+  const R = 3958.8;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function weatherCodeInfo(code) {
+  if (code === 0) return { label: "Clear", Icon: Sun };
+  if ([1, 2].includes(code)) return { label: "Partly cloudy", Icon: Sun };
+  if (code === 3) return { label: "Overcast", Icon: Cloud };
+  if ([45, 48].includes(code)) return { label: "Foggy", Icon: CloudFog };
+  if ([51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82].includes(code))
+    return { label: "Rain", Icon: CloudRain };
+  if ([71, 73, 75, 77, 85, 86].includes(code))
+    return { label: "Snow", Icon: CloudSnow };
+  if ([95, 96, 99].includes(code))
+    return { label: "Thunderstorms", Icon: CloudLightning };
+  return { label: "Mixed", Icon: Cloud };
+}
+
+function compassDir(deg) {
+  const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+  return dirs[Math.round(deg / 22.5) % 16];
+}
+
+function capitalize(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function getPressureTrend(weather) {
+  try {
+    const times = weather.hourly.time;
+    const pressures = weather.hourly.pressure_msl;
+    const nowIdx = times.findIndex((t) => t === weather.current.time?.slice(0, 13) + ":00");
+    const refIdx = nowIdx >= 3 ? nowIdx - 3 : 0;
+    if (nowIdx < 0) return null;
+    const diff = pressures[nowIdx] - pressures[refIdx];
+    return diff > 0.8 ? "rising" : diff < -0.8 ? "falling" : "steady";
+  } catch (e) {
+    return null;
+  }
+}
+
+// --- Solunar estimate: moon phase + approximate major/minor feeding windows ---
+// Moonrise/transit calculations are approximated (not full astronomical
+// precision) using the moon's age relative to the local solar noon, which is
+// the standard simplification hobby solunar calculators use.
+function getMoonPhase(date) {
+  const synodicMonth = 29.530588853;
+  const knownNewMoon = Date.UTC(2000, 0, 6, 18, 14); // a known new moon reference point
+  const daysSince = (date.getTime() - knownNewMoon) / 86400000;
+  const age = daysSince % synodicMonth;
+  const ageNorm = age < 0 ? age + synodicMonth : age;
+  const illumination = Math.round((1 - Math.cos((2 * Math.PI * ageNorm) / synodicMonth)) * 50);
+
+  let name, emoji;
+  if (ageNorm < 1.5 || ageNorm > synodicMonth - 1.5) { name = "New Moon"; emoji = "🌑"; }
+  else if (ageNorm < 6.4) { name = "Waxing Crescent"; emoji = "🌒"; }
+  else if (ageNorm < 8.4) { name = "First Quarter"; emoji = "🌓"; }
+  else if (ageNorm < 13.3) { name = "Waxing Gibbous"; emoji = "🌔"; }
+  else if (ageNorm < 16.3) { name = "Full Moon"; emoji = "🌕"; }
+  else if (ageNorm < 21.2) { name = "Waning Gibbous"; emoji = "🌖"; }
+  else if (ageNorm < 23.2) { name = "Last Quarter"; emoji = "🌗"; }
+  else { name = "Waning Crescent"; emoji = "🌘"; }
+
+  return { ageDays: ageNorm, illumination, name, emoji };
+}
+
+function getSolunarPeriods(sunriseIso, sunsetIso, moonAgeDays) {
+  if (!sunriseIso || !sunsetIso) return null;
+  const sunrise = new Date(sunriseIso);
+  const sunset = new Date(sunsetIso);
+  const solarNoon = new Date((sunrise.getTime() + sunset.getTime()) / 2);
+
+  // Moon transit drifts ~50.5 minutes later each day relative to the sun, starting near solar noon at new moon.
+  const driftMs = moonAgeDays * 50.5 * 60000;
+  const moonTransit = new Date(solarNoon.getTime() + driftMs);
+
+  const H = 3600000;
+  const major1 = { start: new Date(moonTransit - H), end: new Date(moonTransit.getTime() + H) };
+  const major2Center = new Date(moonTransit.getTime() + 12.42 * H);
+  const major2 = { start: new Date(major2Center.getTime() - H), end: new Date(major2Center.getTime() + H) };
+  const minor1Center = new Date(moonTransit.getTime() - 6.2 * H);
+  const minor1 = { start: new Date(minor1Center.getTime() - 0.5 * H), end: new Date(minor1Center.getTime() + 0.5 * H) };
+  const minor2Center = new Date(moonTransit.getTime() + 6.2 * H);
+  const minor2 = { start: new Date(minor2Center.getTime() - 0.5 * H), end: new Date(minor2Center.getTime() + 0.5 * H) };
+
+  return { majors: [major1, major2], minors: [minor1, minor2] };
+}
+
+function itemMatchesKeywords(item, keywords) {
+  const hay = `${item.name} ${item.spec} ${item.notes || ""}`.toLowerCase();
+  return keywords.some((k) => hay.includes(k.toLowerCase()));
+}
+
+function buildRecommendations(weather, tide) {
+  const recs = [];
+  const cur = weather?.current;
+  if (!cur) return recs;
+
+  const now = new Date();
+  const sunrise = weather.daily?.sunrise?.[0] ? new Date(weather.daily.sunrise[0]) : null;
+  const sunset = weather.daily?.sunset?.[0] ? new Date(weather.daily.sunset[0]) : null;
+  const minutesFrom = (d) => (d ? Math.abs(now - d) / 60000 : Infinity);
+  const nearSunrise = minutesFrom(sunrise) < 60;
+  const nearSunset = minutesFrom(sunset) < 60;
+  const trend = getPressureTrend(weather);
+  const cloud = cur.cloud_cover ?? 50;
+  const wind = cur.wind_speed_10m ?? 0;
+  const temp = cur.temperature_2m;
+  const skyLabel = weatherCodeInfo(cur.weather_code).label;
+
+  if ((nearSunrise || nearSunset) && wind < 14) {
+    recs.push({
+      title: "Low-light topwater window",
+      reason: `${nearSunrise ? "Sunrise" : "Sunset"} plus calm wind (${Math.round(wind)} mph) — fish push shallow to feed on top.`,
+      keywords: ["topwater", "popper", "walking bait", "buzzbait", "frog"],
+    });
+  }
+
+  if (trend === "falling") {
+    recs.push({
+      title: "Reaction baits before the front",
+      reason: "Falling pressure usually fires fish up before a system moves in — moving baits get eaten.",
+      keywords: ["spinnerbait", "chatterbait", "crankbait", "swim jig", "lipless"],
+    });
+  } else if (trend === "rising") {
+    recs.push({
+      title: "Slow down and downsize",
+      reason: "Rising pressure after a front puts fish in a tight, finicky mood — go smaller and slower.",
+      keywords: ["ned rig", "drop shot", "finesse", "jig", "soft plastic", "worm"],
+    });
+  }
+
+  if (cloud > 60 || skyLabel === "Rain" || skyLabel === "Thunderstorms") {
+    recs.push({
+      title: "Overcast: let them roam",
+      reason: "Low light lets fish move off cover to chase — moving baits and darker colors shine.",
+      keywords: ["spinnerbait", "chatterbait", "swim jig", "crankbait"],
+    });
+  } else if (cloud < 25) {
+    recs.push({
+      title: "Bright and clear: go natural",
+      reason: "Bluebird skies push fish tight to cover or deeper — natural colors and subtler baits work better.",
+      keywords: ["finesse", "shad", "natural", "soft plastic", "drop shot"],
+    });
+  }
+
+  if (wind > 15) {
+    recs.push({
+      title: "Wind-driven feed",
+      reason: `${Math.round(wind)} mph wind stirs up baitfish — search baits cover water fast.`,
+      keywords: ["crankbait", "spinnerbait", "swimbait"],
+    });
+  }
+
+  if (typeof temp === "number" && temp < 50) {
+    recs.push({
+      title: "Cold water, slow it down",
+      reason: "Below 50°F fish metabolism slows way down — a slow, subtle presentation gets more bites.",
+      keywords: ["jig", "soft plastic", "ned rig", "finesse"],
+    });
+  } else if (typeof temp === "number" && temp > 82) {
+    recs.push({
+      title: "Beat the heat",
+      reason: "In the heat, target shade and deeper structure through midday — save reaction baits for the edges of the day.",
+      keywords: ["deep diving", "jig", "texas rig", "carolina rig"],
+    });
+  }
+
+  if (tide && tide.predictions && tide.predictions.length >= 1) {
+    const sorted = tide.predictions
+      .map((p) => ({ ...p, time: new Date(p.t.replace(" ", "T")) }))
+      .sort((a, b) => a.time - b.time);
+    const next = sorted.find((p) => p.time > now);
+    if (next) {
+      const rising = next.type === "H";
+      recs.push({
+        title: rising ? "Incoming tide" : "Outgoing tide",
+        reason: rising
+          ? "Rising water pulls baitfish onto flats and structure — game fish follow them in."
+          : "Falling water pulls bait off structure into channels — target the edges and drop-offs.",
+        keywords: ["swimbait", "jig", "soft plastic", "topwater"],
+      });
+    }
+  }
+
+  // de-dupe by title, keep first 4
+  const seen = new Set();
+  return recs.filter((r) => (seen.has(r.title) ? false : (seen.add(r.title), true))).slice(0, 4);
+}
+
+function clusterCatchesByLocation(catches) {
+  const tagged = catches.filter((c) => c.gps && typeof c.gps.lat === "number");
+  const clusters = [];
+
+  for (const c of tagged) {
+    let cluster = clusters.find((cl) => haversineMiles(cl.lat, cl.lon, c.gps.lat, c.gps.lon) < 0.6);
+    if (!cluster) {
+      cluster = { lat: c.gps.lat, lon: c.gps.lon, items: [] };
+      clusters.push(cluster);
+    }
+    cluster.items.push(c);
+    cluster.lat = cluster.items.reduce((s, x) => s + x.gps.lat, 0) / cluster.items.length;
+    cluster.lon = cluster.items.reduce((s, x) => s + x.gps.lon, 0) / cluster.items.length;
+  }
+
+  return clusters
+    .map((cl) => {
+      const species = [...new Set(cl.items.map((c) => c.species).filter(Boolean))];
+      const lureCounts = {};
+      cl.items.forEach((c) => {
+        if (c.lure) lureCounts[c.lure] = (lureCounts[c.lure] || 0) + 1;
+      });
+      const topLure = Object.entries(lureCounts).sort((a, b) => b[1] - a[1])[0];
+      const bestWeightLb = cl.items.reduce((best, c) => Math.max(best, weightToLb(c.weight, c.weightUnit)), 0);
+      const lastDate = cl.items.reduce((latest, c) => (!latest || new Date(c.dateTime) > new Date(latest) ? c.dateTime : latest), null);
+      const namedLocation = cl.items.find((c) => c.location)?.location || null;
+      return {
+        lat: cl.lat,
+        lon: cl.lon,
+        count: cl.items.length,
+        speciesCount: species.length,
+        species,
+        topLure: topLure ? topLure[0] : null,
+        bestWeightLb,
+        lastDate,
+        name: namedLocation,
+      };
+    })
+    .sort((a, b) => b.count - a.count);
+}
+
+export default function TackleTracker() {
+  const [view, setView] = useState("tackle"); // 'tackle' | 'conditions' | 'catches'
+  const [items, setItems] = useState(null);
+  const [activeCategory, setActiveCategory] = useState(null);
+  const [search, setSearch] = useState("");
+  const [showForm, setShowForm] = useState(false);
+  const [editingItem, setEditingItem] = useState(null);
+  const [formPrefill, setFormPrefill] = useState(null);
+  const [tackleSubView, setTackleSubView] = useState("gear"); // 'gear' | 'guide'
+  const [showSettings, setShowSettings] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+  const touchStart = useRef(null);
+
+  function handleTouchStart(e) {
+    const overlayOpen = showForm || showCatchForm || showSettings || activeCategory;
+    if (overlayOpen) {
+      touchStart.current = null;
+      return;
+    }
+    const t = e.touches[0];
+    touchStart.current = { x: t.clientX, y: t.clientY };
+  }
+
+  function handleTouchEnd(e) {
+    if (!touchStart.current) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - touchStart.current.x;
+    const dy = t.clientY - touchStart.current.y;
+    touchStart.current = null;
+
+    // Mostly-horizontal, deliberate swipes only — ignore scrolls and taps.
+    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+
+    const idx = MAIN_VIEWS.indexOf(view);
+    if (idx === -1) return;
+    if (dx < 0 && idx < MAIN_VIEWS.length - 1) {
+      setView(MAIN_VIEWS[idx + 1]);
+    } else if (dx > 0 && idx > 0) {
+      setView(MAIN_VIEWS[idx - 1]);
+    }
+  }
+
+  const [catches, setCatches] = useState(null);
+  const [showCatchForm, setShowCatchForm] = useState(false);
+  const [editingCatch, setEditingCatch] = useState(null);
+
+  function openQuickAdd(name, category) {
+    setEditingItem(null);
+    setFormPrefill({ name: capitalize(name), category: category || "lures" });
+    setView("tackle");
+    setShowForm(true);
+  }
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        setItems(res && res.value ? JSON.parse(res.value) : []);
+      } catch (e) {
+        setItems([]);
+      }
+    })();
+    (async () => {
+      try {
+        const res = await window.storage.get(CATCH_KEY, false);
+        setCatches(res && res.value ? JSON.parse(res.value) : []);
+      } catch (e) {
+        setCatches([]);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (items === null) return;
+    (async () => {
+      try {
+        const res = await window.storage.set(STORAGE_KEY, JSON.stringify(items), false);
+        setSaveError(!res);
+      } catch (e) {
+        setSaveError(true);
+      }
+    })();
+  }, [items]);
+
+  useEffect(() => {
+    if (catches === null) return;
+    (async () => {
+      try {
+        const res = await window.storage.set(CATCH_KEY, JSON.stringify(catches), false);
+        setSaveError((prev) => (res ? prev : true));
+      } catch (e) {
+        setSaveError(true);
+      }
+    })();
+  }, [catches]);
+
+  function showToast(msg) {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 1800);
+  }
+
+  function upsertItem(item) {
+    setItems((prev) => {
+      const exists = prev.some((i) => i.id === item.id);
+      if (exists) return prev.map((i) => (i.id === item.id ? item : i));
+      return [...prev, item];
+    });
+    showToast(editingItem ? "Item updated" : "Item added to tackle box");
+    setShowForm(false);
+    setEditingItem(null);
+    setFormPrefill(null);
+  }
+
+  function upsertCatch(record) {
+    setCatches((prev) => {
+      const exists = prev.some((c) => c.id === record.id);
+      if (exists) return prev.map((c) => (c.id === record.id ? record : c));
+      return [record, ...prev];
+    });
+    showToast(editingCatch ? "Catch updated" : "Catch logged");
+    setShowCatchForm(false);
+    setEditingCatch(null);
+  }
+
+  function deleteCatch(id) {
+    setCatches((prev) => prev.filter((c) => c.id !== id));
+    showToast("Catch removed");
+  }
+
+  function deleteItem(id) {
+    setItems((prev) => prev.filter((i) => i.id !== id));
+    showToast("Item removed");
+  }
+
+  function adjustQty(id, delta) {
+    setItems((prev) =>
+      prev.map((i) => (i.id === id ? { ...i, quantity: Math.max(0, i.quantity + delta) } : i))
+    );
+  }
+
+  const loading = items === null;
+  const counts = {};
+  const lowCounts = {};
+  if (!loading) {
+    for (const c of CATEGORIES) {
+      counts[c.id] = items.filter((i) => i.category === c.id).length;
+      lowCounts[c.id] = items.filter(
+        (i) => i.category === c.id && i.quantity <= (i.lowThreshold ?? 2)
+      ).length;
+    }
+  }
+
+  const filteredSearch =
+    !loading && search.trim()
+      ? items.filter(
+          (i) =>
+            i.name.toLowerCase().includes(search.toLowerCase()) ||
+            (i.spec || "").toLowerCase().includes(search.toLowerCase()) ||
+            (i.location || "").toLowerCase().includes(search.toLowerCase())
+        )
+      : null;
+
+  const activeItems =
+    !loading && activeCategory ? items.filter((i) => i.category === activeCategory) : [];
+
+  return (
+    <div
+      style={{ fontFamily: "'Inter', sans-serif", background: "var(--tb-bg)", minHeight: "640px" }}
+      className="w-full max-w-md mx-auto relative overflow-hidden rounded-2xl"
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil:wght@600;800&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        :root {
+          --tb-bg: #070f0f;
+          --tb-surface: #0d1e1d;
+          --tb-surface-2: #143231;
+          --tb-line: #1f4a47;
+          --tb-brass: #2dd4bf;
+          --tb-brass-dim: #0f766e;
+          --tb-flare: #f97362;
+          --tb-text: #f5faf9;
+          --tb-muted: #9fb8b5;
+          --tb-blue: #5eead4;
+        }
+        .tb-stencil { font-family: 'Big Shoulders Stencil', sans-serif; letter-spacing: 0.04em; }
+        .tb-mono { font-family: 'IBM Plex Mono', monospace; }
+        .tb-scroll::-webkit-scrollbar { width: 4px; }
+        .tb-scroll::-webkit-scrollbar-thumb { background: var(--tb-line); border-radius: 4px; }
+        @keyframes tb-slide-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        @keyframes tb-fade-in { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes tb-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .tb-tray { animation: tb-slide-up 0.28s cubic-bezier(.2,.8,.3,1); }
+        .tb-overlay { animation: tb-fade-in 0.2s ease; }
+        .tb-toast { animation: tb-fade-in 0.15s ease; }
+        .tb-spin { animation: tb-spin 1s linear infinite; }
+      `}</style>
+
+      {/* Header */}
+      <div
+        className="px-5 pt-6 pb-3 relative"
+        style={{ background: "linear-gradient(180deg, var(--tb-surface) 0%, var(--tb-bg) 100%)", borderBottom: "1px solid var(--tb-line)" }}
+      >
+        <div className="flex items-center justify-between mb-3">
+          <h1 className="tb-stencil text-3xl" style={{ color: "var(--tb-text)" }}>
+            EPIC FISHY
+          </h1>
+          <button
+            onClick={() => setShowSettings(true)}
+            className="w-8 h-8 rounded-full flex items-center justify-center"
+            style={{ background: "var(--tb-surface-2)", border: "2px solid var(--tb-brass-dim)" }}
+          >
+            <Settings size={14} style={{ color: "var(--tb-brass)" }} />
+          </button>
+        </div>
+
+        {/* Tabs */}
+        <div className="flex gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }}>
+          <TabButton active={view === "tackle"} onClick={() => setView("tackle")} label="Tackle" />
+          <TabButton active={view === "conditions"} onClick={() => setView("conditions")} label="Conditions" />
+          <TabButton active={view === "catches"} onClick={() => setView("catches")} label="Catches" />
+          <TabButton active={view === "spots"} onClick={() => setView("spots")} label="Spots" />
+          <TabButton active={view === "community"} onClick={() => setView("community")} label="Community" />
+          <TabButton active={view === "knots"} onClick={() => setView("knots")} label="Knots" />
+        </div>
+
+        {view === "tackle" && tackleSubView === "gear" && (
+          <div className="mt-3 relative">
+            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--tb-muted)" }} />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search gear, size, or box..."
+              className="w-full rounded-lg py-2.5 pl-9 pr-3 text-sm outline-none"
+              style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* Body */}
+      <div
+        className="px-4 py-4 tb-scroll"
+        style={{ maxHeight: "660px", overflowY: "auto" }}
+        onTouchStart={handleTouchStart}
+        onTouchEnd={handleTouchEnd}
+      >
+        {view === "tackle" && (
+          <>
+            <div className="flex gap-2 mb-3">
+              <TabButton active={tackleSubView === "gear"} onClick={() => setTackleSubView("gear")} label="My Gear" />
+              <TabButton active={tackleSubView === "guide"} onClick={() => setTackleSubView("guide")} label="ID Guide" />
+            </div>
+
+            {tackleSubView === "guide" && <TackleGuideView />}
+
+            {tackleSubView === "gear" && (
+              <>
+                {loading && (
+                  <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>
+                    Loading your gear...
+                  </div>
+                )}
+
+                {!loading && filteredSearch && (
+                  <div>
+                    <p className="tb-mono text-xs mb-2" style={{ color: "var(--tb-muted)" }}>
+                      {filteredSearch.length} result{filteredSearch.length !== 1 ? "s" : ""}
+                    </p>
+                    {filteredSearch.length === 0 ? (
+                      <EmptyState text="No gear matches that search." />
+                    ) : (
+                      <div className="space-y-2">
+                        {filteredSearch.map((item) => (
+                          <ItemRow key={item.id} item={item} onAdjust={adjustQty} onEdit={() => { setEditingItem(item); setShowForm(true); }} onDelete={() => deleteItem(item.id)} />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {!loading && !filteredSearch && (
+                  <div className="grid grid-cols-2 gap-3">
+                    {CATEGORIES.map((c) => {
+                      const Icon = c.icon;
+                      const count = counts[c.id] || 0;
+                      const low = lowCounts[c.id] || 0;
+                      return (
+                        <button
+                          key={c.id}
+                          onClick={() => setActiveCategory(c.id)}
+                          className="relative rounded-xl p-4 text-left transition-transform active:scale-95"
+                          style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}
+                        >
+                          {low > 0 && (
+                            <div className="absolute -top-1.5 -right-1.5 rounded-full w-5 h-5 flex items-center justify-center tb-mono text-[10px] font-bold" style={{ background: "var(--tb-flare)", color: "var(--tb-bg)" }}>
+                              {low}
+                            </div>
+                          )}
+                          <Icon size={22} style={{ color: "var(--tb-brass)" }} />
+                          <div className="mt-3 text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{c.label}</div>
+                          <div className="tb-mono text-xs mt-0.5" style={{ color: "var(--tb-muted)" }}>{count} item{count !== 1 ? "s" : ""}</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+
+        {view === "conditions" && <ConditionsView items={items || []} onQuickAdd={openQuickAdd} />}
+
+        {view === "catches" && (
+          <CatchesView
+            catches={catches}
+            items={items || []}
+            onEdit={(c) => { setEditingCatch(c); setShowCatchForm(true); }}
+            onDelete={deleteCatch}
+          />
+        )}
+
+        {view === "spots" && <SpotsView catches={catches || []} />}
+
+        {view === "community" && <CommunityView />}
+
+        {view === "knots" && <KnotsView />}
+      </div>
+
+      {/* Add button */}
+      {view === "tackle" && tackleSubView === "gear" && (
+        <button
+          onClick={() => { setEditingItem(null); setShowForm(true); }}
+          className="absolute bottom-5 right-5 w-14 h-14 rounded-full flex items-center justify-center shadow-lg active:scale-95 transition-transform"
+          style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}
+        >
+          <Plus size={26} />
+        </button>
+      )}
+      {view === "catches" && (
+        <button
+          onClick={() => { setEditingCatch(null); setShowCatchForm(true); }}
+          className="absolute bottom-5 right-5 w-14 h-14 rounded-full flex items-center justify-center shadow-lg active:scale-95 transition-transform"
+          style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}
+        >
+          <Plus size={26} />
+        </button>
+      )}
+
+      {/* Toast */}
+      {toast && (
+        <div className="tb-toast absolute bottom-24 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs tb-mono" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>
+          {toast}
+        </div>
+      )}
+
+      {saveError && (
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-[10px] tb-mono" style={{ background: "var(--tb-flare)", color: "var(--tb-bg)" }}>
+          couldn't save — check connection
+        </div>
+      )}
+
+      {/* Category tray */}
+      {activeCategory && !showForm && view === "tackle" && (
+        <div className="tb-overlay absolute inset-0 z-20" style={{ background: "rgba(10,16,19,0.55)" }} onClick={() => setActiveCategory(null)}>
+          <div className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-4 pt-3 pb-5" style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "82%", display: "flex", flexDirection: "column" }} onClick={(e) => e.stopPropagation()}>
+            <div className="w-10 h-1 rounded-full mx-auto mb-3" style={{ background: "var(--tb-line)" }} />
+            <div className="flex items-center gap-2 mb-3">
+              <button onClick={() => setActiveCategory(null)}>
+                <ChevronLeft size={20} style={{ color: "var(--tb-muted)" }} />
+              </button>
+              <h2 className="tb-stencil text-xl" style={{ color: "var(--tb-text)" }}>
+                {CATEGORIES.find((c) => c.id === activeCategory)?.label.toUpperCase()}
+              </h2>
+            </div>
+            <div className="tb-scroll overflow-y-auto space-y-2 pb-2">
+              {activeItems.length === 0 ? (
+                <EmptyState text="This compartment is empty. Add your first item." />
+              ) : (
+                activeItems.map((item) => (
+                  <ItemRow key={item.id} item={item} onAdjust={adjustQty} onEdit={() => { setEditingItem(item); setShowForm(true); }} onDelete={() => deleteItem(item.id)} />
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add/Edit form */}
+      {showForm && (
+        <ItemForm initial={editingItem || formPrefill} defaultCategory={activeCategory} onCancel={() => { setShowForm(false); setEditingItem(null); setFormPrefill(null); }} onSave={upsertItem} />
+      )}
+
+      {showCatchForm && (
+        <CatchForm
+          initial={editingCatch}
+          items={items || []}
+          existingTrips={[...new Set((catches || []).map((c) => c.tripName).filter(Boolean))]}
+          onCancel={() => { setShowCatchForm(false); setEditingCatch(null); }}
+          onSave={upsertCatch}
+        />
+      )}
+
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+    </div>
+  );
+}
+
+function TabButton({ active, onClick, label }) {
+  return (
+    <button
+      onClick={onClick}
+      className="px-4 py-1.5 rounded-full text-xs font-semibold tb-mono transition-colors shrink-0"
+      style={{
+        background: active ? "var(--tb-brass)" : "var(--tb-surface-2)",
+        color: active ? "var(--tb-bg)" : "var(--tb-muted)",
+        border: "1px solid " + (active ? "var(--tb-brass)" : "var(--tb-line)"),
+      }}
+    >
+      {label.toUpperCase()}
+    </button>
+  );
+}
+
+function EmptyState({ text }) {
+  return (
+    <div className="rounded-xl py-10 text-center text-sm" style={{ background: "var(--tb-surface)", color: "var(--tb-muted)", border: "1px dashed var(--tb-line)" }}>
+      {text}
+    </div>
+  );
+}
+
+function isMaintenanceDue(item) {
+  if (!item.lastServiced || !item.serviceIntervalDays) return false;
+  const last = new Date(item.lastServiced);
+  const dueDate = new Date(last.getTime() + item.serviceIntervalDays * 86400000);
+  return new Date() >= dueDate;
+}
+
+function ItemRow({ item, onAdjust, onEdit, onDelete }) {
+  const low = item.quantity <= (item.lowThreshold ?? 2);
+  const serviceDue = isMaintenanceDue(item);
+  const [showPhoto, setShowPhoto] = useState(false);
+  const CategoryIcon = CATEGORIES.find((c) => c.id === item.category)?.icon || Package;
+  return (
+    <div className="rounded-xl p-3 flex items-center gap-3" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+      {item.photo ? (
+        <img
+          src={item.photo}
+          alt=""
+          onClick={() => setShowPhoto(true)}
+          className="w-11 h-11 rounded-lg object-cover shrink-0"
+          style={{ border: "1px solid var(--tb-line)" }}
+        />
+      ) : (
+        <div className="w-11 h-11 rounded-lg flex items-center justify-center shrink-0" style={{ background: "var(--tb-surface-2)" }}>
+          <CategoryIcon size={18} style={{ color: "var(--tb-brass)" }} />
+        </div>
+      )}
+      <div className="flex-1 min-w-0" onClick={onEdit}>
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm font-semibold truncate" style={{ color: "var(--tb-text)" }}>{item.name}</span>
+          {low && <AlertTriangle size={12} style={{ color: "var(--tb-flare)" }} />}
+          {serviceDue && <Wrench size={12} style={{ color: "var(--tb-flare)" }} />}
+        </div>
+        <div className="tb-mono text-[11px] mt-0.5 truncate" style={{ color: "var(--tb-muted)" }}>
+          {[item.spec, item.location, item.condition].filter(Boolean).join(" · ")}
+        </div>
+        {serviceDue && (
+          <div className="tb-mono text-[10px] mt-0.5" style={{ color: "var(--tb-flare)" }}>Service due</div>
+        )}
+      </div>
+      <div className="flex items-center gap-1.5 shrink-0">
+        <button onClick={() => onAdjust(item.id, -1)} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+          <Minus size={13} />
+        </button>
+        <span className="tb-mono text-sm w-6 text-center" style={{ color: "var(--tb-text)" }}>{item.quantity}</span>
+        <button onClick={() => onAdjust(item.id, 1)} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+          <Plus size={13} />
+        </button>
+        <button onClick={onDelete} className="w-7 h-7 rounded-md flex items-center justify-center ml-0.5" style={{ color: "var(--tb-flare)" }}>
+          <Trash2 size={14} />
+        </button>
+      </div>
+      {showPhoto && item.photo && <PhotoLightbox src={item.photo} onClose={() => setShowPhoto(false)} />}
+    </div>
+  );
+}
+
+function ItemForm({ initial, defaultCategory, onCancel, onSave }) {
+  const [name, setName] = useState(initial?.name || "");
+  const [category, setCategory] = useState(initial?.category || defaultCategory || "lures");
+  const [spec, setSpec] = useState(initial?.spec || "");
+  const [quantity, setQuantity] = useState(initial?.quantity ?? 1);
+  const [lowThreshold, setLowThreshold] = useState(initial?.lowThreshold ?? 2);
+  const [location, setLocation] = useState(initial?.location || "");
+  const [condition, setCondition] = useState(initial?.condition || CONDITIONS[0]);
+  const [notes, setNotes] = useState(initial?.notes || "");
+  const [photo, setPhoto] = useState(initial?.photo || null);
+  const [lastServiced, setLastServiced] = useState(initial?.lastServiced ? initial.lastServiced.slice(0, 10) : "");
+  const [serviceIntervalDays, setServiceIntervalDays] = useState(initial?.serviceIntervalDays || "");
+
+  function submit() {
+    if (!name.trim()) return;
+    onSave({
+      id: initial?.id || uid(),
+      name: name.trim(),
+      category,
+      spec: spec.trim(),
+      quantity: Number(quantity) || 0,
+      lowThreshold: Number(lowThreshold) || 0,
+      location: location.trim(),
+      condition,
+      notes: notes.trim(),
+      photo,
+      lastServiced: lastServiced ? new Date(lastServiced).toISOString() : null,
+      serviceIntervalDays: serviceIntervalDays === "" ? null : Number(serviceIntervalDays),
+    });
+  }
+
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+
+  return (
+    <div className="tb-overlay absolute inset-0 z-30" style={{ background: "rgba(10,16,19,0.65)" }}>
+      <div className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-5 pt-4 pb-6" style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "90%", overflowY: "auto" }}>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="tb-stencil text-xl" style={{ color: "var(--tb-text)" }}>{initial ? "EDIT ITEM" : "ADD ITEM"}</h2>
+          <button onClick={onCancel}><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+
+        <div className="space-y-3">
+          <Field label="Name">
+            <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Texas Rig Worm Hooks" className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+          </Field>
+          <PhotoField photo={photo} onChange={setPhoto} />
+          <Field label="Compartment">
+            <select value={category} onChange={(e) => setCategory(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle}>
+              {CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+            </select>
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Size / spec">
+              <input value={spec} onChange={(e) => setSpec(e.target.value)} placeholder="4/0, 10lb mono..." className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+            </Field>
+            <Field label="Box / bag">
+              <input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Box 1, top tray" className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+            </Field>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Quantity">
+              <input type="number" min="0" value={quantity} onChange={(e) => setQuantity(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none tb-mono" style={inputStyle} />
+            </Field>
+            <Field label="Low-stock alert at">
+              <input type="number" min="0" value={lowThreshold} onChange={(e) => setLowThreshold(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none tb-mono" style={inputStyle} />
+            </Field>
+          </div>
+          <Field label="Condition">
+            <select value={condition} onChange={(e) => setCondition(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle}>
+              {CONDITIONS.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Last serviced">
+              <input type="date" value={lastServiced} onChange={(e) => setLastServiced(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+            </Field>
+            <Field label="Service every (days)">
+              <input type="number" min="0" value={serviceIntervalDays} onChange={(e) => setServiceIntervalDays(e.target.value)} placeholder="e.g. 90" className="w-full rounded-lg py-2 px-3 text-sm outline-none tb-mono" style={inputStyle} />
+            </Field>
+          </div>
+          <button
+            type="button"
+            onClick={() => setLastServiced(new Date().toISOString().slice(0, 10))}
+            className="text-xs tb-mono"
+            style={{ color: "var(--tb-blue)" }}
+          >
+            Mark serviced today
+          </button>
+          <Field label="Notes (optional)">
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} placeholder="Anything worth remembering..." className="w-full rounded-lg py-2 px-3 text-sm outline-none resize-none" style={inputStyle} />
+          </Field>
+        </div>
+
+        <div className="flex gap-3 mt-5">
+          <button onClick={onCancel} className="flex-1 py-2.5 rounded-lg text-sm font-semibold" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>Cancel</button>
+          <button onClick={submit} disabled={!name.trim()} className="flex-1 py-2.5 rounded-lg text-sm font-semibold" style={{ background: name.trim() ? "var(--tb-brass)" : "var(--tb-surface-2)", color: name.trim() ? "var(--tb-bg)" : "var(--tb-muted)" }}>
+            {initial ? "Save changes" : "Add to box"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="block">
+      <span className="tb-mono text-[11px] block mb-1" style={{ color: "var(--tb-muted)" }}>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function PhotoField({ photo, onChange, label = "Photo" }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const inputRef = useRef(null);
+
+  async function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const dataUrl = await compressImage(file);
+      onChange(dataUrl);
+    } catch (err) {
+      setError("Couldn't process that photo — try another.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Field label={label}>
+      <input ref={inputRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
+      {busy ? (
+        <div className="flex items-center gap-2 text-xs tb-mono rounded-lg py-2 px-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+          <RefreshCw size={13} className="tb-spin" style={{ color: "var(--tb-muted)" }} />
+          <span style={{ color: "var(--tb-muted)" }}>Processing photo...</span>
+        </div>
+      ) : photo ? (
+        <div className="flex items-center gap-3">
+          <img src={photo} alt="" className="w-16 h-16 rounded-lg object-cover" style={{ border: "1px solid var(--tb-line)" }} />
+          <div className="flex flex-col gap-1.5">
+            <button type="button" onClick={() => inputRef.current && inputRef.current.click()} className="text-xs tb-mono text-left" style={{ color: "var(--tb-blue)" }}>
+              Replace photo
+            </button>
+            <button type="button" onClick={() => onChange(null)} className="text-xs tb-mono text-left" style={{ color: "var(--tb-flare)" }}>
+              Remove photo
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => inputRef.current && inputRef.current.click()}
+          className="w-full py-2 rounded-lg text-xs tb-mono flex items-center justify-center gap-1.5"
+          style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+        >
+          <Camera size={14} style={{ color: "var(--tb-brass)" }} />
+          Take or choose a photo
+        </button>
+      )}
+      {error && <div className="tb-mono text-[10px] mt-1" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+    </Field>
+  );
+}
+
+function PhotoLightbox({ src, onClose }) {
+  return (
+    <div
+      className="tb-overlay absolute inset-0 z-40 flex items-center justify-center p-6"
+      style={{ background: "rgba(10,16,19,0.9)" }}
+      onClick={onClose}
+    >
+      <button onClick={onClose} className="absolute top-4 right-4 w-8 h-8 rounded-full flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
+        <X size={18} style={{ color: "var(--tb-text)" }} />
+      </button>
+      <img src={src} alt="" className="max-w-full max-h-full rounded-xl" style={{ border: "1px solid var(--tb-line)" }} onClick={(e) => e.stopPropagation()} />
+    </div>
+  );
+}
+
+/* ---------------- Catch log ---------------- */
+
+function groupCatchesByTrip(sortedCatches) {
+  const groups = {};
+  for (const c of sortedCatches) {
+    const key = c.tripName && c.tripName.trim() ? c.tripName.trim() : "Ungrouped catches";
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(c);
+  }
+  return Object.entries(groups)
+    .map(([tripName, list]) => {
+      const bestC = list.reduce((best, c) => {
+        const lb = weightToLb(c.weight, c.weightUnit);
+        return !best || lb > weightToLb(best.weight, best.weightUnit) ? c : best;
+      }, null);
+      return { tripName, catches: list, bestC };
+    })
+    .sort((a, b) => {
+      if (a.tripName === "Ungrouped catches") return 1;
+      if (b.tripName === "Ungrouped catches") return -1;
+      return new Date(b.catches[0].dateTime) - new Date(a.catches[0].dateTime);
+    });
+}
+
+function CatchesView({ catches, items, onEdit, onDelete }) {
+  const [groupByTrip, setGroupByTrip] = useState(false);
+
+  if (catches === null) {
+    return <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>Loading your catch log...</div>;
+  }
+
+  if (catches.length === 0) {
+    return (
+      <div className="py-10 text-center space-y-3">
+        <Fish size={32} className="mx-auto" style={{ color: "var(--tb-brass)" }} />
+        <p className="text-sm" style={{ color: "var(--tb-muted)" }}>
+          No catches logged yet. Tap + to record your first fish.
+        </p>
+      </div>
+    );
+  }
+
+  const sorted = [...catches].sort((a, b) => new Date(b.dateTime) - new Date(a.dateTime));
+  const bestWeight = catches.reduce((best, c) => {
+    const lb = weightToLb(c.weight, c.weightUnit);
+    return lb > best.lb ? { lb, c } : best;
+  }, { lb: 0, c: null });
+  const bestLength = catches.reduce((best, c) => {
+    const inches = lengthToIn(c.length, c.lengthUnit);
+    return inches > best.inches ? { inches, c } : best;
+  }, { inches: 0, c: null });
+
+  const speciesCounts = {};
+  for (const c of catches) {
+    if (c.species) speciesCounts[c.species] = (speciesCounts[c.species] || 0) + 1;
+  }
+  const topSpecies = Object.entries(speciesCounts).sort((a, b) => b[1] - a[1])[0];
+  const trips = groupByTrip ? groupCatchesByTrip(sorted) : null;
+
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-3 gap-2">
+        <StatTile label="Total" value={catches.length} />
+        <StatTile label="Top species" value={topSpecies ? topSpecies[0] : "—"} small />
+        <StatTile
+          label="Personal best"
+          value={bestWeight.c ? `${bestWeight.c.weight} ${bestWeight.c.weightUnit}` : "—"}
+          icon={Trophy}
+          small
+        />
+      </div>
+
+      <div className="flex justify-end">
+        <button
+          onClick={() => setGroupByTrip((v) => !v)}
+          className="text-xs tb-mono px-3 py-1.5 rounded-full"
+          style={{ background: groupByTrip ? "var(--tb-brass)" : "var(--tb-surface-2)", color: groupByTrip ? "var(--tb-bg)" : "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+        >
+          {groupByTrip ? "Ungroup" : "Group by trip"}
+        </button>
+      </div>
+
+      {!groupByTrip && (
+        <div className="space-y-2">
+          {sorted.map((c) => (
+            <CatchRow key={c.id} record={c} onEdit={() => onEdit(c)} onDelete={() => onDelete(c.id)} />
+          ))}
+        </div>
+      )}
+
+      {groupByTrip && (
+        <div className="space-y-4">
+          {trips.map((t) => (
+            <div key={t.tripName}>
+              <div className="flex items-center justify-between mb-1.5 px-1">
+                <span className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{t.tripName}</span>
+                <span className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>
+                  {t.catches.length} catch{t.catches.length !== 1 ? "es" : ""}
+                  {t.bestC && t.bestC.weight ? ` · best ${t.bestC.weight} ${t.bestC.weightUnit}` : ""}
+                </span>
+              </div>
+              <div className="space-y-2">
+                {t.catches.map((c) => (
+                  <CatchRow key={c.id} record={c} onEdit={() => onEdit(c)} onDelete={() => onDelete(c.id)} />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatTile({ label, value, icon: Icon, small }) {
+  return (
+    <div className="rounded-xl p-3 text-center" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+      {Icon && <Icon size={14} className="mx-auto mb-1" style={{ color: "var(--tb-brass)" }} />}
+      <div className={small ? "text-xs font-semibold truncate" : "text-lg font-semibold"} style={{ color: "var(--tb-text)" }}>
+        {value}
+      </div>
+      <div className="tb-mono text-[10px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{label}</div>
+    </div>
+  );
+}
+
+function CatchRow({ record, onEdit, onDelete }) {
+  const [showMap, setShowMap] = useState(false);
+  const [showPhoto, setShowPhoto] = useState(false);
+  const dt = record.dateTime ? new Date(record.dateTime) : null;
+  return (
+    <div className="rounded-xl p-3" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+      <div className="flex items-start justify-between gap-2">
+        {record.photo && (
+          <img
+            src={record.photo}
+            alt=""
+            onClick={() => setShowPhoto(true)}
+            className="w-14 h-14 rounded-lg object-cover shrink-0"
+            style={{ border: "1px solid var(--tb-line)" }}
+          />
+        )}
+        <div className="flex-1 min-w-0" onClick={onEdit}>
+          <div className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{record.species || "Unknown species"}</div>
+          <div className="tb-mono text-[11px] mt-0.5" style={{ color: "var(--tb-muted)" }}>
+            {[
+              record.length ? `${record.length} ${record.lengthUnit}` : null,
+              record.weight ? `${record.weight} ${record.weightUnit}` : null,
+              dt ? dt.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : null,
+            ].filter(Boolean).join(" · ")}
+          </div>
+          {(record.lure || record.location) && (
+            <div className="tb-mono text-[11px] mt-1" style={{ color: "var(--tb-blue)" }}>
+              {[record.lure, record.location].filter(Boolean).join(" · ")}
+            </div>
+          )}
+          {record.tripName && (
+            <div className="tb-mono text-[10px] mt-1" style={{ color: "var(--tb-brass)" }}>🎒 {record.tripName}</div>
+          )}
+          {record.gps && (
+            <div className="tb-mono text-[10px] mt-1 flex items-center gap-1" style={{ color: "var(--tb-blue)" }}>
+              <MapPin size={11} />
+              {record.gps.lat.toFixed(4)}, {record.gps.lon.toFixed(4)}
+            </div>
+          )}
+          {record.notes && (
+            <div className="text-xs mt-1 truncate" style={{ color: "var(--tb-muted)" }}>{record.notes}</div>
+          )}
+        </div>
+        <div className="flex items-center gap-1 shrink-0">
+          {record.gps && (
+            <button
+              onClick={() => setShowMap((s) => !s)}
+              className="w-7 h-7 rounded-md flex items-center justify-center"
+              style={{ background: showMap ? "var(--tb-brass)" : "var(--tb-surface-2)", color: showMap ? "var(--tb-bg)" : "var(--tb-blue)" }}
+              title="View catch location"
+            >
+              <MapPin size={13} />
+            </button>
+          )}
+          <button onClick={onEdit} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+            <Pencil size={13} />
+          </button>
+          <button onClick={onDelete} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ color: "var(--tb-flare)" }}>
+            <Trash2 size={14} />
+          </button>
+        </div>
+      </div>
+      {showMap && record.gps && (
+        <div className="mt-2 rounded-lg overflow-hidden" style={{ border: "1px solid var(--tb-line)" }}>
+          <iframe
+            title={"catch-map-" + record.id}
+            src={`https://maps.google.com/maps?q=${record.gps.lat},${record.gps.lon}&z=14&output=embed`}
+            style={{ width: "100%", height: "160px", border: "none", display: "block" }}
+            loading="lazy"
+          />
+          <a
+            href={`https://www.google.com/maps?q=${record.gps.lat},${record.gps.lon}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="block text-center py-1.5 tb-mono text-[10px]"
+            style={{ background: "var(--tb-surface-2)", color: "var(--tb-blue)" }}
+          >
+            Open in Maps
+          </a>
+        </div>
+      )}
+      {showPhoto && record.photo && <PhotoLightbox src={record.photo} onClose={() => setShowPhoto(false)} />}
+    </div>
+  );
+}
+
+function toDatetimeLocal(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function CatchForm({ initial, items, existingTrips = [], onCancel, onSave }) {
+  const [species, setSpecies] = useState(initial?.species || "");
+  const [length, setLength] = useState(initial?.length || "");
+  const [lengthUnit, setLengthUnit] = useState(initial?.lengthUnit || "in");
+  const [weight, setWeight] = useState(initial?.weight || "");
+  const [weightUnit, setWeightUnit] = useState(initial?.weightUnit || "lb");
+  const [dateTime, setDateTime] = useState(initial?.dateTime ? initial.dateTime.slice(0, 16) : toDatetimeLocal(new Date()));
+  const [location, setLocation] = useState(initial?.location || "");
+  const [tripName, setTripName] = useState(initial?.tripName || "");
+  const [lure, setLure] = useState(initial?.lure || "");
+  const [notes, setNotes] = useState(initial?.notes || "");
+  const [gps, setGps] = useState(initial?.gps || null);
+  const [gpsStatus, setGpsStatus] = useState(initial?.gps ? "ok" : "idle"); // idle | locating | ok | error
+  const [photo, setPhoto] = useState(initial?.photo || null);
+  const [shareToCommunity, setShareToCommunity] = useState(false);
+  const communityAvailable = typeof window !== "undefined" && window.communityAPI && window.communityAPI.configured;
+
+  const captureGps = useCallback(() => {
+    if (!navigator.geolocation) {
+      setGpsStatus("error");
+      return;
+    }
+    setGpsStatus("locating");
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setGps({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy });
+        setGpsStatus("ok");
+      },
+      () => setGpsStatus("error"),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  }, []);
+
+  useEffect(() => {
+    // Only auto-tag brand new catches — edits keep whatever was saved unless the angler retags.
+    if (!initial) captureGps();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function submit() {
+    if (!species.trim()) return;
+    onSave({
+      id: initial?.id || uid(),
+      species: species.trim(),
+      length: length === "" ? null : Number(length),
+      lengthUnit,
+      weight: weight === "" ? null : Number(weight),
+      weightUnit,
+      dateTime: new Date(dateTime).toISOString(),
+      location: location.trim(),
+      tripName: tripName.trim(),
+      lure: lure.trim(),
+      notes: notes.trim(),
+      gps,
+      photo,
+    });
+    if (shareToCommunity && communityAvailable && window.communityAPI.ready) {
+      window.communityAPI.addCatch({
+        species: species.trim(),
+        length: length === "" ? null : Number(length),
+        lengthUnit,
+        weight: weight === "" ? null : Number(weight),
+        weightUnit,
+        dateTime: new Date(dateTime).toISOString(),
+        location: location.trim(),
+        lure: lure.trim(),
+      }).catch(() => {});
+    }
+  }
+
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+
+  return (
+    <div className="tb-overlay absolute inset-0 z-30" style={{ background: "rgba(10,16,19,0.65)" }}>
+      <div className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-5 pt-4 pb-6" style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "90%", overflowY: "auto" }}>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="tb-stencil text-xl" style={{ color: "var(--tb-text)" }}>{initial ? "EDIT CATCH" : "LOG A CATCH"}</h2>
+          <button onClick={onCancel}><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+
+        <div className="space-y-3">
+          <Field label="Species">
+            <input autoFocus value={species} onChange={(e) => setSpecies(e.target.value)} placeholder="e.g. Largemouth bass" className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+          </Field>
+
+          <PhotoField photo={photo} onChange={setPhoto} label="Catch photo" />
+
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Length">
+              <div className="flex gap-1.5">
+                <input type="number" min="0" step="0.1" value={length} onChange={(e) => setLength(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none tb-mono" style={inputStyle} />
+                <select value={lengthUnit} onChange={(e) => setLengthUnit(e.target.value)} className="rounded-lg px-2 text-sm outline-none" style={inputStyle}>
+                  <option value="in">in</option>
+                  <option value="cm">cm</option>
+                </select>
+              </div>
+            </Field>
+            <Field label="Weight">
+              <div className="flex gap-1.5">
+                <input type="number" min="0" step="0.1" value={weight} onChange={(e) => setWeight(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none tb-mono" style={inputStyle} />
+                <select value={weightUnit} onChange={(e) => setWeightUnit(e.target.value)} className="rounded-lg px-2 text-sm outline-none" style={inputStyle}>
+                  <option value="lb">lb</option>
+                  <option value="kg">kg</option>
+                </select>
+              </div>
+            </Field>
+          </div>
+
+          <Field label="Date & time">
+            <input type="datetime-local" value={dateTime} onChange={(e) => setDateTime(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none tb-mono" style={inputStyle} />
+          </Field>
+
+          <Field label="Location">
+            <input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Lake, river, or spot name" className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+          </Field>
+
+          <Field label="Trip (optional)">
+            <input
+              value={tripName}
+              onChange={(e) => setTripName(e.target.value)}
+              placeholder="e.g. Memorial Day weekend"
+              list="trip-suggestions"
+              className="w-full rounded-lg py-2 px-3 text-sm outline-none"
+              style={inputStyle}
+            />
+            <datalist id="trip-suggestions">
+              {existingTrips.map((t) => <option key={t} value={t} />)}
+            </datalist>
+          </Field>
+
+          <Field label="GPS tag">
+            {gpsStatus === "locating" && (
+              <div className="flex items-center gap-2 text-xs tb-mono rounded-lg py-2 px-3" style={inputStyle}>
+                <RefreshCw size={13} className="tb-spin" style={{ color: "var(--tb-muted)" }} />
+                <span style={{ color: "var(--tb-muted)" }}>Finding your location...</span>
+              </div>
+            )}
+            {gpsStatus === "ok" && gps && (
+              <div className="flex items-center justify-between text-xs tb-mono rounded-lg py-2 px-3" style={inputStyle}>
+                <span className="flex items-center gap-1.5" style={{ color: "var(--tb-text)" }}>
+                  <MapPin size={13} style={{ color: "var(--tb-brass)" }} />
+                  {gps.lat.toFixed(5)}, {gps.lon.toFixed(5)}
+                  {typeof gps.accuracy === "number" && <span style={{ color: "var(--tb-muted)" }}> · ±{Math.round(gps.accuracy)}m</span>}
+                </span>
+                <span className="flex items-center gap-3">
+                  <button type="button" onClick={captureGps} style={{ color: "var(--tb-blue)" }}>Retag</button>
+                  <button type="button" onClick={() => { setGps(null); setGpsStatus("idle"); }} style={{ color: "var(--tb-flare)" }}>Remove</button>
+                </span>
+              </div>
+            )}
+            {gpsStatus === "error" && (
+              <div className="flex items-center justify-between text-xs tb-mono rounded-lg py-2 px-3" style={inputStyle}>
+                <span style={{ color: "var(--tb-muted)" }}>Couldn't get your location.</span>
+                <button type="button" onClick={captureGps} style={{ color: "var(--tb-brass)" }}>Try again</button>
+              </div>
+            )}
+            {gpsStatus === "idle" && (
+              <button type="button" onClick={captureGps} className="w-full py-2 rounded-lg text-xs tb-mono flex items-center justify-center gap-1.5" style={inputStyle}>
+                <MapPin size={13} style={{ color: "var(--tb-brass)" }} />
+                Tag current GPS location
+              </button>
+            )}
+          </Field>
+
+          <Field label="Lure / bait used">
+            <input
+              value={lure}
+              onChange={(e) => setLure(e.target.value)}
+              placeholder="Pick from your tackle box or type your own"
+              list="tb-lure-options"
+              className="w-full rounded-lg py-2 px-3 text-sm outline-none"
+              style={inputStyle}
+            />
+            <datalist id="tb-lure-options">
+              {items.map((i) => <option key={i.id} value={i.name} />)}
+            </datalist>
+          </Field>
+
+          <Field label="Notes (optional)">
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} placeholder="Conditions, technique, anything worth remembering..." className="w-full rounded-lg py-2 px-3 text-sm outline-none resize-none" style={inputStyle} />
+          </Field>
+
+          {communityAvailable && (
+            <label className="flex items-center gap-2.5 rounded-lg py-2.5 px-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+              <input type="checkbox" checked={shareToCommunity} onChange={(e) => setShareToCommunity(e.target.checked)} className="w-4 h-4" />
+              <span className="text-xs tb-mono" style={{ color: "var(--tb-text)" }}>
+                Share to community feed <span style={{ color: "var(--tb-muted)" }}>(species, size, lure — no exact GPS or photo)</span>
+              </span>
+            </label>
+          )}
+        </div>
+
+        <div className="flex gap-3 mt-5">
+          <button onClick={onCancel} className="flex-1 py-2.5 rounded-lg text-sm font-semibold" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>Cancel</button>
+          <button onClick={submit} disabled={!species.trim()} className="flex-1 py-2.5 rounded-lg text-sm font-semibold" style={{ background: species.trim() ? "var(--tb-brass)" : "var(--tb-surface-2)", color: species.trim() ? "var(--tb-bg)" : "var(--tb-muted)" }}>
+            {initial ? "Save changes" : "Log catch"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Conditions (weather / tide / radar) ---------------- */
+
+function ConditionsView({ items = [], onQuickAdd }) {
+  const [location, setLocation] = useState(null); // {name, lat, lon}
+  const [locLoading, setLocLoading] = useState(true);
+  const [showLocationPicker, setShowLocationPicker] = useState(false);
+
+  const [weather, setWeather] = useState(null);
+  const [weatherError, setWeatherError] = useState(null);
+  const [weatherLoading, setWeatherLoading] = useState(false);
+
+  const [tide, setTide] = useState(null);
+  const [tideError, setTideError] = useState(null);
+  const [tideLoading, setTideLoading] = useState(false);
+
+  const [waterTemp, setWaterTemp] = useState(null); // null = not loaded/unavailable
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(LOCATION_KEY, false);
+        if (res && res.value) setLocation(JSON.parse(res.value));
+      } catch (e) {
+        // no saved location yet
+      }
+      setLocLoading(false);
+    })();
+  }, []);
+
+  const saveLocation = useCallback(async (loc) => {
+    setLocation(loc);
+    try {
+      await window.storage.set(LOCATION_KEY, JSON.stringify(loc), false);
+    } catch (e) {
+      // ignore, will just not persist
+    }
+  }, []);
+
+  const loadWaterTemp = useCallback(async (lat, lon) => {
+    try {
+      const url = `https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=sea_surface_temperature&temperature_unit=fahrenheit&timezone=auto`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("marine request failed");
+      const data = await res.json();
+      const temp = data.current?.sea_surface_temperature;
+      setWaterTemp(typeof temp === "number" ? temp : null);
+    } catch (e) {
+      setWaterTemp(null); // quietly unavailable (common for inland/freshwater spots)
+    }
+  }, []);
+
+  const loadWeather = useCallback(async (lat, lon) => {
+    setWeatherLoading(true);
+    setWeatherError(null);
+    try {
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,apparent_temperature,wind_speed_10m,wind_direction_10m,wind_gusts_10m,pressure_msl,cloud_cover,weather_code,precipitation&hourly=pressure_msl,precipitation_probability&daily=sunrise,sunset&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&forecast_days=2`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("weather request failed");
+      const data = await res.json();
+      setWeather(data);
+    } catch (e) {
+      setWeatherError("Couldn't load weather right now.");
+    } finally {
+      setWeatherLoading(false);
+    }
+  }, []);
+
+  const loadTide = useCallback(async (lat, lon) => {
+    setTideLoading(true);
+    setTideError(null);
+    setTide(null);
+    try {
+      const stationsRes = await fetch("https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions");
+      if (!stationsRes.ok) throw new Error("station list failed");
+      const stationsData = await stationsRes.json();
+      let best = null;
+      let bestDist = Infinity;
+      for (const s of stationsData.stations || []) {
+        const d = haversineMiles(lat, lon, s.lat, s.lng);
+        if (d < bestDist) { bestDist = d; best = s; }
+      }
+      if (!best || bestDist > 60) {
+        setTideError("No nearby tide station — this spot may be inland or too far from the coast.");
+        return;
+      }
+      const today = new Date();
+      const end = new Date(today);
+      end.setDate(end.getDate() + 1);
+      const fmt = (d) => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+      const predUrl = `https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=predictions&datum=MLLW&station=${best.id}&time_zone=lst_ldt&units=english&interval=hilo&format=json&begin_date=${fmt(today)}&end_date=${fmt(end)}`;
+      const predRes = await fetch(predUrl);
+      const predData = await predRes.json();
+      if (predData.error) throw new Error(predData.error.message || "prediction error");
+      setTide({ station: best, distance: bestDist, predictions: predData.predictions || [] });
+    } catch (e) {
+      setTideError("Couldn't load tide data right now.");
+    } finally {
+      setTideLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!location) return;
+    loadWeather(location.lat, location.lon);
+    loadTide(location.lat, location.lon);
+    loadWaterTemp(location.lat, location.lon);
+  }, [location, loadWeather, loadTide, loadWaterTemp]);
+
+  function useMyLocation() {
+    setLocLoading(true);
+    if (!navigator.geolocation) {
+      setLocLoading(false);
+      setShowLocationPicker(true);
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        saveLocation({ name: "Current location", lat: pos.coords.latitude, lon: pos.coords.longitude });
+        setLocLoading(false);
+      },
+      () => {
+        setLocLoading(false);
+        setShowLocationPicker(true);
+      },
+      { timeout: 8000 }
+    );
+  }
+
+  if (locLoading) {
+    return <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>Checking conditions...</div>;
+  }
+
+  if (!location) {
+    return (
+      <div className="py-8 text-center space-y-4">
+        <Waves size={32} className="mx-auto" style={{ color: "var(--tb-brass)" }} />
+        <p className="text-sm" style={{ color: "var(--tb-muted)" }}>
+          Add a location to see weather, tides, and live radar for your spot.
+        </p>
+        <div className="flex flex-col gap-2 items-center">
+          <button onClick={useMyLocation} className="px-4 py-2 rounded-lg text-sm font-semibold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+            Use my location
+          </button>
+          <button onClick={() => setShowLocationPicker(true)} className="px-4 py-2 rounded-lg text-sm font-semibold" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+            Search for a spot
+          </button>
+        </div>
+        {showLocationPicker && <LocationPicker onPick={(loc) => { saveLocation(loc); setShowLocationPicker(false); }} onClose={() => setShowLocationPicker(false)} />}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <button onClick={() => setShowLocationPicker(true)} className="flex items-center gap-1.5 text-sm font-semibold" style={{ color: "var(--tb-text)" }}>
+          <MapPin size={15} style={{ color: "var(--tb-brass)" }} />
+          {location.name}
+        </button>
+        <button onClick={() => { loadWeather(location.lat, location.lon); loadTide(location.lat, location.lon); loadWaterTemp(location.lat, location.lon); }} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
+          <RefreshCw size={13} className={weatherLoading || tideLoading ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
+        </button>
+      </div>
+
+      <WeatherCard weather={weather} loading={weatherLoading} error={weatherError} waterTemp={waterTemp} />
+      <TideCard tide={tide} loading={tideLoading} error={tideError} />
+      <BestBiteCard weather={weather} />
+      <RecommendationCard weather={weather} tide={tide} items={items} onQuickAdd={onQuickAdd} />
+      <RadarCard lat={location.lat} lon={location.lon} />
+
+      {showLocationPicker && <LocationPicker onPick={(loc) => { saveLocation(loc); setShowLocationPicker(false); }} onClose={() => setShowLocationPicker(false)} onUseMyLocation={useMyLocation} />}
+    </div>
+  );
+}
+
+function WeatherCard({ weather, loading, error, waterTemp }) {
+  if (loading) return <CardShell><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading weather...</span></CardShell>;
+  if (error) return <CardShell><span className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{error}</span></CardShell>;
+  if (!weather || !weather.current) return null;
+
+  const cur = weather.current;
+  const { label, Icon } = weatherCodeInfo(cur.weather_code);
+
+  const trend = getPressureTrend(weather);
+
+  const sunrise = weather.daily?.sunrise?.[0];
+  const sunset = weather.daily?.sunset?.[0];
+  const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "--";
+
+  return (
+    <CardShell title="WEATHER">
+      <div className="flex items-center gap-3 mb-3">
+        <Icon size={30} style={{ color: "var(--tb-brass)" }} />
+        <div>
+          <div className="text-2xl font-semibold tb-mono" style={{ color: "var(--tb-text)" }}>{Math.round(cur.temperature_2m)}°F</div>
+          <div className="text-xs" style={{ color: "var(--tb-muted)" }}>{label} · feels {Math.round(cur.apparent_temperature)}°</div>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-2 tb-mono text-xs">
+        <StatRow icon={Wind} label="Wind" value={`${Math.round(cur.wind_speed_10m)} mph ${compassDir(cur.wind_direction_10m)}`} />
+        <StatRow icon={Wind} label="Gusts" value={`${Math.round(cur.wind_gusts_10m)} mph`} />
+        <StatRow icon={Gauge} label="Pressure" value={`${Math.round(cur.pressure_msl)} hPa${trend ? " · " + trend : ""}`} trendIcon={trend === "rising" ? TrendingUp : trend === "falling" ? TrendingDown : null} />
+        <StatRow icon={Droplets} label="Precip" value={`${cur.precipitation ?? 0} in`} />
+        <StatRow icon={Sunrise} label="Sunrise" value={fmtTime(sunrise)} />
+        <StatRow icon={Sunset} label="Sunset" value={fmtTime(sunset)} />
+        {typeof waterTemp === "number" && (
+          <StatRow icon={Waves} label="Water" value={`${Math.round(waterTemp)}°F`} />
+        )}
+      </div>
+    </CardShell>
+  );
+}
+
+function BestBiteCard({ weather }) {
+  if (!weather || !weather.daily?.sunrise?.[0]) return null;
+
+  const now = new Date();
+  const moon = getMoonPhase(now);
+  const periods = getSolunarPeriods(weather.daily.sunrise[0], weather.daily.sunset[0], moon.ageDays);
+  if (!periods) return null;
+
+  const fmt = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const isNowIn = (p) => now >= p.start && now <= p.end;
+  const activeNow = [...periods.majors, ...periods.minors].some(isNowIn);
+
+  // Fishing is traditionally considered best near new and full moons.
+  const nearKeyPhase = moon.ageDays < 2 || moon.ageDays > 27.5 || (moon.ageDays > 13.3 && moon.ageDays < 16.3);
+  const dayRating = nearKeyPhase ? "Great day" : "Fair day";
+
+  return (
+    <CardShell title="BEST BITE TIMES" subtitle="estimated solunar windows — not exact astronomy">
+      <div className="flex items-center gap-3 mb-3">
+        <span className="text-2xl">{moon.emoji}</span>
+        <div>
+          <div className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{moon.name}</div>
+          <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>
+            {moon.illumination}% lit · {dayRating}
+            {activeNow && <span style={{ color: "var(--tb-brass)" }}> · active now</span>}
+          </div>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <div className="tb-mono text-[10px] mb-1" style={{ color: "var(--tb-brass)" }}>MAJOR (strongest)</div>
+          {periods.majors.map((p, i) => (
+            <div key={i} className="tb-mono text-xs" style={{ color: isNowIn(p) ? "var(--tb-brass)" : "var(--tb-text)" }}>
+              {fmt(p.start)}–{fmt(p.end)}
+            </div>
+          ))}
+        </div>
+        <div>
+          <div className="tb-mono text-[10px] mb-1" style={{ color: "var(--tb-blue)" }}>MINOR</div>
+          {periods.minors.map((p, i) => (
+            <div key={i} className="tb-mono text-xs" style={{ color: isNowIn(p) ? "var(--tb-brass)" : "var(--tb-text)" }}>
+              {fmt(p.start)}–{fmt(p.end)}
+            </div>
+          ))}
+        </div>
+      </div>
+    </CardShell>
+  );
+}
+
+function StatRow({ icon: Icon, label, value, trendIcon: TrendIcon }) {
+  return (
+    <div className="flex items-center gap-1.5" style={{ color: "var(--tb-muted)" }}>
+      <Icon size={13} style={{ color: "var(--tb-blue)" }} />
+      <span>{label}:</span>
+      <span style={{ color: "var(--tb-text)" }}>{value}</span>
+      {TrendIcon && <TrendIcon size={12} style={{ color: "var(--tb-brass)" }} />}
+    </div>
+  );
+}
+
+function TideCard({ tide, loading, error }) {
+  if (loading) return <CardShell><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading tides...</span></CardShell>;
+  if (error) return <CardShell title="TIDES"><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>{error}</span></CardShell>;
+  if (!tide) return null;
+
+  return (
+    <CardShell title="TIDES" subtitle={`nearest station: ${tide.station.name} (${tide.distance.toFixed(1)} mi)`}>
+      {tide.predictions.length === 0 ? (
+        <span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No predictions available.</span>
+      ) : (
+        <div className="space-y-1.5">
+          {tide.predictions.map((p, idx) => {
+            const isHigh = p.type === "H";
+            const dt = new Date(p.t.replace(" ", "T"));
+            return (
+              <div key={idx} className="flex items-center justify-between tb-mono text-xs">
+                <div className="flex items-center gap-1.5" style={{ color: "var(--tb-text)" }}>
+                  <ArrowUp size={12} style={{ color: isHigh ? "var(--tb-blue)" : "var(--tb-brass)", transform: isHigh ? "none" : "rotate(180deg)" }} />
+                  {isHigh ? "High" : "Low"}
+                </div>
+                <div style={{ color: "var(--tb-muted)" }}>
+                  {dt.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+                </div>
+                <div style={{ color: "var(--tb-text)" }}>{Number(p.v).toFixed(1)} ft</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </CardShell>
+  );
+}
+
+function RecommendationCard({ weather, tide, items, onQuickAdd }) {
+  if (!weather || !weather.current) return null;
+  const recs = buildRecommendations(weather, tide);
+  if (recs.length === 0) return null;
+
+  return (
+    <CardShell title="TACKLE PICK FOR NOW" subtitle="based on current weather, pressure, and tide">
+      <div>
+        {recs.map((rec, idx) => {
+          const matches = items.filter((i) => itemMatchesKeywords(i, rec.keywords));
+          return (
+            <div
+              key={rec.title}
+              style={{
+                borderTop: idx > 0 ? "1px solid var(--tb-line)" : "none",
+                paddingTop: idx > 0 ? "10px" : "0",
+                marginTop: idx > 0 ? "10px" : "0",
+              }}
+            >
+              <div className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{rec.title}</div>
+              <div className="tb-mono text-[11px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{rec.reason}</div>
+              {matches.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5 mt-2">
+                  {matches.slice(0, 4).map((m) => (
+                    <span
+                      key={m.id}
+                      className="tb-mono text-[10px] px-2 py-1 rounded-full"
+                      style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+                    >
+                      {m.name}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <button
+                  onClick={() => onQuickAdd && onQuickAdd(rec.keywords[0], "lures")}
+                  className="mt-2 text-[11px] tb-mono px-2.5 py-1 rounded-full"
+                  style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}
+                >
+                  + nothing in your box — add {rec.keywords[0]}
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </CardShell>
+  );
+}
+
+function RadarCard({ lat, lon }) {
+  const src = `https://www.rainviewer.com/map.html?loc=${lat},${lon},7&oFa=0&oC=1&oU=0&oCS=1&c=3&o=83&lm=1&layer=radar&sm=1&sn=1`;
+  return (
+    <CardShell title="DOPPLER RADAR" noPad>
+      <iframe
+        title="doppler radar"
+        src={src}
+        style={{ width: "100%", height: "280px", border: "none", display: "block" }}
+        loading="lazy"
+      />
+    </CardShell>
+  );
+}
+
+function CardShell({ title, subtitle, children, noPad }) {
+  return (
+    <div className="rounded-xl overflow-hidden" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+      {title && (
+        <div className="px-4 pt-3 pb-1.5" style={{ borderBottom: noPad ? "1px solid var(--tb-line)" : "none" }}>
+          <div className="tb-stencil text-sm" style={{ color: "var(--tb-brass)" }}>{title}</div>
+          {subtitle && <div className="tb-mono text-[10px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{subtitle}</div>}
+        </div>
+      )}
+      <div className={noPad ? "" : "px-4 pb-4 pt-1"}>{children}</div>
+    </div>
+  );
+}
+
+function LocationPicker({ onPick, onClose, onUseMyLocation }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function search() {
+    if (!query.trim()) return;
+    setLoading(true);
+    setErr(null);
+    try {
+      const res = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=6`);
+      const data = await res.json();
+      setResults(data.results || []);
+      if (!data.results || data.results.length === 0) setErr("No matches found.");
+    } catch (e) {
+      setErr("Search failed — check your connection.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="tb-overlay absolute inset-0 z-30 flex items-end" style={{ background: "rgba(10,16,19,0.65)" }} onClick={onClose}>
+      <div className="tb-tray w-full rounded-t-2xl px-5 pt-4 pb-6" style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "80%", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="tb-stencil text-xl" style={{ color: "var(--tb-text)" }}>SET LOCATION</h2>
+          <button onClick={onClose}><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+
+        {onUseMyLocation && (
+          <button onClick={onUseMyLocation} className="w-full mb-3 py-2.5 rounded-lg text-sm font-semibold" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+            Use my current location
+          </button>
+        )}
+
+        <div className="flex gap-2 mb-3">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && search()}
+            placeholder="City, lake, or coastal town..."
+            className="flex-1 rounded-lg py-2 px-3 text-sm outline-none"
+            style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+          />
+          <button onClick={search} className="px-4 rounded-lg text-sm font-semibold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+            Go
+          </button>
+        </div>
+
+        {loading && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Searching...</div>}
+        {err && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{err}</div>}
+
+        <div className="space-y-2">
+          {results.map((r, idx) => (
+            <button
+              key={idx}
+              onClick={() => onPick({ name: [r.name, r.admin1, r.country_code].filter(Boolean).join(", "), lat: r.latitude, lon: r.longitude })}
+              className="w-full text-left rounded-lg p-3"
+              style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}
+            >
+              <div className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{r.name}</div>
+              <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>{[r.admin1, r.country].filter(Boolean).join(", ")}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Spots (personal catch stats + nearby waters) ---------------- */
+
+function SpotsView({ catches }) {
+  const [location, setLocation] = useState(null);
+  const [locLoading, setLocLoading] = useState(true);
+  const [showLocationPicker, setShowLocationPicker] = useState(false);
+
+  const [nearby, setNearby] = useState(null);
+  const [nearbyLoading, setNearbyLoading] = useState(false);
+  const [nearbyError, setNearbyError] = useState(null);
+
+  const [marinas, setMarinas] = useState(null);
+  const [marinasLoading, setMarinasLoading] = useState(false);
+  const [marinasError, setMarinasError] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(LOCATION_KEY, false);
+        if (res && res.value) setLocation(JSON.parse(res.value));
+      } catch (e) {
+        // no saved location yet
+      }
+      setLocLoading(false);
+    })();
+  }, []);
+
+  const saveLocation = useCallback(async (loc) => {
+    setLocation(loc);
+    try {
+      await window.storage.set(LOCATION_KEY, JSON.stringify(loc), false);
+    } catch (e) {
+      // ignore, just won't persist
+    }
+  }, []);
+
+  const loadNearby = useCallback(async (lat, lon) => {
+    setNearbyLoading(true);
+    setNearbyError(null);
+    try {
+      const query = `[out:json][timeout:25];(node["leisure"="fishing"](around:24000,${lat},${lon});way["leisure"="fishing"](around:24000,${lat},${lon});way["natural"="water"](around:24000,${lat},${lon});way["waterway"="river"](around:24000,${lat},${lon}););out center 60;`;
+      const res = await fetch("https://overpass-api.de/api/interpreter", {
+        method: "POST",
+        body: query,
+      });
+      if (!res.ok) throw new Error("overpass request failed");
+      const data = await res.json();
+      const seen = new Set();
+      const spots = [];
+      for (const el of data.elements || []) {
+        const elLat = el.lat ?? el.center?.lat;
+        const elLon = el.lon ?? el.center?.lon;
+        const name = el.tags?.name;
+        if (elLat == null || elLon == null || !name || seen.has(name)) continue;
+        seen.add(name);
+        const type = el.tags?.leisure === "fishing" ? "Fishing spot" : el.tags?.waterway === "river" ? "River" : "Lake / pond";
+        spots.push({ name, type, lat: elLat, lon: elLon, distance: haversineMiles(lat, lon, elLat, elLon) });
+      }
+      spots.sort((a, b) => a.distance - b.distance);
+      setNearby(spots.slice(0, 10));
+    } catch (e) {
+      setNearbyError("Couldn't reach map data right now — try again in a bit.");
+    } finally {
+      setNearbyLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (location) loadNearby(location.lat, location.lon);
+  }, [location, loadNearby]);
+
+  const loadMarinas = useCallback(async (lat, lon) => {
+    setMarinasLoading(true);
+    setMarinasError(null);
+    try {
+      const query = `[out:json][timeout:25];(node["leisure"="marina"](around:40000,${lat},${lon});way["leisure"="marina"](around:40000,${lat},${lon}););out center 20;`;
+      const res = await fetch("https://overpass-api.de/api/interpreter", {
+        method: "POST",
+        body: query,
+      });
+      if (!res.ok) throw new Error("overpass request failed");
+      const data = await res.json();
+      const seen = new Set();
+      const found = [];
+      for (const el of data.elements || []) {
+        const elLat = el.lat ?? el.center?.lat;
+        const elLon = el.lon ?? el.center?.lon;
+        const name = el.tags?.name;
+        if (elLat == null || elLon == null || !name || seen.has(name)) continue;
+        seen.add(name);
+        found.push({ name, lat: elLat, lon: elLon, distance: haversineMiles(lat, lon, elLat, elLon) });
+      }
+      found.sort((a, b) => a.distance - b.distance);
+      const nearest = found.slice(0, 6);
+
+      // Fetch water temp for each nearby marina in parallel; missing data (common for
+      // small/inland marinas) just shows as unavailable rather than failing the whole list.
+      const withTemps = await Promise.all(
+        nearest.map(async (m) => {
+          try {
+            const wres = await fetch(
+              `https://marine-api.open-meteo.com/v1/marine?latitude=${m.lat}&longitude=${m.lon}&current=sea_surface_temperature&temperature_unit=fahrenheit&timezone=auto`
+            );
+            const wdata = await wres.json();
+            const temp = wdata.current?.sea_surface_temperature;
+            return { ...m, waterTemp: typeof temp === "number" ? temp : null };
+          } catch (e) {
+            return { ...m, waterTemp: null };
+          }
+        })
+      );
+      setMarinas(withTemps);
+    } catch (e) {
+      setMarinasError("Couldn't reach map data right now — try again in a bit.");
+    } finally {
+      setMarinasLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (location) loadMarinas(location.lat, location.lon);
+  }, [location, loadMarinas]);
+
+  function useMyLocation() {
+    setLocLoading(true);
+    if (!navigator.geolocation) {
+      setLocLoading(false);
+      setShowLocationPicker(true);
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        saveLocation({ name: "Current location", lat: pos.coords.latitude, lon: pos.coords.longitude });
+        setLocLoading(false);
+      },
+      () => {
+        setLocLoading(false);
+        setShowLocationPicker(true);
+      },
+      { timeout: 8000 }
+    );
+  }
+
+  const clusters = clusterCatchesByLocation(catches);
+
+  if (locLoading) {
+    return <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>Loading spots...</div>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <CardShell title="YOUR BEST SPOTS" subtitle="ranked from your GPS-tagged catches">
+        {clusters.length === 0 ? (
+          <EmptyState text="Log a few GPS-tagged catches and your top spots will show up here." />
+        ) : (
+          <div className="space-y-2">
+            {clusters.slice(0, 5).map((cl, idx) => (
+              <div key={idx} className="rounded-lg p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-sm font-semibold truncate" style={{ color: "var(--tb-text)" }}>
+                    {cl.name || `Spot ${idx + 1}`}
+                  </div>
+                  <span className="tb-mono text-[10px] px-2 py-0.5 rounded-full shrink-0" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+                    {cl.count} catch{cl.count !== 1 ? "es" : ""}
+                  </span>
+                </div>
+                <div className="tb-mono text-[11px] mt-1" style={{ color: "var(--tb-muted)" }}>
+                  {[
+                    `${cl.speciesCount} species`,
+                    cl.bestWeightLb > 0 ? `best ${cl.bestWeightLb.toFixed(1)} lb` : null,
+                    cl.topLure ? `${cl.topLure} working best` : null,
+                  ].filter(Boolean).join(" · ")}
+                </div>
+                <a
+                  href={`https://www.google.com/maps?q=${cl.lat},${cl.lon}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="tb-mono text-[11px] mt-1.5 inline-flex items-center gap-1"
+                  style={{ color: "var(--tb-blue)" }}
+                >
+                  <MapPin size={11} /> Open in Maps
+                </a>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardShell>
+
+      <CardShell title="NEARBY WATERS TO TRY" subtitle="pulled live from open map data">
+        <div className="flex items-center justify-between mb-2">
+          <button onClick={() => setShowLocationPicker(true)} className="flex items-center gap-1.5 text-xs tb-mono" style={{ color: "var(--tb-text)" }}>
+            <MapPin size={13} style={{ color: "var(--tb-brass)" }} />
+            {location ? location.name : "Set a search location"}
+          </button>
+          {location && (
+            <button onClick={() => loadNearby(location.lat, location.lon)} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
+              <RefreshCw size={13} className={nearbyLoading ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
+            </button>
+          )}
+        </div>
+
+        {!location && (
+          <button onClick={useMyLocation} className="w-full py-2 rounded-lg text-xs tb-mono" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>
+            Use my current location
+          </button>
+        )}
+
+        {location && nearbyLoading && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Searching nearby waters...</div>}
+        {location && nearbyError && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{nearbyError}</div>}
+        {location && !nearbyLoading && !nearbyError && nearby && nearby.length === 0 && (
+          <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No named waters found nearby — try a different spot.</div>
+        )}
+        {location && !nearbyLoading && nearby && nearby.length > 0 && (
+          <div className="space-y-1.5">
+            {nearby.map((s, idx) => (
+              <a
+                key={idx}
+                href={`https://www.google.com/maps?q=${s.lat},${s.lon}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center justify-between rounded-lg py-2 px-3"
+                style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}
+              >
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold truncate" style={{ color: "var(--tb-text)" }}>{s.name}</div>
+                  <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{s.type}</div>
+                </div>
+                <div className="tb-mono text-[11px] shrink-0" style={{ color: "var(--tb-blue)" }}>{s.distance.toFixed(1)} mi</div>
+              </a>
+            ))}
+          </div>
+        )}
+        <div className="tb-mono text-[9px] mt-2" style={{ color: "var(--tb-muted)" }}>
+          Map data © OpenStreetMap contributors
+        </div>
+      </CardShell>
+
+      <CardShell title="NEARBY MARINAS" subtitle="water temperature at each, where available">
+        {!location && (
+          <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Set a location above to see nearby marinas.</div>
+        )}
+        {location && (
+          <>
+            <div className="flex justify-end mb-2">
+              <button onClick={() => loadMarinas(location.lat, location.lon)} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
+                <RefreshCw size={13} className={marinasLoading ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
+              </button>
+            </div>
+            {marinasLoading && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Finding nearby marinas...</div>}
+            {marinasError && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{marinasError}</div>}
+            {!marinasLoading && !marinasError && marinas && marinas.length === 0 && (
+              <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No named marinas found within about 25 miles.</div>
+            )}
+            {!marinasLoading && marinas && marinas.length > 0 && (
+              <div className="space-y-1.5">
+                {marinas.map((m, idx) => (
+                  <a
+                    key={idx}
+                    href={`https://www.google.com/maps?q=${m.lat},${m.lon}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center justify-between rounded-lg py-2 px-3"
+                    style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}
+                  >
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold truncate" style={{ color: "var(--tb-text)" }}>{m.name}</div>
+                      <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{m.distance.toFixed(1)} mi away</div>
+                    </div>
+                    <div className="tb-mono text-xs shrink-0 flex items-center gap-1" style={{ color: typeof m.waterTemp === "number" ? "var(--tb-brass)" : "var(--tb-muted)" }}>
+                      <Waves size={12} />
+                      {typeof m.waterTemp === "number" ? `${Math.round(m.waterTemp)}°F` : "no data"}
+                    </div>
+                  </a>
+                ))}
+              </div>
+            )}
+            <div className="tb-mono text-[9px] mt-2" style={{ color: "var(--tb-muted)" }}>
+              Map data © OpenStreetMap contributors · water temps from Open-Meteo
+            </div>
+          </>
+        )}
+      </CardShell>
+
+      {showLocationPicker && (
+        <LocationPicker
+          onPick={(loc) => { saveLocation(loc); setShowLocationPicker(false); }}
+          onClose={() => setShowLocationPicker(false)}
+          onUseMyLocation={useMyLocation}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------------- Community (shared feed, spots, leaderboard) ---------------- */
+
+function CommunityView() {
+  const [sub, setSub] = useState("feed"); // feed | spots | leaderboard
+  const [ready, setReady] = useState(!!(typeof window !== "undefined" && window.communityAPI && window.communityAPI.ready));
+  const configured = typeof window !== "undefined" && window.communityAPI && window.communityAPI.configured;
+  const [nickname, setNicknameState] = useState(() => (configured ? window.communityAPI.getNickname() : "Angler"));
+  const [editingNickname, setEditingNickname] = useState(false);
+  const [nicknameDraft, setNicknameDraft] = useState(nickname);
+
+  useEffect(() => {
+    if (!configured || ready) return;
+    function onReady() {
+      setReady(true);
+      setNicknameState(window.communityAPI.getNickname());
+    }
+    window.addEventListener("community-ready", onReady);
+    const t = setTimeout(() => {
+      if (window.communityAPI && window.communityAPI.ready) onReady();
+    }, 1500);
+    return () => {
+      window.removeEventListener("community-ready", onReady);
+      clearTimeout(t);
+    };
+  }, [configured, ready]);
+
+  function saveNickname() {
+    const name = nicknameDraft.trim() || "Angler";
+    window.communityAPI.setNickname(name);
+    setNicknameState(name);
+    setEditingNickname(false);
+  }
+
+  if (!configured) {
+    return (
+      <div className="py-10 text-center space-y-3">
+        <Waves size={30} className="mx-auto" style={{ color: "var(--tb-brass)" }} />
+        <p className="text-sm px-4" style={{ color: "var(--tb-muted)" }}>
+          Community features need a one-time setup by whoever's hosting this app
+          (a free Firebase project). Ask them to finish that step, then this tab
+          will light up for everyone.
+        </p>
+      </div>
+    );
+  }
+
+  if (!ready) {
+    return <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>Connecting to the community...</div>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="flex gap-2">
+          <TabButton active={sub === "feed"} onClick={() => setSub("feed")} label="Feed" />
+          <TabButton active={sub === "spots"} onClick={() => setSub("spots")} label="Spots" />
+          <TabButton active={sub === "leaderboard"} onClick={() => setSub("leaderboard")} label="Ranks" />
+        </div>
+      </div>
+
+      <CardShell title="YOUR ANGLER NAME">
+        {editingNickname ? (
+          <div className="flex gap-2">
+            <input
+              autoFocus
+              value={nicknameDraft}
+              onChange={(e) => setNicknameDraft(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && saveNickname()}
+              className="flex-1 rounded-lg py-2 px-3 text-sm outline-none"
+              style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+            />
+            <button onClick={saveNickname} className="px-3 rounded-lg text-xs tb-mono font-semibold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>Save</button>
+          </div>
+        ) : (
+          <button onClick={() => { setNicknameDraft(nickname); setEditingNickname(true); }} className="flex items-center justify-between w-full">
+            <span className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{nickname}</span>
+            <span className="tb-mono text-[11px]" style={{ color: "var(--tb-blue)" }}>Change</span>
+          </button>
+        )}
+      </CardShell>
+
+      {sub === "feed" && <CommunityFeed />}
+      {sub === "spots" && <CommunitySpots />}
+      {sub === "leaderboard" && <CommunityLeaderboard />}
+    </div>
+  );
+}
+
+function CommunityFeed() {
+  const [catches, setCatches] = useState(null);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const data = await window.communityAPI.listCatches(30);
+      setCatches(data);
+    } catch (e) {
+      setError("Couldn't load the community feed right now.");
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function handleDelete(id) {
+    try {
+      await window.communityAPI.deleteCatch(id);
+      setCatches((prev) => prev.filter((c) => c.id !== id));
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  return (
+    <CardShell title="RECENT CATCHES" subtitle="shared by everyone using this app">
+      <div className="flex justify-end mb-2">
+        <button onClick={load} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
+          <RefreshCw size={13} style={{ color: "var(--tb-muted)" }} />
+        </button>
+      </div>
+      {error && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      {!error && catches === null && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading feed...</div>}
+      {!error && catches && catches.length === 0 && <EmptyState text="No shared catches yet — be the first from the Catches tab." />}
+      {!error && catches && catches.length > 0 && (
+        <div className="space-y-2">
+          {catches.map((c) => {
+            const dt = c.dateTime ? new Date(c.dateTime) : null;
+            const mine = window.communityAPI.uid && c.uid === window.communityAPI.uid;
+            return (
+              <div key={c.id} className="rounded-lg p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{c.species || "Unknown species"}</span>
+                  <span className="tb-mono text-[10px]" style={{ color: "var(--tb-brass)" }}>{c.nickname || "Angler"}</span>
+                </div>
+                <div className="tb-mono text-[11px] mt-0.5" style={{ color: "var(--tb-muted)" }}>
+                  {[
+                    c.length ? `${c.length} ${c.lengthUnit}` : null,
+                    c.weight ? `${c.weight} ${c.weightUnit}` : null,
+                    dt ? dt.toLocaleDateString([], { month: "short", day: "numeric" }) : null,
+                  ].filter(Boolean).join(" · ")}
+                </div>
+                {(c.lure || c.location) && (
+                  <div className="tb-mono text-[11px] mt-1" style={{ color: "var(--tb-blue)" }}>
+                    {[c.lure, c.location].filter(Boolean).join(" · ")}
+                  </div>
+                )}
+                {mine && (
+                  <button onClick={() => handleDelete(c.id)} className="tb-mono text-[10px] mt-1.5" style={{ color: "var(--tb-flare)" }}>
+                    Remove my post
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </CardShell>
+  );
+}
+
+function CommunitySpots() {
+  const [spots, setSpots] = useState(null);
+  const [error, setError] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [votedIds, setVotedIds] = useState({});
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const data = await window.communityAPI.listSpots();
+      setSpots(data);
+    } catch (e) {
+      setError("Couldn't load community spots right now.");
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function vote(spotId) {
+    if (votedIds[spotId]) return;
+    setVotedIds((prev) => ({ ...prev, [spotId]: true }));
+    try {
+      await window.communityAPI.voteSpot(spotId);
+      setSpots((prev) => prev.map((s) => (s.id === spotId ? { ...s, voteCount: (s.voteCount || 0) + 1 } : s)).sort((a, b) => (b.voteCount || 0) - (a.voteCount || 0)));
+    } catch (e) {
+      setVotedIds((prev) => ({ ...prev, [spotId]: false }));
+    }
+  }
+
+  return (
+    <>
+      <CardShell title="CROWD-SOURCED SPOTS" subtitle="submitted and upvoted by the community">
+        <div className="flex justify-between items-center mb-2">
+          <button onClick={() => setShowForm(true)} className="text-xs tb-mono px-3 py-1.5 rounded-full" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+            + Add a spot
+          </button>
+          <button onClick={load} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
+            <RefreshCw size={13} style={{ color: "var(--tb-muted)" }} />
+          </button>
+        </div>
+        {error && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+        {!error && spots === null && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading spots...</div>}
+        {!error && spots && spots.length === 0 && <EmptyState text="No community spots yet — add the first one." />}
+        {!error && spots && spots.length > 0 && (
+          <div className="space-y-2">
+            {spots.map((s) => (
+              <div key={s.id} className="rounded-lg p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold truncate" style={{ color: "var(--tb-text)" }}>{s.name}</div>
+                    <div className="tb-mono text-[10px] mt-0.5" style={{ color: "var(--tb-brass)" }}>added by {s.nickname || "Angler"}</div>
+                  </div>
+                  <button
+                    onClick={() => vote(s.id)}
+                    disabled={!!votedIds[s.id]}
+                    className="flex flex-col items-center px-2 py-1 rounded-lg shrink-0"
+                    style={{ background: votedIds[s.id] ? "var(--tb-brass)" : "var(--tb-surface)", color: votedIds[s.id] ? "var(--tb-bg)" : "var(--tb-text)" }}
+                  >
+                    <ArrowUp size={13} />
+                    <span className="tb-mono text-[10px]">{s.voteCount || 0}</span>
+                  </button>
+                </div>
+                {s.notes && <div className="text-xs mt-1.5" style={{ color: "var(--tb-muted)" }}>{s.notes}</div>}
+                {typeof s.lat === "number" && (
+                  <a
+                    href={`https://www.google.com/maps?q=${s.lat},${s.lon}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="tb-mono text-[11px] mt-1.5 inline-flex items-center gap-1"
+                    style={{ color: "var(--tb-blue)" }}
+                  >
+                    <MapPin size={11} /> Open in Maps
+                  </a>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </CardShell>
+
+      {showForm && <AddSpotForm onCancel={() => setShowForm(false)} onSaved={() => { setShowForm(false); load(); }} />}
+    </>
+  );
+}
+
+function AddSpotForm({ onCancel, onSaved }) {
+  const [name, setName] = useState("");
+  const [notes, setNotes] = useState("");
+  const [gps, setGps] = useState(null);
+  const [gpsStatus, setGpsStatus] = useState("idle");
+  const [saving, setSaving] = useState(false);
+
+  const captureGps = useCallback(() => {
+    if (!navigator.geolocation) {
+      setGpsStatus("error");
+      return;
+    }
+    setGpsStatus("locating");
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setGps({ lat: pos.coords.latitude, lon: pos.coords.longitude });
+        setGpsStatus("ok");
+      },
+      () => setGpsStatus("error"),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  }, []);
+
+  useEffect(() => { captureGps(); }, [captureGps]);
+
+  async function submit() {
+    if (!name.trim() || saving) return;
+    setSaving(true);
+    try {
+      await window.communityAPI.addSpot({
+        name: name.trim(),
+        notes: notes.trim(),
+        lat: gps ? gps.lat : null,
+        lon: gps ? gps.lon : null,
+      });
+      onSaved();
+    } catch (e) {
+      setSaving(false);
+    }
+  }
+
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+
+  return (
+    <div className="tb-overlay absolute inset-0 z-30" style={{ background: "rgba(10,16,19,0.65)" }}>
+      <div className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-5 pt-4 pb-6" style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "80%", overflowY: "auto" }}>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="tb-stencil text-xl" style={{ color: "var(--tb-text)" }}>ADD A SPOT</h2>
+          <button onClick={onCancel}><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+        <div className="space-y-3">
+          <Field label="Spot name">
+            <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. North Cove boat ramp" className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+          </Field>
+          <Field label="Notes (optional)">
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} placeholder="What's good here, access tips, etc." className="w-full rounded-lg py-2 px-3 text-sm outline-none resize-none" style={inputStyle} />
+          </Field>
+          <Field label="Location">
+            {gpsStatus === "locating" && (
+              <div className="flex items-center gap-2 text-xs tb-mono rounded-lg py-2 px-3" style={inputStyle}>
+                <RefreshCw size={13} className="tb-spin" style={{ color: "var(--tb-muted)" }} />
+                <span style={{ color: "var(--tb-muted)" }}>Finding your location...</span>
+              </div>
+            )}
+            {gpsStatus === "ok" && gps && (
+              <div className="text-xs tb-mono rounded-lg py-2 px-3" style={inputStyle}>
+                <span style={{ color: "var(--tb-text)" }}>{gps.lat.toFixed(4)}, {gps.lon.toFixed(4)}</span>
+              </div>
+            )}
+            {gpsStatus === "error" && (
+              <div className="flex items-center justify-between text-xs tb-mono rounded-lg py-2 px-3" style={inputStyle}>
+                <span style={{ color: "var(--tb-muted)" }}>No location — spot will save without a pin.</span>
+                <button type="button" onClick={captureGps} style={{ color: "var(--tb-brass)" }}>Try again</button>
+              </div>
+            )}
+          </Field>
+        </div>
+        <div className="flex gap-3 mt-5">
+          <button onClick={onCancel} className="flex-1 py-2.5 rounded-lg text-sm font-semibold" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>Cancel</button>
+          <button onClick={submit} disabled={!name.trim() || saving} className="flex-1 py-2.5 rounded-lg text-sm font-semibold" style={{ background: name.trim() ? "var(--tb-brass)" : "var(--tb-surface-2)", color: name.trim() ? "var(--tb-bg)" : "var(--tb-muted)" }}>
+            {saving ? "Saving..." : "Add spot"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CommunityLeaderboard() {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const data = await window.communityAPI.getLeaderboard();
+      setRows(data);
+    } catch (e) {
+      setError("Couldn't load the leaderboard right now.");
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  return (
+    <CardShell title="LEADERBOARD" subtitle="ranked by shared catches">
+      <div className="flex justify-end mb-2">
+        <button onClick={load} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
+          <RefreshCw size={13} style={{ color: "var(--tb-muted)" }} />
+        </button>
+      </div>
+      {error && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      {!error && rows === null && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading rankings...</div>}
+      {!error && rows && rows.length === 0 && <EmptyState text="No shared catches yet to rank." />}
+      {!error && rows && rows.length > 0 && (
+        <div className="space-y-1.5">
+          {rows.map((r, idx) => (
+            <div key={r.nickname} className="flex items-center justify-between rounded-lg py-2 px-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="tb-mono text-xs w-5 text-center shrink-0" style={{ color: "var(--tb-brass)" }}>{idx + 1}</span>
+                <span className="text-sm font-semibold truncate" style={{ color: "var(--tb-text)" }}>{r.nickname}</span>
+              </div>
+              <div className="tb-mono text-[11px] text-right shrink-0" style={{ color: "var(--tb-muted)" }}>
+                {r.count} catch{r.count !== 1 ? "es" : ""}
+                {r.bestLb > 0 ? ` · best ${r.bestLb.toFixed(1)} lb ${r.bestSpecies || ""}` : ""}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </CardShell>
+  );
+}
+
+/* ---------------- Knots (reference guide) ---------------- */
+
+const KNOT_CATEGORIES = [
+  { id: "all", label: "All" },
+  { id: "hook", label: "Hook / Lure" },
+  { id: "join", label: "Join Lines" },
+  { id: "loop", label: "Loops" },
+  { id: "rig", label: "Rigging" },
+];
+
+const KNOTS = [
+  {
+    id: "improved-clinch",
+    name: "Improved Clinch Knot",
+    category: "hook",
+    difficulty: "Easy",
+    useCase: "Tying line to a hook, lure, or swivel",
+    steps: [
+      "Thread the tag end through the eye of the hook and pull through 6+ inches.",
+      "Twist the tag end around the standing line 5–6 times.",
+      "Bring the tag end back and thread it through the small loop formed just above the eye.",
+      "Thread the tag end again through the larger loop you just created.",
+      "Moisten the knot and pull the standing line and tag end slowly to cinch it tight against the eye.",
+      "Trim the excess tag end close to the knot.",
+    ],
+    tip: "A classic, reliable all-purpose knot. Works best on mono and fluorocarbon; braid can slip, so consider the Palomar for braided line.",
+  },
+  {
+    id: "palomar",
+    name: "Palomar Knot",
+    category: "hook",
+    difficulty: "Easy",
+    useCase: "Tying line to a hook or lure — very strong, works great with braid",
+    steps: [
+      "Double about 6 inches of line and pass the loop through the hook eye.",
+      "Tie a simple overhand knot with the doubled line, letting the hook hang loose in the loop — don't tighten yet.",
+      "Pass the loop over the entire hook or lure.",
+      "Moisten the knot and pull both the standing line and tag end to draw it snug against the eye.",
+      "Trim the tag end.",
+    ],
+    tip: "Considered one of the strongest and simplest knots — a great default if you're only going to learn one.",
+  },
+  {
+    id: "uni-knot",
+    name: "Uni Knot",
+    category: "hook",
+    difficulty: "Easy",
+    useCase: "Versatile — hook attachment, joining lines, or a loop, all with the same basic wrap",
+    steps: [
+      "Pass the tag end through the hook eye and back alongside the standing line, forming a loop.",
+      "Wrap the tag end around both lines 5–6 times inside the loop.",
+      "Moisten and pull the tag end to snug the coils together.",
+      "Slide the whole knot down to the eye by pulling the standing line, then trim the tag end.",
+    ],
+    tip: "Worth learning first — the same wrap pattern shows up in the loop and line-joining versions below.",
+  },
+  {
+    id: "double-uni",
+    name: "Double Uni Knot",
+    category: "join",
+    difficulty: "Medium",
+    useCase: "Joining two lines of similar diameter (mono to mono, or backing to line)",
+    steps: [
+      "Overlap the two line ends by about a foot, running parallel to each other.",
+      "With one tag end, form a loop around both lines and wrap it around them 5–6 times, then pass it back through the loop and snug it (this is one Uni knot).",
+      "Repeat the same wrap with the other tag end, in the opposite direction.",
+      "Moisten both knots, then pull the two standing lines apart so the knots slide together and lock.",
+      "Trim both tag ends close to the knot.",
+    ],
+    tip: "Handles slightly different line types reasonably well, though for mono-to-braid the Albright below holds up better.",
+  },
+  {
+    id: "albright",
+    name: "Albright Knot",
+    category: "join",
+    difficulty: "Medium",
+    useCase: "Joining lines of very different diameter — classic for mono/fluoro leader to braid",
+    steps: [
+      "Form a loop in the thicker line (e.g. mono leader) and hold it pinched between your fingers.",
+      "Pass the thinner line (e.g. braid) through the loop.",
+      "Wrap the thin line back over itself and the loop 10–12 times, working toward the closed end of the loop.",
+      "Thread the tag end of the thin line back through the loop, exiting the same side it entered.",
+      "Moisten and pull both standing lines firmly to compress the wraps tightly, then trim both tag ends.",
+    ],
+    tip: "Take your time with the wraps — keeping them snug and orderly (not overlapping) is what makes this knot hold.",
+  },
+  {
+    id: "surgeons-knot",
+    name: "Surgeon's Knot",
+    category: "join",
+    difficulty: "Easy",
+    useCase: "Quick join between leader and tippet/main line, especially similar diameters",
+    steps: [
+      "Overlap the two line ends by 6–8 inches.",
+      "Treating the overlapped lines as one, tie an overhand knot but pass the ends through the loop twice instead of once.",
+      "Moisten and pull all four ends evenly to cinch the knot down.",
+      "Trim the tag ends close.",
+    ],
+    tip: "Fast to tie under pressure, though a bit bulkier than the Double Uni or Albright.",
+  },
+  {
+    id: "non-slip-loop",
+    name: "Non-Slip Loop Knot",
+    category: "loop",
+    difficulty: "Medium",
+    useCase: "Loop knot for lures/flies that need to swing freely for natural action",
+    steps: [
+      "Tie a simple overhand knot in the line about 6 inches from the end, without tightening, leaving a loose loop.",
+      "Pass the tag end through the hook or lure eye, then back through the overhand loop you just made.",
+      "Wrap the tag end around the standing line 5–6 times.",
+      "Thread the tag end back through the original overhand loop, entering from the same side it exited.",
+      "Moisten and slowly pull the standing line to snug the wraps down onto the overhand knot, leaving the loop at the eye open.",
+      "Trim the tag end.",
+    ],
+    tip: "Unlike a plain loop, this one won't slip down and cinch shut under pressure — the lure keeps its swimming action.",
+  },
+  {
+    id: "dropper-loop",
+    name: "Dropper Loop",
+    category: "rig",
+    difficulty: "Medium",
+    useCase: "Creating a perpendicular loop mid-line for multi-hook or multi-lure rigs",
+    steps: [
+      "Form a loop at the point in the line where you want the dropper.",
+      "Pinch the loop and twist it around the standing line 6–8 times, keeping an opening in the middle of the twists.",
+      "Reach through that middle opening and pull the original loop through it.",
+      "Moisten and pull both ends of the standing line slowly and evenly so the twists gather tightly around the base of the loop.",
+      "Adjust the loop to the size you want, then trim if needed.",
+    ],
+    tip: "Great for surf or bottom rigs with multiple hooks above a sinker — keep the twists even so the loop stands out perpendicular to the line.",
+  },
+];
+
+function KnotsView() {
+  const [category, setCategory] = useState("all");
+  const [expanded, setExpanded] = useState({});
+
+  const filtered = category === "all" ? KNOTS : KNOTS.filter((k) => k.category === category);
+
+  function toggle(id) {
+    setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }}>
+        {KNOT_CATEGORIES.map((c) => (
+          <TabButton key={c.id} active={category === c.id} onClick={() => setCategory(c.id)} label={c.label} />
+        ))}
+      </div>
+
+      <div className="space-y-2">
+        {filtered.map((knot) => {
+          const isOpen = !!expanded[knot.id];
+          const videoUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent("how to tie a " + knot.name + " fishing knot")}`;
+          return (
+            <div key={knot.id} className="rounded-xl overflow-hidden" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+              <button onClick={() => toggle(knot.id)} className="w-full text-left px-4 py-3 flex items-center gap-3">
+                <KnotIcon />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{knot.name}</span>
+                    <span className="tb-mono text-[9px] px-1.5 py-0.5 rounded-full shrink-0" style={{ background: "var(--tb-surface-2)", color: "var(--tb-brass)", border: "1px solid var(--tb-line)" }}>
+                      {knot.difficulty}
+                    </span>
+                  </div>
+                  <div className="tb-mono text-[11px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{knot.useCase}</div>
+                </div>
+                <ChevronDown size={16} style={{ color: "var(--tb-muted)", transform: isOpen ? "rotate(180deg)" : "none", transition: "transform 0.15s" }} />
+              </button>
+              {isOpen && (
+                <div className="px-4 pb-4" style={{ borderTop: "1px solid var(--tb-line)" }}>
+                  <ol className="space-y-2 mt-3 list-decimal list-inside">
+                    {knot.steps.map((step, idx) => (
+                      <li key={idx} className="text-xs leading-relaxed" style={{ color: "var(--tb-text)" }}>{step}</li>
+                    ))}
+                  </ol>
+                  <div className="tb-mono text-[11px] mt-3 rounded-lg p-2.5" style={{ background: "var(--tb-surface-2)", color: "var(--tb-muted)" }}>
+                    💡 {knot.tip}
+                  </div>
+                  <a
+                    href={videoUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="tb-mono text-[11px] mt-2 inline-flex items-center gap-1"
+                    style={{ color: "var(--tb-blue)" }}
+                  >
+                    <ExternalLink size={11} /> Watch a video tutorial
+                  </a>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function KnotIcon() {
+  return (
+    <svg width="26" height="26" viewBox="0 0 26 26" fill="none" className="shrink-0">
+      <path
+        d="M4 13c0-3 2-5 5-5s5 2 5 5-2 5-5 5-5-2-5-5c0-5 4-9 9-9s9 4 9 9"
+        stroke="var(--tb-brass)"
+        strokeWidth="2"
+        strokeLinecap="round"
+        fill="none"
+      />
+    </svg>
+  );
+}
+
+/* ---------------- Settings (license & limits, backup/restore) ---------------- */
+
+async function exportAllData() {
+  const data = { version: 1, exportedAt: new Date().toISOString() };
+  try {
+    const r = await window.storage.get(STORAGE_KEY, false);
+    data.items = r && r.value ? JSON.parse(r.value) : [];
+  } catch (e) {
+    data.items = [];
+  }
+  try {
+    const r = await window.storage.get(CATCH_KEY, false);
+    data.catches = r && r.value ? JSON.parse(r.value) : [];
+  } catch (e) {
+    data.catches = [];
+  }
+  try {
+    const r = await window.storage.get(LOCATION_KEY, false);
+    data.location = r && r.value ? JSON.parse(r.value) : null;
+  } catch (e) {
+    data.location = null;
+  }
+  try {
+    const r = await window.storage.get(LICENSE_KEY, false);
+    data.license = r && r.value ? JSON.parse(r.value) : null;
+  } catch (e) {
+    data.license = null;
+  }
+  data.nickname = (typeof window !== "undefined" && window.communityAPI && window.communityAPI.getNickname)
+    ? window.communityAPI.getNickname()
+    : null;
+
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `epic-fishy-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+async function importAllData(file) {
+  const text = await file.text();
+  const data = JSON.parse(text);
+  if (Array.isArray(data.items)) await window.storage.set(STORAGE_KEY, JSON.stringify(data.items), false);
+  if (Array.isArray(data.catches)) await window.storage.set(CATCH_KEY, JSON.stringify(data.catches), false);
+  if (data.location) await window.storage.set(LOCATION_KEY, JSON.stringify(data.location), false);
+  if (data.license) await window.storage.set(LICENSE_KEY, JSON.stringify(data.license), false);
+  if (data.nickname && typeof window !== "undefined" && window.communityAPI && window.communityAPI.setNickname) {
+    window.communityAPI.setNickname(data.nickname);
+  }
+}
+
+function SettingsPanel({ onClose }) {
+  const [loading, setLoading] = useState(true);
+  const [expiry, setExpiry] = useState("");
+  const [notes, setNotes] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importMsg, setImportMsg] = useState(null);
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(LICENSE_KEY, false);
+        if (r && r.value) {
+          const parsed = JSON.parse(r.value);
+          setExpiry(parsed.expiry ? parsed.expiry.slice(0, 10) : "");
+          setNotes(parsed.notes || "");
+        }
+      } catch (e) {
+        // no saved license info yet
+      }
+      setLoading(false);
+    })();
+  }, []);
+
+  async function saveLicense() {
+    const data = { expiry: expiry ? new Date(expiry).toISOString() : null, notes: notes.trim() };
+    try {
+      await window.storage.set(LICENSE_KEY, JSON.stringify(data), false);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  const daysUntilExpiry = expiry ? Math.ceil((new Date(expiry) - new Date()) / 86400000) : null;
+
+  async function handleImportFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setImporting(true);
+    setImportMsg(null);
+    try {
+      await importAllData(file);
+      setImportMsg("Import complete — reloading...");
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (err) {
+      setImportMsg("Couldn't read that file — make sure it's an Epic Fishy backup.");
+      setImporting(false);
+    }
+  }
+
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+
+  return (
+    <div className="tb-overlay absolute inset-0 z-40" style={{ background: "rgba(10,16,19,0.7)" }} onClick={onClose}>
+      <div
+        className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-5 pt-4 pb-6"
+        style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "85%", overflowY: "auto" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="tb-stencil text-xl" style={{ color: "var(--tb-text)" }}>SETTINGS</h2>
+          <button onClick={onClose}><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+
+        <CardShell title="LICENSE & LIMITS">
+          {loading ? (
+            <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading...</div>
+          ) : (
+            <div className="space-y-3">
+              <Field label="License expiration date">
+                <input type="date" value={expiry} onChange={(e) => setExpiry(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+              </Field>
+              {daysUntilExpiry !== null && (
+                <div className="tb-mono text-xs" style={{ color: daysUntilExpiry <= 14 ? "var(--tb-flare)" : "var(--tb-muted)" }}>
+                  {daysUntilExpiry < 0
+                    ? "Your license has expired."
+                    : daysUntilExpiry === 0
+                    ? "Expires today!"
+                    : `Expires in ${daysUntilExpiry} day${daysUntilExpiry !== 1 ? "s" : ""}.`}
+                </div>
+              )}
+              <Field label="Size & bag limits, notes">
+                <textarea
+                  value={notes}
+                  onChange={(e) => setNotes(e.target.value)}
+                  rows={3}
+                  placeholder="e.g. Largemouth bass: 5/day, 12in minimum at Clear Lake"
+                  className="w-full rounded-lg py-2 px-3 text-sm outline-none resize-none"
+                  style={inputStyle}
+                />
+              </Field>
+              <button onClick={saveLicense} className="w-full py-2 rounded-lg text-xs tb-mono font-semibold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+                {saved ? "Saved ✓" : "Save"}
+              </button>
+            </div>
+          )}
+        </CardShell>
+
+        <div className="h-3" />
+
+        <CardShell title="YOUR DATA">
+          <div className="space-y-2">
+            <button onClick={exportAllData} className="w-full py-2.5 rounded-lg text-xs tb-mono font-semibold" style={inputStyle}>
+              Export a backup file
+            </button>
+            <input ref={fileInputRef} type="file" accept="application/json" onChange={handleImportFile} className="hidden" />
+            <button
+              onClick={() => fileInputRef.current && fileInputRef.current.click()}
+              disabled={importing}
+              className="w-full py-2.5 rounded-lg text-xs tb-mono font-semibold"
+              style={inputStyle}
+            >
+              {importing ? "Importing..." : "Import a backup file"}
+            </button>
+            {importMsg && <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>{importMsg}</div>}
+            <p className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>
+              Importing replaces your current tackle box, catches, and location with the backup's contents.
+              Worth doing this occasionally — everything lives only on this device otherwise.
+            </p>
+          </div>
+        </CardShell>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Tackle ID Guide (original reference illustrations) ---------------- */
+
+const TACKLE_REF_CATEGORIES = [
+  { id: "all", label: "All" },
+  { id: "lures", label: "Lures" },
+  { id: "hooks", label: "Hooks" },
+  { id: "rigs", label: "Rigs" },
+];
+
+const TACKLE_REFERENCE = [
+  { id: "spinnerbait", category: "lures", name: "Spinnerbait", desc: "A bent-wire bait with a spinning metal blade on one arm and a skirted hook on the other. A great search bait in murky water or around cover." },
+  { id: "crankbait", category: "lures", name: "Crankbait", desc: "A hard-bodied lure with a diving lip that makes it wobble. Lip size controls dive depth — good for covering water fast." },
+  { id: "jig", category: "lures", name: "Jig", desc: "A weighted head molded onto a hook, usually dressed with a skirt or soft plastic trailer. Fished along the bottom with a hop-and-pause retrieve." },
+  { id: "worm", category: "lures", name: "Soft Plastic Worm", desc: "A flexible plastic worm rigged on a hook and fished slowly along the bottom. One of the most versatile, consistent baits there is." },
+  { id: "popper", category: "lures", name: "Popper (Topwater)", desc: "A surface lure with a concave face that pops and splashes when jerked, imitating a struggling baitfish. Best at dawn, dusk, or calm water." },
+  { id: "spoon", category: "lures", name: "Spoon", desc: "A curved, concave piece of metal that wobbles and flashes as it falls or is retrieved — mimics a fleeing baitfish." },
+  { id: "swimbait", category: "lures", name: "Swimbait", desc: "A soft or hard lure shaped like a baitfish with a paddle or boot tail that kicks on a steady retrieve." },
+  { id: "chatterbait", category: "lures", name: "Chatterbait", desc: "A jig with a small metal blade bolted to the head that vibrates the whole lure — a hybrid between a jig and a spinnerbait." },
+
+  { id: "jhook", category: "hooks", name: "J-Hook / Worm Hook", desc: "The classic all-purpose shape — a straight shank curving into a J. Used for live bait, worms, and most soft plastics." },
+  { id: "treble", category: "hooks", name: "Treble Hook", desc: "Three hook points joined at a single eye. Standard on crankbaits, topwaters, and spoons for extra hookup odds." },
+  { id: "circle", category: "hooks", name: "Circle Hook", desc: "The point curves back in toward the shank. Designed to hook fish in the corner of the mouth when you simply reel tight — no hard hookset needed." },
+  { id: "octopus", category: "hooks", name: "Octopus / Wide Gap Hook", desc: "A short shank with a wide, rounded bend. Common for live bait and bulkier soft plastics." },
+
+  { id: "texas-rig", category: "rigs", name: "Texas Rig", desc: "A bullet weight slides on the line above a worm hook rigged weedless. The go-to setup for fishing soft plastics through cover." },
+  { id: "carolina-rig", category: "rigs", name: "Carolina Rig", desc: "The weight and a bead sit above a swivel, with a longer leader running to the hook and bait — lets it float more naturally off bottom." },
+  { id: "drop-shot", category: "rigs", name: "Drop Shot Rig", desc: "The hook ties in mid-line facing out, with the weight hanging below at the very end. Keeps the bait suspended right at a fish's level." },
+  { id: "wacky-rig", category: "rigs", name: "Wacky Rig", desc: "A worm is hooked through its middle so both ends dangle and shimmy on the fall. Deadly for a slow, subtle presentation." },
+];
+
+function TackleRefIcon({ type }) {
+  const brass = "var(--tb-brass)";
+  const blue = "var(--tb-blue)";
+  const size = { width: 44, height: 44, viewBox: "0 0 64 64" };
+
+  switch (type) {
+    case "spinnerbait":
+      return (
+        <svg {...size}>
+          <path d="M10 50 L32 14 L54 50" style={{ stroke: brass }} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+          <ellipse cx="12" cy="47" rx="7" ry="4" style={{ fill: blue }} transform="rotate(-25 12 47)" />
+          <circle cx="52" cy="50" r="5" style={{ fill: brass }} />
+          <path d="M52 55 q4 8 10 3" style={{ stroke: brass }} strokeWidth="2" fill="none" strokeLinecap="round" />
+        </svg>
+      );
+    case "crankbait":
+      return (
+        <svg {...size}>
+          <ellipse cx="34" cy="30" rx="20" ry="10" style={{ fill: blue, fillOpacity: 0.25, stroke: brass }} strokeWidth="2" />
+          <path d="M14 30 L4 22 L4 38 Z" style={{ fill: brass }} />
+          <path d="M28 40 q3 8 10 6" style={{ stroke: brass }} strokeWidth="2" fill="none" strokeLinecap="round" />
+          <path d="M44 40 q3 8 10 6" style={{ stroke: brass }} strokeWidth="2" fill="none" strokeLinecap="round" />
+        </svg>
+      );
+    case "jig":
+      return (
+        <svg {...size}>
+          <circle cx="32" cy="16" r="8" style={{ fill: brass }} />
+          <path d="M20 18 L13 27 M26 22 L17 33 M32 24 L28 37 M38 22 L39 37 M44 18 L51 30" style={{ stroke: blue }} strokeWidth="2" strokeLinecap="round" />
+          <path d="M32 24 q-3 22 16 24" style={{ stroke: brass }} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+        </svg>
+      );
+    case "worm":
+      return (
+        <svg {...size}>
+          <path d="M6 22 q11 -12 22 0 t22 0 t10 10" style={{ stroke: blue }} strokeWidth="5" fill="none" strokeLinecap="round" />
+        </svg>
+      );
+    case "popper":
+      return (
+        <svg {...size}>
+          <rect x="16" y="22" width="30" height="16" rx="8" style={{ fill: blue, fillOpacity: 0.25, stroke: brass }} strokeWidth="2" />
+          <path d="M16 22 a8 8 0 0 0 0 16" style={{ fill: "var(--tb-bg)", stroke: brass }} strokeWidth="2" />
+        </svg>
+      );
+    case "spoon":
+      return (
+        <svg {...size}>
+          <path d="M12 34 q12 -22 38 -8 q-16 4 -22 18 q-9 -2 -16 -10 Z" style={{ fill: brass, fillOpacity: 0.85 }} />
+        </svg>
+      );
+    case "swimbait":
+      return (
+        <svg {...size}>
+          <path d="M8 32 q16 -16 34 0 q-18 16 -34 0 Z" style={{ fill: blue, fillOpacity: 0.35, stroke: brass }} strokeWidth="2" />
+          <path d="M42 32 L56 21 L56 43 Z" style={{ fill: brass }} />
+        </svg>
+      );
+    case "chatterbait":
+      return (
+        <svg {...size}>
+          <rect x="16" y="14" width="11" height="11" style={{ fill: blue }} transform="rotate(45 21.5 19.5)" />
+          <path d="M22 24 L34 42" style={{ stroke: brass }} strokeWidth="2" />
+          <circle cx="36" cy="44" r="7" style={{ fill: brass }} />
+          <path d="M36 50 q3 8 10 3" style={{ stroke: brass }} strokeWidth="2" fill="none" strokeLinecap="round" />
+        </svg>
+      );
+    case "jhook":
+      return (
+        <svg {...size}>
+          <path d="M32 10 L32 34 q0 16 14 16 q10 0 8 -13" style={{ stroke: brass }} strokeWidth="3" fill="none" strokeLinecap="round" />
+          <circle cx="32" cy="10" r="3" style={{ fill: brass }} />
+        </svg>
+      );
+    case "treble":
+      return (
+        <svg {...size}>
+          <circle cx="32" cy="18" r="3" style={{ fill: brass }} />
+          <g style={{ stroke: brass }} strokeWidth="2.5" fill="none" strokeLinecap="round">
+            <path d="M32 18 L32 38 q0 10 10 8" />
+            <path d="M32 18 L32 38 q0 10 10 8" transform="rotate(120 32 18)" />
+            <path d="M32 18 L32 38 q0 10 10 8" transform="rotate(240 32 18)" />
+          </g>
+        </svg>
+      );
+    case "circle":
+      return (
+        <svg {...size}>
+          <path d="M32 10 L32 26 A15 15 0 1 1 20.5 40" style={{ stroke: brass }} strokeWidth="3" fill="none" strokeLinecap="round" />
+          <circle cx="32" cy="10" r="3" style={{ fill: brass }} />
+        </svg>
+      );
+    case "octopus":
+      return (
+        <svg {...size}>
+          <path d="M32 14 L32 27 q0 19 19 13" style={{ stroke: brass }} strokeWidth="3" fill="none" strokeLinecap="round" />
+          <circle cx="32" cy="14" r="3" style={{ fill: brass }} />
+        </svg>
+      );
+    case "texas-rig":
+      return (
+        <svg {...size}>
+          <line x1="32" y1="6" x2="32" y2="18" style={{ stroke: blue }} strokeWidth="2" />
+          <path d="M26 18 L38 18 L32 28 Z" style={{ fill: brass }} />
+          <path d="M32 28 L32 38 q0 12 12 10" style={{ stroke: brass }} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+          <path d="M18 42 q6 -8 12 0 t12 0" style={{ stroke: blue }} strokeWidth="3" fill="none" strokeLinecap="round" />
+        </svg>
+      );
+    case "carolina-rig":
+      return (
+        <svg {...size}>
+          <line x1="32" y1="4" x2="32" y2="14" style={{ stroke: blue }} strokeWidth="2" />
+          <path d="M26 14 L38 14 L32 22 Z" style={{ fill: brass }} />
+          <circle cx="32" cy="27" r="3" style={{ fill: blue, stroke: brass }} strokeWidth="1.5" />
+          <line x1="32" y1="30" x2="32" y2="44" style={{ stroke: blue }} strokeWidth="2" />
+          <path d="M32 44 L32 50 q0 8 9 7" style={{ stroke: brass }} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+          <path d="M20 53 q5 -6 10 0 t10 0" style={{ stroke: blue }} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+        </svg>
+      );
+    case "drop-shot":
+      return (
+        <svg {...size}>
+          <line x1="32" y1="4" x2="32" y2="54" style={{ stroke: blue }} strokeWidth="2" />
+          <path d="M32 22 L46 22 q6 2 3 9" style={{ stroke: brass }} strokeWidth="2.5" fill="none" strokeLinecap="round" />
+          <circle cx="32" cy="54" r="4" style={{ fill: brass }} />
+        </svg>
+      );
+    case "wacky-rig":
+      return (
+        <svg {...size}>
+          <path d="M8 32 q11 -11 22 0 t22 0" style={{ stroke: blue }} strokeWidth="5" fill="none" strokeLinecap="round" />
+          <path d="M32 19 L32 45" style={{ stroke: brass }} strokeWidth="2.5" />
+          <circle cx="32" cy="17" r="3" style={{ fill: brass }} />
+        </svg>
+      );
+    default:
+      return null;
+  }
+}
+
+function TackleGuideView() {
+  const [category, setCategory] = useState("all");
+  const [expanded, setExpanded] = useState({});
+
+  const filtered = category === "all" ? TACKLE_REFERENCE : TACKLE_REFERENCE.filter((t) => t.category === category);
+
+  function toggle(id) {
+    setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
+  }
+
+  return (
+    <div className="space-y-3">
+      <p className="tb-mono text-[11px] px-1" style={{ color: "var(--tb-muted)" }}>
+        Original diagrams to help identify what's in your box — tap any one for details.
+      </p>
+      <div className="flex gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }}>
+        {TACKLE_REF_CATEGORIES.map((c) => (
+          <TabButton key={c.id} active={category === c.id} onClick={() => setCategory(c.id)} label={c.label} />
+        ))}
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        {filtered.map((t) => {
+          const isOpen = !!expanded[t.id];
+          return (
+            <button
+              key={t.id}
+              onClick={() => toggle(t.id)}
+              className="rounded-xl p-3 text-left"
+              style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)", gridColumn: isOpen ? "1 / -1" : undefined }}
+            >
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 rounded-lg flex items-center justify-center shrink-0" style={{ background: "var(--tb-surface-2)" }}>
+                  <TackleRefIcon type={t.id} />
+                </div>
+                <span className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{t.name}</span>
+              </div>
+              {isOpen && (
+                <p className="text-xs leading-relaxed mt-2" style={{ color: "var(--tb-muted)" }}>{t.desc}</p>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+const root = createRoot(document.getElementById("root"));
+root.render(<TackleTracker />);
+window.__tackleAppMounted = true;
+
+</script>
+</body>
+</html>
