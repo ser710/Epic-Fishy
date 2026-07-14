@@ -5,7 +5,7 @@
 // Until you replace the placeholder apiKey below, Community features stay
 // switched off and the rest of the app works exactly as before.
 
-export const firebaseConfig = {
+{
   "project_info": {
     "project_number": "362455123000",
     "firebase_url": "https://epic-fishy-default-rtdb.firebaseio.com",
