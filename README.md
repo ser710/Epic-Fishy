@@ -66,8 +66,9 @@ Either works fine — just keep the folder structure intact (icons stay in an
    production mode** → pick a region → **Enable**.
 3. In Firestore, go to the **Rules** tab, replace the contents with what's in
    `firestore.rules` (included alongside this README), and click **Publish**.
-4. **Build → Authentication** → **Get started** → **Anonymous** → **Enable**
-   → **Save**. (This quietly identifies each phone — no login screen needed.)
+4. **Build → Authentication** → **Get started** → **Email/Password** → **Enable**
+   → **Save**. (People create a free account with email + password to post to
+   the community — no anonymous access, so posts stay tied to a real login.)
 5. Click the **⚙️ gear** → **Project settings** → scroll to "Your apps" →
    click **`</>`** → give it a nickname → **Register app** (skip hosting).
 6. Copy the `firebaseConfig` object it shows you into **`firebase-config.js`**,

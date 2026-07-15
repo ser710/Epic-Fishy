@@ -1,8 +1,15 @@
+// Paste YOUR Firebase project's config below.
+// Find it at: Firebase console → ⚙️ Project settings → scroll to "Your apps" →
+// click your web app (or click </> to register one if you haven't yet).
+//
+// Until you replace the placeholder apiKey below, Community features stay
+// switched off and the rest of the app works exactly as before.
+
 export const firebaseConfig = {
-  apiKey: "AIzaSyDk5Kpl7TZhxFhfTuAo7SH7QyUPN7oUIrw",
-  authDomain: "epic-fishy.firebaseapp.com",
-  projectId: "epic-fishy",
-  storageBucket: "epic-fishy.firebasestorage.app",
-  messagingSenderId: "362455123000",
-  appId: "1:362455123000:web:19eaa143abff79b18112cd",
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_PROJECT.appspot.com",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId: "YOUR_APP_ID",
 };

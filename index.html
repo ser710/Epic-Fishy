@@ -2270,35 +2270,110 @@ function SpotsView({ catches }) {
 
 /* ---------------- Community (shared feed, spots, leaderboard) ---------------- */
 
+function CommunityAuthForm({ onSignedIn }) {
+  const [mode, setMode] = useState("signin"); // signin | signup
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  async function submit() {
+    if (!email.trim() || !password) return;
+    setLoading(true);
+    setError(null);
+    const fn = mode === "signup" ? window.communityAPI.signUp : window.communityAPI.signIn;
+    const result = await fn(email.trim(), password);
+    setLoading(false);
+    if (result.error) {
+      setError(result.error);
+    } else {
+      onSignedIn();
+    }
+  }
+
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+
+  return (
+    <CardShell title={mode === "signup" ? "CREATE AN ACCOUNT" : "SIGN IN"} subtitle="to post catches, spots, and see the leaderboard">
+      <div className="space-y-3">
+        <Field label="Email">
+          <input
+            type="email"
+            autoCapitalize="none"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            className="w-full rounded-lg py-2 px-3 text-sm outline-none"
+            style={inputStyle}
+          />
+        </Field>
+        <Field label="Password">
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && submit()}
+            placeholder={mode === "signup" ? "At least 6 characters" : ""}
+            className="w-full rounded-lg py-2 px-3 text-sm outline-none"
+            style={inputStyle}
+          />
+        </Field>
+        {error && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+        <button
+          onClick={submit}
+          disabled={!email.trim() || !password || loading}
+          className="w-full py-2.5 rounded-lg text-sm font-semibold"
+          style={{ background: email.trim() && password ? "var(--tb-brass)" : "var(--tb-surface-2)", color: email.trim() && password ? "var(--tb-bg)" : "var(--tb-muted)" }}
+        >
+          {loading ? "Please wait..." : mode === "signup" ? "Create account" : "Sign in"}
+        </button>
+        <button
+          onClick={() => { setMode(mode === "signup" ? "signin" : "signup"); setError(null); }}
+          className="w-full text-center tb-mono text-xs"
+          style={{ color: "var(--tb-blue)" }}
+        >
+          {mode === "signup" ? "Already have an account? Sign in" : "New here? Create an account"}
+        </button>
+      </div>
+    </CardShell>
+  );
+}
+
 function CommunityView() {
   const [sub, setSub] = useState("feed"); // feed | spots | leaderboard
   const [ready, setReady] = useState(!!(typeof window !== "undefined" && window.communityAPI && window.communityAPI.ready));
+  const [signedIn, setSignedIn] = useState(!!(typeof window !== "undefined" && window.communityAPI && window.communityAPI.signedIn));
   const configured = typeof window !== "undefined" && window.communityAPI && window.communityAPI.configured;
   const [nickname, setNicknameState] = useState(() => (configured ? window.communityAPI.getNickname() : "Angler"));
   const [editingNickname, setEditingNickname] = useState(false);
   const [nicknameDraft, setNicknameDraft] = useState(nickname);
 
   useEffect(() => {
-    if (!configured || ready) return;
-    function onReady() {
-      setReady(true);
+    if (!configured) return;
+    function onChange() {
+      setReady(window.communityAPI.ready);
+      setSignedIn(window.communityAPI.signedIn);
       setNicknameState(window.communityAPI.getNickname());
     }
-    window.addEventListener("community-ready", onReady);
+    window.addEventListener("community-ready", onChange);
     const t = setTimeout(() => {
-      if (window.communityAPI && window.communityAPI.ready) onReady();
+      if (window.communityAPI && window.communityAPI.ready) onChange();
     }, 1500);
     return () => {
-      window.removeEventListener("community-ready", onReady);
+      window.removeEventListener("community-ready", onChange);
       clearTimeout(t);
     };
-  }, [configured, ready]);
+  }, [configured]);
 
   function saveNickname() {
     const name = nicknameDraft.trim() || "Angler";
     window.communityAPI.setNickname(name);
     setNicknameState(name);
     setEditingNickname(false);
+  }
+
+  async function handleSignOut() {
+    await window.communityAPI.signOutUser();
+    setSignedIn(false);
   }
 
   if (!configured) {
@@ -2316,6 +2391,10 @@ function CommunityView() {
 
   if (!ready) {
     return <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>Connecting to the community...</div>;
+  }
+
+  if (!signedIn) {
+    return <CommunityAuthForm onSignedIn={() => setSignedIn(true)} />;
   }
 
   return (
@@ -2342,10 +2421,13 @@ function CommunityView() {
             <button onClick={saveNickname} className="px-3 rounded-lg text-xs tb-mono font-semibold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>Save</button>
           </div>
         ) : (
-          <button onClick={() => { setNicknameDraft(nickname); setEditingNickname(true); }} className="flex items-center justify-between w-full">
-            <span className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{nickname}</span>
-            <span className="tb-mono text-[11px]" style={{ color: "var(--tb-blue)" }}>Change</span>
-          </button>
+          <div className="flex items-center justify-between">
+            <button onClick={() => { setNicknameDraft(nickname); setEditingNickname(true); }} className="flex items-center gap-2 flex-1 min-w-0">
+              <span className="text-sm font-semibold truncate" style={{ color: "var(--tb-text)" }}>{nickname}</span>
+              <span className="tb-mono text-[11px] shrink-0" style={{ color: "var(--tb-blue)" }}>Change</span>
+            </button>
+            <button onClick={handleSignOut} className="tb-mono text-[11px] shrink-0 ml-3" style={{ color: "var(--tb-muted)" }}>Sign out</button>
+          </div>
         )}
       </CardShell>
 
@@ -2778,6 +2860,123 @@ const KNOTS = [
     ],
     tip: "Great for surf or bottom rigs with multiple hooks above a sinker — keep the twists even so the loop stands out perpendicular to the line.",
   },
+  {
+    id: "trilene-knot",
+    name: "Trilene Knot",
+    category: "hook",
+    difficulty: "Easy",
+    useCase: "Tying line to a hook, lure, or swivel — a stronger alternative to the Improved Clinch",
+    steps: [
+      "Pass the tag end through the hook eye twice, forming a small double loop in front of the eye.",
+      "Wrap the tag end around the standing line 5–6 times.",
+      "Thread the tag end back through the double loop you made at the eye.",
+      "Moisten and pull the standing line and tag end slowly to snug the coils down against the eye.",
+      "Trim the excess tag end.",
+    ],
+    tip: "The double pass through the eye spreads out pressure on the line, so it tends to retain more of the line's rated strength than a single-pass clinch knot.",
+  },
+  {
+    id: "snell-knot",
+    name: "Snell Knot",
+    category: "hook",
+    difficulty: "Medium",
+    useCase: "Tying line directly to a hook shank — classic for bait fishing and rigs with turned-up or turned-down eyes",
+    steps: [
+      "Pass the line through the hook eye, then lay several inches alongside the shank, forming a loop back through the eye.",
+      "Holding the loop and shank together, wrap the tag end around both, working down the shank, 6–8 turns.",
+      "Hold the wraps in place and pull the standing line to draw everything snug against the shank.",
+      "Pull firmly to seat the wraps tightly, then trim the tag end.",
+    ],
+    tip: "Because the line pulls in line with the shank rather than at an angle from the eye, this puts more direct hooksetting force through the point — a favorite for bait rigs.",
+  },
+  {
+    id: "blood-knot",
+    name: "Blood Knot",
+    category: "join",
+    difficulty: "Medium",
+    useCase: "Joining two lines of similar diameter — a fly-fishing staple for building tapered leaders",
+    steps: [
+      "Overlap the two line ends by about 6 inches.",
+      "Wrap one tag end around the other line 5 times, then bring it back and pinch it between the two strands at the center.",
+      "Wrap the other tag end around the first line 5 times in the opposite direction, then bring it back through the same center gap, entering from the opposite side.",
+      "Moisten the knot and pull both standing lines steadily so the two sets of wraps compress together and the tag ends lock in the middle.",
+      "Trim both tag ends close to the knot.",
+    ],
+    tip: "This is the traditional way fly anglers build a tapered leader from sections of different-diameter tippet material.",
+  },
+  {
+    id: "fg-knot",
+    name: "FG Knot",
+    category: "join",
+    difficulty: "Hard",
+    useCase: "Joining braided main line to a fluorocarbon or mono leader with an extremely thin, smooth profile",
+    steps: [
+      "Hold the leader taut (looping it around something steady helps) and lay the braid across it at a slight angle.",
+      "Weave the braid over and under the leader in tight alternating wraps, working down the leader 20+ times, keeping each wrap snug against the last.",
+      "Finish with several locking half-hitches of the braid around the leader to secure the weave.",
+      "Trim the leader tag end close, then whip-finish or half-hitch the braid tag end for extra security, and trim.",
+    ],
+    tip: "The thinnest, smoothest braid-to-leader connection there is — it casts through guides with almost no hang-up — but it takes real practice to tie consistently. Many anglers prefer to keep both hands free by anchoring the leader to something first.",
+  },
+  {
+    id: "perfection-loop",
+    name: "Perfection Loop",
+    category: "loop",
+    difficulty: "Easy",
+    useCase: "A quick, fixed loop at the end of a leader for attaching flies or connecting to a loop-to-loop system",
+    steps: [
+      "Form a small loop near the end of the line, with the tag end crossing in front.",
+      "Form a second, larger loop with the tag end, laying it in front of the first loop.",
+      "Pass the tag end behind both loops, then bring it forward between them.",
+      "Reach through the first (smaller) loop, grab the second loop, and pull it through — this becomes your finished loop.",
+      "Moisten and pull the standing line to snug the knot down at the base of the loop, then trim the tag end.",
+    ],
+    tip: "A neat, low-bulk loop that sits in line with the leader rather than off to one side — standard for fly leader loops.",
+  },
+  {
+    id: "bimini-twist",
+    name: "Bimini Twist",
+    category: "loop",
+    difficulty: "Hard",
+    useCase: "Doubling the end of the line for extra strength — a big-game and saltwater staple",
+    steps: [
+      "Double about 3 feet of line back on itself to form a large loop, and twist the two strands together 20+ times.",
+      "Spread the loop open (over your knees or with a helper) to keep tension while the twists set.",
+      "Let the tag end begin to wrap back up over the twists on its own, guiding it so the wraps lie neatly side by side.",
+      "Once the wraps reach the top, finish with a half-hitch around both strands, then a second locking half-hitch.",
+      "Trim the tag end, leaving a doubled section of line at the end that's stronger than the single line alone.",
+    ],
+    tip: "This creates a shock-absorbing doubled line, nearly 100% of the line's original strength — worth the practice for big fish where a single strand is the weak point.",
+  },
+  {
+    id: "arbor-knot",
+    name: "Arbor Knot",
+    category: "rig",
+    difficulty: "Easy",
+    useCase: "Attaching the very first wrap of line directly to a bare reel spool",
+    steps: [
+      "Wrap the line around the reel spool (the arbor).",
+      "Tie an overhand knot around the standing line with the tag end.",
+      "Tie a second overhand knot in the tag end itself, a few inches further down, as a stopper.",
+      "Pull the standing line so the first knot slides down and jams against the stopper knot, cinching against the spool.",
+    ],
+    tip: "Not meant to be a high-strength knot — its only job is to keep line from spinning loose on the spool, so the two simple overhand knots are all it needs.",
+  },
+  {
+    id: "nail-knot",
+    name: "Nail Knot",
+    category: "rig",
+    difficulty: "Medium",
+    useCase: "Joining fly line to a leader (or backing to fly line) with a smooth connection that slides through guides",
+    steps: [
+      "Lay a nail, needle, or hollow tube alongside the fly line and leader, overlapping them by a few inches.",
+      "Wrap the leader tag end around all three (fly line, leader, and nail) 6–8 times, working neatly toward the fly line's tip.",
+      "Thread the tag end through the gap left by the nail, alongside the wraps.",
+      "Slide the nail out, then pull both ends slowly to cinch the wraps down tight around the fly line.",
+      "Trim both tag ends close, leaving a smooth, low-profile connection.",
+    ],
+    tip: "A tool like a purpose-made nail knot tool makes this far easier than an actual nail — but the mechanics are the same either way.",
+  },
 ];
 
 function KnotsView() {
@@ -3064,15 +3263,89 @@ const TACKLE_REFERENCE = [
   { id: "swimbait", category: "lures", name: "Swimbait", desc: "A soft or hard lure shaped like a baitfish with a paddle or boot tail that kicks on a steady retrieve." },
   { id: "chatterbait", category: "lures", name: "Chatterbait", desc: "A jig with a small metal blade bolted to the head that vibrates the whole lure — a hybrid between a jig and a spinnerbait." },
 
-  { id: "jhook", category: "hooks", name: "J-Hook / Worm Hook", desc: "The classic all-purpose shape — a straight shank curving into a J. Used for live bait, worms, and most soft plastics." },
-  { id: "treble", category: "hooks", name: "Treble Hook", desc: "Three hook points joined at a single eye. Standard on crankbaits, topwaters, and spoons for extra hookup odds." },
-  { id: "circle", category: "hooks", name: "Circle Hook", desc: "The point curves back in toward the shank. Designed to hook fish in the corner of the mouth when you simply reel tight — no hard hookset needed." },
-  { id: "octopus", category: "hooks", name: "Octopus / Wide Gap Hook", desc: "A short shank with a wide, rounded bend. Common for live bait and bulkier soft plastics." },
+  {
+    id: "jhook", category: "hooks", name: "J-Hook / Worm Hook",
+    desc: "The classic all-purpose shape — a straight shank curving into a J. Used for live bait, worms, and most soft plastics.",
+    steps: [
+      "Push the point into the very tip of the plastic's nose, about a quarter inch deep.",
+      "Bring the point back out through the bottom of the plastic.",
+      "Slide the plastic up the shank until the hook eye is buried inside the nose.",
+      "Rotate the point around and skin-hook it just under the plastic's back — barely piercing the surface — so the point is hidden and it rides weedless.",
+      "Check that the plastic hangs straight, not twisted, before you cast.",
+    ],
+  },
+  {
+    id: "treble", category: "hooks", name: "Treble Hook",
+    desc: "Three hook points joined at a single eye. Standard on crankbaits, topwaters, and spoons for extra hookup odds.",
+    steps: [
+      "Open a split ring with split-ring pliers (or carefully with a fingernail).",
+      "Slide one eye of the treble onto the ring, then rotate the ring around the treble's eye until it's fully seated.",
+      "Repeat for each hanger point on multi-hook lures like crankbaits.",
+      "Check that every hook swings freely and doesn't tangle with the others or the line tie.",
+      "Always handle trebles by the shank or eye, never near the points — especially when releasing a fish.",
+    ],
+  },
+  {
+    id: "circle", category: "hooks", name: "Circle Hook",
+    desc: "The point curves back in toward the shank. Designed to hook fish in the corner of the mouth when you simply reel tight — no hard hookset needed.",
+    steps: [
+      "Thread the point through live or cut bait once, leaving most of the hook exposed.",
+      "Keep the point and barb clear of the bait's body so the hook can rotate freely when a fish takes it.",
+      "For cut bait, hook through the toughest part — skin or near the spine — so it stays secured through a cast.",
+      "When a fish bites, resist the urge to set the hook hard — simply reel tight and let the curved shape find the corner of the jaw on its own.",
+    ],
+  },
+  {
+    id: "octopus", category: "hooks", name: "Octopus / Wide Gap Hook",
+    desc: "A short shank with a wide, rounded bend. Common for live bait and bulkier soft plastics.",
+    steps: [
+      "For minnows: hook through both lips from bottom to top for casting distance, or just under the dorsal fin for a livelier, freer-swimming presentation.",
+      "For shrimp: hook through the tail segment, or thread up through the horn on the head for more natural movement.",
+      "Match hook size to bait size — too large and it kills natural movement, too small and hooksets suffer.",
+      "Double check the point rides free of the bait's body for a clean hookset.",
+    ],
+  },
 
-  { id: "texas-rig", category: "rigs", name: "Texas Rig", desc: "A bullet weight slides on the line above a worm hook rigged weedless. The go-to setup for fishing soft plastics through cover." },
-  { id: "carolina-rig", category: "rigs", name: "Carolina Rig", desc: "The weight and a bead sit above a swivel, with a longer leader running to the hook and bait — lets it float more naturally off bottom." },
-  { id: "drop-shot", category: "rigs", name: "Drop Shot Rig", desc: "The hook ties in mid-line facing out, with the weight hanging below at the very end. Keeps the bait suspended right at a fish's level." },
-  { id: "wacky-rig", category: "rigs", name: "Wacky Rig", desc: "A worm is hooked through its middle so both ends dangle and shimmy on the fall. Deadly for a slow, subtle presentation." },
+  {
+    id: "texas-rig", category: "rigs", name: "Texas Rig",
+    desc: "A bullet weight slides on the line above a worm hook rigged weedless. The go-to setup for fishing soft plastics through cover.",
+    steps: [
+      "Slide a bullet weight onto your main line, point end first.",
+      "Tie on a worm or EWG hook using your preferred knot.",
+      "Insert the hook point into the nose of the soft plastic about a quarter inch, then bring it out the side.",
+      "Slide the plastic up to the hook eye, then rotate the point and skin-hook it back into the body — this keeps the whole rig weedless.",
+    ],
+  },
+  {
+    id: "carolina-rig", category: "rigs", name: "Carolina Rig",
+    desc: "The weight and a bead sit above a swivel, with a longer leader running to the hook and bait — lets it float more naturally off bottom.",
+    steps: [
+      "Thread a sliding sinker, then a plastic bead (to protect your knot), onto the main line.",
+      "Tie a swivel onto the end of the main line, trapping the sinker and bead above it.",
+      "Tie 18–36 inches of leader line to the other end of the swivel.",
+      "Tie a hook to the far end of the leader, then rig your soft plastic onto it Texas-style for a weedless presentation.",
+    ],
+  },
+  {
+    id: "drop-shot", category: "rigs", name: "Drop Shot Rig",
+    desc: "The hook ties in mid-line facing out, with the weight hanging below at the very end. Keeps the bait suspended right at a fish's level.",
+    steps: [
+      "Tie a hook onto your line with a Palomar knot, but leave a long tag end below the knot — 12 inches or more.",
+      "Thread that tag end back through the hook eye so the hook stands out perpendicular from the main line.",
+      "Tie a drop shot weight onto the very end of the tag end.",
+      "Nose-hook or wacky-rig a soft plastic onto the hook so it hovers naturally above the weight.",
+    ],
+  },
+  {
+    id: "wacky-rig", category: "rigs", name: "Wacky Rig",
+    desc: "A worm is hooked through its middle so both ends dangle and shimmy on the fall. Deadly for a slow, subtle presentation.",
+    steps: [
+      "Take a straight soft plastic worm — no weight needed for a true finesse fall.",
+      "Hook it directly through the middle, perpendicular to its length, so both ends hang free.",
+      "Optional: slip a small O-ring around the worm's middle first and hook through the O-ring instead — it saves the plastic from tearing after a few fish.",
+      "Fish it on slack line and let it fall naturally; most bites come on the drop.",
+    ],
+  },
 ];
 
 function TackleRefIcon({ type }) {
@@ -3253,7 +3526,19 @@ function TackleGuideView() {
                 <span className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{t.name}</span>
               </div>
               {isOpen && (
-                <p className="text-xs leading-relaxed mt-2" style={{ color: "var(--tb-muted)" }}>{t.desc}</p>
+                <div className="mt-2">
+                  <p className="text-xs leading-relaxed" style={{ color: "var(--tb-muted)" }}>{t.desc}</p>
+                  {t.steps && (
+                    <>
+                      <div className="tb-mono text-[10px] mt-3 mb-1" style={{ color: "var(--tb-brass)" }}>HOW TO RIG IT</div>
+                      <ol className="space-y-1.5 list-decimal list-inside">
+                        {t.steps.map((step, idx) => (
+                          <li key={idx} className="text-xs leading-relaxed" style={{ color: "var(--tb-text)" }}>{step}</li>
+                        ))}
+                      </ol>
+                    </>
+                  )}
+                </div>
               )}
             </button>
           );

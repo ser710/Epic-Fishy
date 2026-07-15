@@ -1,4 +1,4 @@
-const CACHE_NAME = "tackle-box-v9";
+const CACHE_NAME = "tackle-box-v12";
 const APP_SHELL = ["./", "./index.html", "./manifest.json", "./firebase-config.js", "./firebase-bootstrap.js", "./icons/icon-180.png", "./icons/icon-192.png", "./icons/icon-512.png"];
 
 self.addEventListener("install", (event) => {
