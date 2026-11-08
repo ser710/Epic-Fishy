@@ -2,26 +2,118 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // Reusable checks
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isOwnerOnCreate() {
+      return signedIn() && request.resource.data.uid == request.auth.uid;
+    }
+    function isOwner() {
+      return signedIn() && resource.data.uid == request.auth.uid;
+    }
+    // In a DM pair id ("<uidA>_<uidB>") returns the other member's uid
+    function otherMember(pairId) {
+      return pairId.replace(request.auth.uid, '').replace('_', '');
+    }
+    function validText(max) {
+      return request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= max;
+    }
+
     match /community_catches/{catchId} {
       allow read: if true;
-      allow create: if request.auth != null
-                    && request.resource.data.uid == request.auth.uid;
-      allow update, delete: if request.auth != null
-                    && resource.data.uid == request.auth.uid;
+      allow create: if isOwnerOnCreate();
+      allow update, delete: if isOwner();
+
+      match /comments/{commentId} {
+        allow read: if true;
+        allow create: if isOwnerOnCreate() && validText(500);
+        allow delete: if isOwner();
+      }
+
+      match /likes/{likerId} {
+        allow read: if true;
+        allow create, delete: if signedIn() && request.auth.uid == likerId;
+      }
     }
 
     match /community_spots/{spotId} {
       allow read: if true;
-      allow create: if request.auth != null
-                    && request.resource.data.uid == request.auth.uid;
-      allow update, delete: if request.auth != null
-                    && resource.data.uid == request.auth.uid;
+      allow create: if isOwnerOnCreate();
+      allow update, delete: if isOwner();
 
       match /votes/{voterId} {
         allow read: if true;
-        allow create: if request.auth != null && request.auth.uid == voterId;
-        allow delete: if request.auth != null && request.auth.uid == voterId;
+        allow create: if signedIn() && request.auth.uid == voterId;
+        allow delete: if signedIn() && request.auth.uid == voterId;
       }
+
+      match /comments/{commentId} {
+        allow read: if true;
+        allow create: if isOwnerOnCreate() && validText(500);
+        allow delete: if isOwner();
+      }
+    }
+
+    // Lets members find and remove their own comments when deleting an account
+    match /{path=**}/comments/{commentId} {
+      allow read: if true;
+      allow delete: if isOwner();
+    }
+
+    // Live chat: signed-in members only
+    match /community_chat/{messageId} {
+      allow read: if signedIn();
+      allow create: if isOwnerOnCreate() && validText(300);
+      allow delete: if isOwner();
+    }
+
+    // Following: doc id is "<followerUid>_<followeeUid>"
+    match /follows/{followId} {
+      allow read: if true;
+      allow create: if signedIn()
+                    && request.resource.data.follower == request.auth.uid
+                    && request.resource.data.followee is string
+                    && followId == request.auth.uid + '_' + request.resource.data.followee;
+      allow delete: if signedIn() && resource.data.follower == request.auth.uid;
+    }
+
+    // Direct messages: pair id is the two uids sorted and joined with "_".
+    // Only those two members can read or write the thread.
+    match /dms/{pairId}/messages/{messageId} {
+      allow read: if signedIn() && request.auth.uid in pairId.split('_');
+      allow create: if isOwnerOnCreate()
+                    && request.auth.uid in pairId.split('_')
+                    && validText(1000)
+                    && !exists(/databases/$(database)/documents/blocks/$(otherMember(pairId) + '_' + request.auth.uid));
+      allow delete: if isOwner();
+    }
+
+    // Inbox list: you read your own; a sender may write the recipient's entry
+    // (whose document id is the sender's own uid).
+    match /dm_index/{ownerUid}/threads/{otherUid} {
+      allow read, delete: if signedIn() && request.auth.uid == ownerUid;
+      allow create, update: if signedIn()
+                            && (request.auth.uid == ownerUid || request.auth.uid == otherUid);
+    }
+
+    // Blocks: doc id is "<blockerUid>_<blockedUid>". Only the blocker can read or change them.
+    match /blocks/{blockId} {
+      allow read: if signedIn() && resource.data.blocker == request.auth.uid;
+      allow create: if signedIn()
+                    && request.resource.data.blocker == request.auth.uid
+                    && request.resource.data.blocked is string
+                    && blockId == request.auth.uid + '_' + request.resource.data.blocked;
+      allow delete: if signedIn() && resource.data.blocker == request.auth.uid;
+    }
+
+    // Reports: anyone signed in can file one; nobody can read them from the app
+    // (review them in the Firebase console).
+    match /community_reports/{reportId} {
+      allow create: if isOwnerOnCreate();
+      allow read, update, delete: if false;
     }
   }
 }

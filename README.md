@@ -101,3 +101,62 @@ If you ever want a real `.apk`/`.aab` to submit to the Play Store, once this
 is hosted you can run it through **PWABuilder** (https://www.pwabuilder.com) —
 paste your hosted URL in and it packages this exact PWA into an Android app
 bundle for you. Not needed just to use it as an app on your own phone, though.
+
+## Comments & chat (added Nov 2026)
+
+Community now has comments on catches/spots and a live chat room. These need
+**updated Firestore rules** or posting will fail with "permission denied":
+
+1. Firebase console → project **epic-fishy** → **Firestore Database** → **Rules** tab.
+2. Replace everything with the contents of `firestore.rules` from this folder.
+3. Click **Publish**.
+
+Reports filed from the app land in a `community_reports` collection — open
+Firestore → **Data** to review them and delete abusive posts.
+
+`firebase-config.js` in this folder already contains the real `epic-fishy`
+config, so uploading the whole folder no longer overwrites it with placeholders.
+
+## Account deletion (Google Play requirement)
+
+Members can delete their account in-app: **Community → Delete my account**.
+The web instructions Play asks for live at `privacy.html#delete-account`.
+
+**One-time Firestore index (needed so deletion also removes a member's comments):**
+Firebase console → **Firestore → Indexes → Single field → Add exemption**
+- Collection ID: `comments`
+- Field path: `uid`
+- Query scope: **Collection group** → turn on **Ascending** → Save
+
+Also republish `firestore.rules` (it gained one rule for this).
+
+## Social features (likes, profiles, following, direct messages)
+
+Community now works like a small fishing social network:
+- **Likes** on shared catches (heart button).
+- **Profiles:** tap any angler's name (feed, chat, spots, comments) to see their
+  catches and stats, **Follow** them, or **Message** them.
+- **Following** filter on the Feed.
+- **DMs** tab: private one-to-one conversations (only the two members can read them).
+
+All of this needs the updated `firestore.rules` published (Firestore -> Rules -> Publish).
+No new indexes are required.
+
+## Blocking
+
+Any member can **Block this angler** from their profile sheet. Blocked members'
+catches, comments, chat, spots and messages are hidden from the blocker, and a
+blocked member can no longer start or continue a direct message with them
+(enforced by the rules). Blocked anglers can be unblocked from the list at the
+bottom of the Community tab. Republish `firestore.rules` for this to work.
+
+## Weather safety alerts
+
+A warning banner appears at the top of the app when the saved Conditions location has an
+active National Weather Service alert (U.S.) or a thunderstorm / strong-wind / heavy-rain
+forecast within the next 6 hours. Settings -> **Weather safety alerts** turns on phone
+notifications. Background checks while the app is closed are best-effort (Chrome decides
+when they run). Reliable closed-app push would need a server (Firebase Cloud Functions).
+
+Google Play build: in PWABuilder's Android options, enable **Notification delegation** so
+notifications work inside the Play Store version.

@@ -17,6 +17,8 @@
 <meta name="apple-mobile-web-app-title" content="Epic Fishy" />
 
 <script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
 <script type="importmap">
 {
@@ -118,7 +120,7 @@ import {
   Trash2, AlertTriangle, ChevronLeft, Minus, Wind, Droplets, Gauge,
   Sunrise, Sunset, Waves, MapPin, RefreshCw, CloudRain, Sun, Cloud,
   CloudFog, CloudSnow, CloudLightning, TrendingUp, TrendingDown, ArrowUp,
-  Ruler, Scale, Trophy, Calendar, Pencil, Camera, ChevronDown, ExternalLink, Settings
+  Ruler, Scale, Trophy, Calendar, Pencil, Camera, ChevronDown, ExternalLink, Settings, Heart
 } from "lucide-react";
 
 const CATEGORIES = [
@@ -137,6 +139,7 @@ const LOCATION_KEY = "tackle-location-v1";
 const CATCH_KEY = "catch-records-v1";
 const NICKNAME_KEY = "tackle-community-nickname";
 const LICENSE_KEY = "tackle-license-v1";
+const WAYPOINT_KEY = "tackle-waypoints-v1";
 const MAIN_VIEWS = ["tackle", "conditions", "catches", "spots", "community", "knots"];
 
 function weightToLb(value, unit) {
@@ -192,6 +195,19 @@ function haversineMiles(lat1, lon1, lat2, lon2) {
       Math.cos((lat2 * Math.PI) / 180) *
       Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Randomly offsets a coordinate within radiusMiles so a shared point can't reveal
+// someone's exact honey hole while still landing in roughly the right area.
+function fuzzCoordinate(lat, lon, radiusMiles = 0.5) {
+  const radiusDeg = radiusMiles / 69;
+  const u = Math.random();
+  const v = Math.random();
+  const w = radiusDeg * Math.sqrt(u);
+  const t = 2 * Math.PI * v;
+  const dy = w * Math.sin(t);
+  const dx = (w * Math.cos(t)) / Math.cos((lat * Math.PI) / 180);
+  return { lat: lat + dy, lon: lon + dx };
 }
 
 function weatherCodeInfo(code) {
@@ -421,6 +437,302 @@ function clusterCatchesByLocation(catches) {
     .sort((a, b) => b.count - a.count);
 }
 
+const SAFETY_NOTIFY_KEY = "tackle-safety-notify-v1";
+const PREFS_CACHE = "epic-fishy-prefs";
+const SEVERITY_RANK = { Extreme: 4, Severe: 3, Moderate: 2, Minor: 1, Unknown: 0 };
+
+async function readPrefJson(name, fallback) {
+  try {
+    const cache = await caches.open(PREFS_CACHE);
+    const res = await cache.match("prefs/" + name + ".json");
+    return res ? await res.json() : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+async function writePrefJson(name, value) {
+  try {
+    const cache = await caches.open(PREFS_CACHE);
+    await cache.put("prefs/" + name + ".json", new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } }));
+  } catch (e) {
+    // not available (e.g. a preview) — alerts still work while the app is open
+  }
+}
+
+function safetyNotifyEnabled() {
+  try {
+    return localStorage.getItem(SAFETY_NOTIFY_KEY) === "1" && typeof Notification !== "undefined" && Notification.permission === "granted";
+  } catch (e) {
+    return false;
+  }
+}
+
+async function showSafetyNotification(a) {
+  try {
+    const opts = {
+      body: a.detail || "",
+      tag: a.id,
+      icon: "icons/icon-192.png",
+      badge: "icons/icon-192.png",
+      requireInteraction: a.level === "danger",
+    };
+    const reg = navigator.serviceWorker ? await navigator.serviceWorker.getRegistration() : null;
+    if (reg && reg.showNotification) await reg.showNotification("⚠️ " + a.title, opts);
+    else new Notification("⚠️ " + a.title, opts);
+  } catch (e) {
+    // notifications unavailable — the in-app banner still shows
+  }
+}
+
+async function notifyNewAlerts(alerts) {
+  if (!safetyNotifyEnabled()) return;
+  const seen = await readPrefJson("notified", []);
+  const fresh = alerts.filter((a) => !seen.includes(a.id));
+  if (fresh.length === 0) return;
+  for (const a of fresh.slice(0, 3)) await showSafetyNotification(a);
+  await writePrefJson("notified", seen.concat(fresh.map((a) => a.id)).slice(-100));
+}
+
+// Official National Weather Service alerts (U.S.) plus an Open-Meteo look-ahead for the next 6 hours.
+async function fetchSafetyAlerts(lat, lon) {
+  const results = [];
+  const nwsUrl = `https://api.weather.gov/alerts/active?point=${lat.toFixed(4)},${lon.toFixed(4)}`;
+  const omUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation_probability,weather_code,wind_gusts_10m&wind_speed_unit=mph&timezone=auto&forecast_hours=6`;
+  const [nws, om] = await Promise.allSettled([
+    fetch(nwsUrl).then((r) => (r.ok ? r.json() : Promise.reject(new Error("nws")))),
+    fetch(omUrl).then((r) => (r.ok ? r.json() : Promise.reject(new Error("om")))),
+  ]);
+
+  if (nws.status === "fulfilled") {
+    for (const f of nws.value.features || []) {
+      const pr = f.properties || {};
+      const rank = SEVERITY_RANK[pr.severity] ?? 0;
+      const detail = [pr.headline, pr.instruction].filter(Boolean).join(" ").slice(0, 400) || (pr.description || "").slice(0, 300);
+      results.push({
+        id: "nws-" + (pr.id || f.id),
+        level: rank >= 3 ? "danger" : "warn",
+        rank,
+        title: pr.event || "Weather alert",
+        detail,
+        source: "National Weather Service",
+        until: pr.ends || pr.expires || null,
+      });
+    }
+  }
+
+  if (om.status === "fulfilled" && om.value && om.value.hourly) {
+    const h = om.value.hourly;
+    const codes = h.weather_code || [];
+    const probs = (h.precipitation_probability || []).filter((n) => typeof n === "number");
+    const gusts = (h.wind_gusts_10m || []).filter((n) => typeof n === "number");
+    const day = String((h.time && h.time[0]) || new Date().toISOString()).slice(0, 10);
+    const hasNwsStorm = results.some((a) => /thunderstorm|tornado|hurricane|tropical/i.test(a.title));
+
+    const thunder = codes.some((c) => c >= 95);
+    if (thunder && !hasNwsStorm) {
+      results.push({
+        id: `fc-thunder-${day}`, level: "danger", rank: 3,
+        title: "Thunderstorms in the forecast",
+        detail: "Thunderstorms are forecast within the next 6 hours. Lightning can strike miles from a storm — get off the water and into a building or hard-topped vehicle when you hear thunder.",
+        source: "Forecast (Open-Meteo)", until: null,
+      });
+    }
+    const maxGust = gusts.length ? Math.max(...gusts) : 0;
+    if (maxGust >= 35) {
+      results.push({
+        id: `fc-wind-${day}`, level: maxGust >= 45 ? "danger" : "warn", rank: maxGust >= 45 ? 3 : 2,
+        title: "Strong wind gusts",
+        detail: `Gusts up to ${Math.round(maxGust)} mph are forecast in the next 6 hours. Small boats, kayaks, and open water can become dangerous quickly.`,
+        source: "Forecast (Open-Meteo)", until: null,
+      });
+    }
+    const heavyRain = codes.some((c) => c === 65 || c === 67 || c === 82);
+    const maxProb = probs.length ? Math.max(...probs) : 0;
+    if (!thunder && (heavyRain || maxProb >= 70)) {
+      results.push({
+        id: `fc-rain-${day}`, level: "warn", rank: heavyRain ? 2 : 1,
+        title: heavyRain ? "Heavy rain expected" : "Rain likely soon",
+        detail: heavyRain
+          ? "Heavy rain is forecast in the next 6 hours. Expect reduced visibility and slick ramps and docks."
+          : `Up to a ${Math.round(maxProb)}% chance of rain in the next 6 hours.`,
+        source: "Forecast (Open-Meteo)", until: null,
+      });
+    }
+  }
+
+  return results.sort((a, b) => b.rank - a.rank);
+}
+
+function useSafetyAlerts() {
+  const [alerts, setAlerts] = useState([]);
+
+  const check = useCallback(async () => {
+    let loc = null;
+    try {
+      const r = await window.storage.get(LOCATION_KEY, false);
+      if (r && r.value) loc = JSON.parse(r.value);
+    } catch (e) {
+      // no saved location yet
+    }
+    if (!loc || typeof loc.lat !== "number") {
+      setAlerts([]);
+      return;
+    }
+    // Share the location with the background worker (it can't read the page's storage).
+    await writePrefJson("safety", { lat: loc.lat, lon: loc.lon, enabled: safetyNotifyEnabled() });
+    try {
+      const found = await fetchSafetyAlerts(loc.lat, loc.lon);
+      setAlerts(found);
+      await notifyNewAlerts(found);
+    } catch (e) {
+      // keep showing the last known alerts
+    }
+  }, []);
+
+  useEffect(() => {
+    check();
+    const timer = setInterval(check, 10 * 60 * 1000);
+    const onVisible = () => { if (document.visibilityState === "visible") check(); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("tackle-location-changed", check);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("tackle-location-changed", check);
+    };
+  }, [check]);
+
+  return { alerts };
+}
+
+function SafetyBanner({ alerts }) {
+  const [expanded, setExpanded] = useState(false);
+  const [dismissedKey, setDismissedKey] = useState(null);
+  if (!alerts || alerts.length === 0) return null;
+
+  const key = alerts.map((a) => a.id).sort().join("|");
+  if (dismissedKey === key) return null;
+
+  const top = alerts[0];
+  const danger = top.level === "danger";
+  const accent = danger ? "var(--tb-flare)" : "var(--tb-brass)";
+
+  return (
+    <div
+      className="mx-4 mt-3 rounded-xl px-3 py-2.5"
+      style={{ background: danger ? "rgba(249,115,98,0.12)" : "rgba(45,212,191,0.10)", border: `1px solid ${accent}` }}
+      role="alert"
+    >
+      <div className="flex items-start gap-2">
+        <AlertTriangle size={16} className="shrink-0 mt-0.5" style={{ color: accent }} />
+        <button onClick={() => setExpanded((v) => !v)} className="flex-1 min-w-0 text-left">
+          <div className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>
+            {top.title}
+            {alerts.length > 1 ? ` + ${alerts.length - 1} more` : ""}
+          </div>
+          {!expanded && (
+            <div className="tb-mono text-[11px] truncate" style={{ color: "var(--tb-muted)" }}>Tap for details and safety tips</div>
+          )}
+        </button>
+        <button onClick={() => setDismissedKey(key)} aria-label="Dismiss" className="shrink-0">
+          <X size={16} style={{ color: "var(--tb-muted)" }} />
+        </button>
+      </div>
+
+      {expanded && (
+        <div className="mt-2 space-y-3">
+          {alerts.map((a) => (
+            <div key={a.id}>
+              <div className="text-xs font-semibold" style={{ color: a.level === "danger" ? "var(--tb-flare)" : "var(--tb-brass)" }}>{a.title}</div>
+              <div className="text-xs leading-relaxed mt-0.5" style={{ color: "var(--tb-text)" }}>{a.detail}</div>
+              <div className="tb-mono text-[10px] mt-0.5" style={{ color: "var(--tb-muted)" }}>
+                {a.source}
+                {a.until ? ` · until ${new Date(a.until).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}` : ""}
+              </div>
+            </div>
+          ))}
+          <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>
+            Alerts are a convenience, not a guarantee. Check official sources (weather.gov, NOAA Weather Radio) and use your own judgment before heading out.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SafetyNotifyCard() {
+  const supported = typeof Notification !== "undefined";
+  const [enabled, setEnabled] = useState(() => {
+    try { return localStorage.getItem(SAFETY_NOTIFY_KEY) === "1"; } catch (e) { return false; }
+  });
+  const [msg, setMsg] = useState(null);
+
+  async function turnOn() {
+    setMsg(null);
+    const result = await Notification.requestPermission();
+    if (result !== "granted") {
+      setMsg("Notifications are blocked. Allow them for Epic Fishy in your phone's settings, then try again.");
+      return;
+    }
+    try { localStorage.setItem(SAFETY_NOTIFY_KEY, "1"); } catch (e) { /* ignore */ }
+    setEnabled(true);
+    window.dispatchEvent(new Event("tackle-location-changed")); // re-checks now and updates background prefs
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      if (reg.periodicSync) await reg.periodicSync.register("safety-check", { minInterval: 60 * 60 * 1000 });
+    } catch (e) {
+      // background checks aren't available here — alerts still arrive while the app is open
+    }
+    setMsg("Alerts are on for your saved Conditions location.");
+  }
+
+  async function turnOff() {
+    try { localStorage.setItem(SAFETY_NOTIFY_KEY, "0"); } catch (e) { /* ignore */ }
+    setEnabled(false);
+    const prefs = await readPrefJson("safety", null);
+    if (prefs) await writePrefJson("safety", { ...prefs, enabled: false });
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      if (reg.periodicSync) await reg.periodicSync.unregister("safety-check");
+    } catch (e) { /* ignore */ }
+    setMsg("Notifications are off. The in-app warning banner still appears.");
+  }
+
+  async function sendTest() {
+    await showSafetyNotification({ id: "test-" + Date.now(), level: "warn", title: "Test alert", detail: "Weather safety notifications are working." });
+  }
+
+  const btn = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+
+  return (
+    <CardShell title="WEATHER SAFETY ALERTS" subtitle="storms, heavy rain, high wind, and official warnings">
+      <p className="text-xs leading-relaxed mb-3" style={{ color: "var(--tb-muted)" }}>
+        A warning banner always appears at the top of the app when something dangerous is forecast or an official
+        National Weather Service alert (U.S.) is active for your saved Conditions location. Turn on notifications to
+        get a phone alert too.
+      </p>
+      {!supported ? (
+        <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>This browser doesn't support notifications.</div>
+      ) : enabled ? (
+        <div className="flex gap-2">
+          <button onClick={sendTest} className="flex-1 py-2.5 rounded-lg text-xs tb-mono font-semibold" style={btn}>Send a test</button>
+          <button onClick={turnOff} className="flex-1 py-2.5 rounded-lg text-xs tb-mono font-semibold" style={btn}>Turn off</button>
+        </div>
+      ) : (
+        <button onClick={turnOn} className="w-full py-2.5 rounded-lg text-xs tb-mono font-semibold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+          Turn on notifications
+        </button>
+      )}
+      {msg && <div className="tb-mono text-[11px] mt-2" style={{ color: "var(--tb-muted)" }}>{msg}</div>}
+      <p className="tb-mono text-[10px] mt-3" style={{ color: "var(--tb-muted)" }}>
+        Phones limit background activity: notifications are most reliable while the app is open or was used recently.
+        Set your location on the Conditions tab first.
+      </p>
+    </CardShell>
+  );
+}
+
 export default function TackleTracker() {
   const [view, setView] = useState("tackle"); // 'tackle' | 'conditions' | 'catches'
   const [items, setItems] = useState(null);
@@ -435,6 +747,7 @@ export default function TackleTracker() {
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
   const touchStart = useRef(null);
+  const safety = useSafetyAlerts();
 
   function handleTouchStart(e) {
     const overlayOpen = showForm || showCatchForm || showSettings || activeCategory;
@@ -662,6 +975,8 @@ export default function TackleTracker() {
           </div>
         )}
       </div>
+
+      <SafetyBanner alerts={safety.alerts} />
 
       {/* Body */}
       <div
@@ -1330,6 +1645,7 @@ function CatchForm({ initial, items, existingTrips = [], onCancel, onSave }) {
   const [gpsStatus, setGpsStatus] = useState(initial?.gps ? "ok" : "idle"); // idle | locating | ok | error
   const [photo, setPhoto] = useState(initial?.photo || null);
   const [shareToCommunity, setShareToCommunity] = useState(false);
+  const [shareApproxLocation, setShareApproxLocation] = useState(false);
   const communityAvailable = typeof window !== "undefined" && window.communityAPI && window.communityAPI.configured;
 
   const captureGps = useCallback(() => {
@@ -1372,6 +1688,7 @@ function CatchForm({ initial, items, existingTrips = [], onCancel, onSave }) {
       photo,
     });
     if (shareToCommunity && communityAvailable && window.communityAPI.ready) {
+      const fuzzed = shareApproxLocation && gps ? fuzzCoordinate(gps.lat, gps.lon, 0.5) : null;
       window.communityAPI.addCatch({
         species: species.trim(),
         length: length === "" ? null : Number(length),
@@ -1381,6 +1698,9 @@ function CatchForm({ initial, items, existingTrips = [], onCancel, onSave }) {
         dateTime: new Date(dateTime).toISOString(),
         location: location.trim(),
         lure: lure.trim(),
+        photo: photo || null,
+        lat: fuzzed ? fuzzed.lat : null,
+        lon: fuzzed ? fuzzed.lon : null,
       }).catch(() => {});
     }
   }
@@ -1498,12 +1818,22 @@ function CatchForm({ initial, items, existingTrips = [], onCancel, onSave }) {
           </Field>
 
           {communityAvailable && (
-            <label className="flex items-center gap-2.5 rounded-lg py-2.5 px-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
-              <input type="checkbox" checked={shareToCommunity} onChange={(e) => setShareToCommunity(e.target.checked)} className="w-4 h-4" />
-              <span className="text-xs tb-mono" style={{ color: "var(--tb-text)" }}>
-                Share to community feed <span style={{ color: "var(--tb-muted)" }}>(species, size, lure — no exact GPS or photo)</span>
-              </span>
-            </label>
+            <div className="rounded-lg p-3 space-y-2" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+              <label className="flex items-center gap-2.5">
+                <input type="checkbox" checked={shareToCommunity} onChange={(e) => setShareToCommunity(e.target.checked)} className="w-4 h-4" />
+                <span className="text-xs tb-mono" style={{ color: "var(--tb-text)" }}>
+                  Share to community feed <span style={{ color: "var(--tb-muted)" }}>(species, size, lure, photo — no exact GPS)</span>
+                </span>
+              </label>
+              {shareToCommunity && (
+                <label className="flex items-center gap-2.5 pl-6">
+                  <input type="checkbox" checked={shareApproxLocation} onChange={(e) => setShareApproxLocation(e.target.checked)} className="w-4 h-4" />
+                  <span className="text-xs tb-mono" style={{ color: "var(--tb-text)" }}>
+                    Also show on the community map <span style={{ color: "var(--tb-muted)" }}>(location fuzzed ~half a mile — your exact spot stays private)</span>
+                  </span>
+                </label>
+              )}
+            </div>
           )}
         </div>
 
@@ -1551,6 +1881,7 @@ function ConditionsView({ items = [], onQuickAdd }) {
     setLocation(loc);
     try {
       await window.storage.set(LOCATION_KEY, JSON.stringify(loc), false);
+      window.dispatchEvent(new Event("tackle-location-changed"));
     } catch (e) {
       // ignore, will just not persist
     }
@@ -1976,6 +2307,187 @@ function LocationPicker({ onPick, onClose, onUseMyLocation }) {
 
 /* ---------------- Spots (personal catch stats + nearby waters) ---------------- */
 
+function WaypointsCard() {
+  const [points, setPoints] = useState(null);
+  const [status, setStatus] = useState("idle"); // idle | locating
+  const [error, setError] = useState(null);
+  const [note, setNote] = useState(null);
+  const [namingId, setNamingId] = useState(null);
+  const [nameDraft, setNameDraft] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(WAYPOINT_KEY, false);
+        setPoints(r && r.value ? JSON.parse(r.value) : []);
+      } catch (e) {
+        setPoints([]);
+      }
+    })();
+  }, []);
+
+  async function persist(next) {
+    setPoints(next);
+    try {
+      await window.storage.set(WAYPOINT_KEY, JSON.stringify(next), false);
+    } catch (e) {
+      setError("Couldn't save — your device storage may be full.");
+    }
+  }
+
+  function logHere() {
+    if (status === "locating") return;
+    setError(null);
+    setNote(null);
+    if (!navigator.geolocation) {
+      setError("This device doesn't support GPS in the browser.");
+      return;
+    }
+    setStatus("locating");
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const wp = {
+          id: uid(),
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+          accuracyFt: Math.round(pos.coords.accuracy * 3.28084),
+          time: new Date().toISOString(),
+          name: "",
+        };
+        persist([wp, ...(points || [])]);
+        setNamingId(wp.id);
+        setNameDraft("");
+        setStatus("idle");
+      },
+      (err) => {
+        setStatus("idle");
+        setError(
+          err.code === 1
+            ? "Location permission was denied — allow location for this app in your phone's settings."
+            : err.code === 3
+            ? "Couldn't get a GPS fix in time — step outside or try again."
+            : "Location isn't available right now."
+        );
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+    );
+  }
+
+  function saveName(id) {
+    persist((points || []).map((p) => (p.id === id ? { ...p, name: nameDraft.trim() } : p)));
+    setNamingId(null);
+  }
+
+  function remove(id) {
+    persist((points || []).filter((p) => p.id !== id));
+    if (namingId === id) setNamingId(null);
+  }
+
+  async function shareAsSpot(wp) {
+    const ok = window.confirm("Share this exact location with the whole community as a spot?");
+    if (!ok) return;
+    try {
+      await window.communityAPI.addSpot({
+        name: wp.name || "Waypoint",
+        notes: "",
+        photo: null,
+        lat: wp.lat,
+        lon: wp.lon,
+      });
+      setNote("Shared to Community → Spots ✓");
+    } catch (e) {
+      setError("Couldn't share that spot — try again.");
+    }
+  }
+
+  const canShare = !!(window.communityAPI && window.communityAPI.signedIn);
+
+  return (
+    <CardShell title="MY WAYPOINTS" subtitle="one tap saves where you are right now">
+      <button
+        onClick={logHere}
+        disabled={status === "locating"}
+        className="w-full py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-2"
+        style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}
+      >
+        {status === "locating" ? (
+          <>
+            <RefreshCw size={15} className="tb-spin" /> Getting GPS fix...
+          </>
+        ) : (
+          <>
+            <MapPin size={16} /> Log my location
+          </>
+        )}
+      </button>
+
+      {error && <div className="tb-mono text-xs mt-2" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      {note && <div className="tb-mono text-xs mt-2" style={{ color: "var(--tb-brass)" }}>{note}</div>}
+
+      {points && points.length === 0 && (
+        <div className="tb-mono text-xs mt-3" style={{ color: "var(--tb-muted)" }}>
+          Nothing logged yet. Tap the button when you're on a spot you want to remember — boat ramp, a drop-off, a good bank.
+        </div>
+      )}
+
+      <div className="space-y-2 mt-3">
+        {(points || []).map((wp) => (
+          <div key={wp.id} className="rounded-lg p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+            {namingId === wp.id ? (
+              <div className="flex gap-2 mb-2">
+                <input
+                  autoFocus
+                  value={nameDraft}
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && saveName(wp.id)}
+                  placeholder="Name this spot (optional)"
+                  className="flex-1 min-w-0 rounded-lg py-2 px-3 text-sm outline-none"
+                  style={{ background: "var(--tb-surface)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+                />
+                <button onClick={() => saveName(wp.id)} className="px-3 rounded-lg text-xs tb-mono font-semibold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+                  Save
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  onClick={() => { setNamingId(wp.id); setNameDraft(wp.name || ""); }}
+                  className="text-sm font-semibold text-left truncate"
+                  style={{ color: "var(--tb-text)" }}
+                >
+                  {wp.name || "Waypoint"} <Pencil size={11} className="inline ml-1" style={{ color: "var(--tb-muted)" }} />
+                </button>
+                <button onClick={() => remove(wp.id)} aria-label="Delete waypoint">
+                  <Trash2 size={14} style={{ color: "var(--tb-flare)" }} />
+                </button>
+              </div>
+            )}
+            <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>
+              {new Date(wp.time).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+              {" · "}
+              {wp.lat.toFixed(5)}, {wp.lon.toFixed(5)}
+              {typeof wp.accuracyFt === "number" ? ` · ±${wp.accuracyFt} ft` : ""}
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5">
+              <a href={`https://www.google.com/maps?q=${wp.lat},${wp.lon}`} target="_blank" rel="noopener noreferrer" className="tb-mono text-[11px]" style={{ color: "var(--tb-blue)" }}>
+                Open in Maps
+              </a>
+              <a href={`https://www.google.com/maps/dir/?api=1&destination=${wp.lat},${wp.lon}`} target="_blank" rel="noopener noreferrer" className="tb-mono text-[11px]" style={{ color: "var(--tb-blue)" }}>
+                Directions
+              </a>
+              {canShare && (
+                <button onClick={() => shareAsSpot(wp)} className="tb-mono text-[11px]" style={{ color: "var(--tb-blue)" }}>
+                  Share as community spot
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </CardShell>
+  );
+}
+
 function SpotsView({ catches }) {
   const [location, setLocation] = useState(null);
   const [locLoading, setLocLoading] = useState(true);
@@ -2005,6 +2517,7 @@ function SpotsView({ catches }) {
     setLocation(loc);
     try {
       await window.storage.set(LOCATION_KEY, JSON.stringify(loc), false);
+      window.dispatchEvent(new Event("tackle-location-changed"));
     } catch (e) {
       // ignore, just won't persist
     }
@@ -2125,6 +2638,8 @@ function SpotsView({ catches }) {
 
   return (
     <div className="space-y-3">
+      <WaypointsCard />
+
       <CardShell title="YOUR BEST SPOTS" subtitle="ranked from your GPS-tagged catches">
         {clusters.length === 0 ? (
           <EmptyState text="Log a few GPS-tagged catches and your top spots will show up here." />
@@ -2338,8 +2853,438 @@ function CommunityAuthForm({ onSignedIn }) {
   );
 }
 
+function LikeButton({ catchId }) {
+  const [info, setInfo] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    window.communityAPI.getLikeInfo(catchId)
+      .then((i) => { if (alive) setInfo(i); })
+      .catch(() => { if (alive) setInfo({ count: 0, liked: false }); });
+    return () => { alive = false; };
+  }, [catchId]);
+
+  async function toggle() {
+    if (!info || busy) return;
+    setBusy(true);
+    const before = info;
+    setInfo({ count: Math.max(0, before.count + (before.liked ? -1 : 1)), liked: !before.liked });
+    try {
+      if (before.liked) await window.communityAPI.unlikeCatch(catchId);
+      else await window.communityAPI.likeCatch(catchId);
+    } catch (e) {
+      setInfo(before);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const liked = !!(info && info.liked);
+  return (
+    <button
+      onClick={toggle}
+      className="flex items-center gap-1 tb-mono text-[11px]"
+      style={{ color: liked ? "var(--tb-brass)" : "var(--tb-muted)" }}
+    >
+      <Heart size={14} fill={liked ? "currentColor" : "none"} />
+      {info ? info.count : "–"}
+    </button>
+  );
+}
+
+function ProfileSheet({ user, onClose, onMessage }) {
+  const isMe = !!window.communityAPI.uid && user.uid === window.communityAPI.uid;
+  const [catches, setCatches] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    window.communityAPI.listUserCatches(user.uid)
+      .then((d) => { if (alive) setCatches(d); })
+      .catch(() => { if (alive) setError("Couldn't load this profile."); });
+    window.communityAPI.getProfileStats(user.uid)
+      .then((st) => { if (alive) setStats(st); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [user.uid]);
+
+  async function toggleFollow() {
+    if (!stats || busy || isMe) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (stats.isFollowing) {
+        await window.communityAPI.unfollowUser(user.uid);
+        setStats({ ...stats, isFollowing: false, followers: Math.max(0, stats.followers - 1) });
+      } else {
+        await window.communityAPI.followUser(user.uid);
+        setStats({ ...stats, isFollowing: true, followers: stats.followers + 1 });
+      }
+    } catch (e) {
+      setError("Couldn't update that — try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleBlock() {
+    if (busy || isMe) return;
+    const already = isBlocked(user.uid);
+    const ok = already || window.confirm(`Block ${user.nickname || "this angler"}? You won't see their posts, comments, chat, or messages, and they can't message you.`);
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (already) await window.communityAPI.unblockUser(user.uid);
+      else await window.communityAPI.blockUser(user.uid, user.nickname || "Angler");
+      onClose();
+    } catch (e) {
+      setError("Couldn't update that — try again.");
+      setBusy(false);
+    }
+  }
+
+  const best = (catches || []).reduce((b, c) => {
+    const lb = weightToLb(c.weight, c.weightUnit);
+    return lb > b.lb ? { lb, c } : b;
+  }, { lb: 0, c: null });
+
+  return (
+    <div
+      className="tb-overlay absolute inset-0 z-40"
+      style={{ background: "rgba(2,7,7,0.75)" }}
+      onClick={onClose}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+    >
+      <div
+        className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-5 pt-4 pb-6"
+        style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "85%", overflowY: "auto" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-3">
+          <div className="min-w-0">
+            <h2 className="tb-stencil text-2xl truncate" style={{ color: "var(--tb-text)" }}>{user.nickname || "Angler"}</h2>
+            {isMe && <div className="tb-mono text-[11px]" style={{ color: "var(--tb-brass)" }}>this is you</div>}
+          </div>
+          <button onClick={onClose}><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+
+        <div className="grid grid-cols-4 gap-2 mb-3">
+          <StatTile label="Catches" value={catches ? catches.length : "–"} />
+          <StatTile label="Followers" value={stats ? stats.followers : "–"} />
+          <StatTile label="Following" value={stats ? stats.following : "–"} />
+          <StatTile label="Best" value={best.c ? `${best.c.weight} ${best.c.weightUnit}` : "—"} small />
+        </div>
+
+        {!isMe && (
+          <div className="flex gap-3 mb-3">
+            <button
+              onClick={toggleFollow}
+              disabled={!stats || busy}
+              className="flex-1 py-2.5 rounded-lg text-sm font-semibold"
+              style={{
+                background: stats && stats.isFollowing ? "var(--tb-surface-2)" : "var(--tb-brass)",
+                color: stats && stats.isFollowing ? "var(--tb-text)" : "var(--tb-bg)",
+                border: "1px solid var(--tb-line)",
+              }}
+            >
+              {busy ? "..." : stats && stats.isFollowing ? "Following ✓" : "Follow"}
+            </button>
+            <button
+              onClick={() => onMessage({ uid: user.uid, nickname: user.nickname || "Angler" })}
+              className="flex-1 py-2.5 rounded-lg text-sm font-semibold"
+              style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+            >
+              Message
+            </button>
+          </div>
+        )}
+
+        {!isMe && (
+          <div className="flex justify-center mb-3">
+            <button onClick={toggleBlock} className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>
+              {isBlocked(user.uid) ? "Unblock this angler" : "Block this angler"}
+            </button>
+          </div>
+        )}
+
+        {error && <div className="tb-mono text-xs mb-2" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+
+        <div className="tb-mono text-[10px] mb-1.5" style={{ color: "var(--tb-brass)" }}>RECENT CATCHES</div>
+        {catches === null && !error && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading...</div>}
+        {catches && catches.length === 0 && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No shared catches yet.</div>}
+        <div className="space-y-2">
+          {(catches || []).slice(0, 10).map((c) => (
+            <div key={c.id} className="rounded-lg p-2.5 flex gap-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+              {c.photo && <img src={c.photo} alt="" className="w-12 h-12 rounded-lg object-cover shrink-0" />}
+              <div className="min-w-0">
+                <div className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{c.species || "Unknown species"}</div>
+                <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>
+                  {[
+                    c.length ? `${c.length} ${c.lengthUnit}` : null,
+                    c.weight ? `${c.weight} ${c.weightUnit}` : null,
+                    c.lure || null,
+                  ].filter(Boolean).join(" · ")}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MessagesView({ target, onOpen }) {
+  const [threads, setThreads] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (target) return undefined;
+    let alive = true;
+    setThreads(null);
+    window.communityAPI.listThreads()
+      .then((t) => { if (alive) setThreads(t); })
+      .catch(() => { if (alive) setError("Couldn't load your messages."); });
+    return () => { alive = false; };
+  }, [target]);
+
+  if (target) return <DMThread other={target} onBack={() => onOpen(null)} />;
+
+  return (
+    <CardShell title="MESSAGES" subtitle="private — only you and the other angler can read these">
+      {error && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      {!error && threads === null && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading...</div>}
+      {!error && threads && threads.length === 0 && (
+        <EmptyState text="No conversations yet — tap an angler's name anywhere in Community and choose Message." />
+      )}
+      <div className="space-y-2">
+        {(threads || []).filter((t) => !isBlocked(t.otherUid)).map((t) => (
+          <button
+            key={t.id}
+            onClick={() => onOpen({ uid: t.otherUid, nickname: t.otherNickname || "Angler" })}
+            className="w-full text-left rounded-lg px-3 py-2.5"
+            style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-sm font-semibold truncate" style={{ color: "var(--tb-text)" }}>{t.otherNickname || "Angler"}</span>
+              <span className="tb-mono text-[10px] shrink-0" style={{ color: "var(--tb-muted)" }}>{formatCommentTime(t.updatedAt)}</span>
+            </div>
+            <div className="tb-mono text-[11px] truncate" style={{ color: "var(--tb-muted)" }}>{t.lastText}</div>
+          </button>
+        ))}
+      </div>
+    </CardShell>
+  );
+}
+
+function DMThread({ other, onBack }) {
+  const [messages, setMessages] = useState(null);
+  const [error, setError] = useState(null);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const endRef = useRef(null);
+
+  useEffect(() => {
+    const unsubscribe = window.communityAPI.subscribeDM(
+      other.uid,
+      (msgs) => { setMessages(msgs); setError(null); },
+      () => setError("Couldn't open this conversation.")
+    );
+    return () => { if (typeof unsubscribe === "function") unsubscribe(); };
+  }, [other.uid]);
+
+  useEffect(() => {
+    if (endRef.current) endRef.current.scrollIntoView({ block: "end" });
+  }, [messages]);
+
+  async function send() {
+    const clean = text.trim();
+    if (!clean || sending) return;
+    setSending(true);
+    try {
+      await window.communityAPI.sendDM(other.uid, other.nickname, clean);
+      setText("");
+    } catch (e) {
+      setError("Message didn't send — try again.");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <CardShell title={`CHAT WITH ${String(other.nickname || "Angler").toUpperCase()}`} subtitle="private conversation">
+      <button onClick={onBack} className="tb-mono text-[11px] mb-2" style={{ color: "var(--tb-blue)" }}>← All messages</button>
+      <div className="rounded-lg p-2 space-y-2 overflow-y-auto tb-scroll" style={{ height: "320px", background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+        {messages === null && !error && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Opening...</div>}
+        {messages && messages.length === 0 && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No messages yet — say hi.</div>}
+        {(messages || []).filter((m) => !isBlocked(m.uid)).map((m) => {
+          const mine = window.communityAPI.uid && m.uid === window.communityAPI.uid;
+          return (
+            <div key={m.id} className={mine ? "flex flex-col items-end" : "flex flex-col items-start"}>
+              <div
+                className="rounded-xl px-3 py-1.5 text-xs break-words"
+                style={{
+                  maxWidth: "85%",
+                  background: mine ? "var(--tb-brass)" : "var(--tb-surface)",
+                  color: mine ? "var(--tb-bg)" : "var(--tb-text)",
+                  border: mine ? "none" : "1px solid var(--tb-line)",
+                }}
+              >
+                {m.text}
+              </div>
+              <div className="tb-mono text-[10px] mt-0.5 flex gap-2" style={{ color: "var(--tb-muted)" }}>
+                <span>{formatCommentTime(m.createdAt)}</span>
+                {!mine && <ReportButton kind="dm" path={`dms/${m.id}`} excerpt={m.text} />}
+              </div>
+            </div>
+          );
+        })}
+        <div ref={endRef} />
+      </div>
+      {error && <div className="tb-mono text-xs mt-2" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      <div className="flex gap-2 mt-2">
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+          maxLength={1000}
+          placeholder={`Message ${other.nickname || "Angler"}...`}
+          className="flex-1 min-w-0 rounded-lg py-2.5 px-3 text-sm outline-none"
+          style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+        />
+        <button
+          onClick={send}
+          disabled={!text.trim() || sending}
+          className="px-4 rounded-lg text-xs tb-mono font-semibold shrink-0"
+          style={{ background: text.trim() ? "var(--tb-brass)" : "var(--tb-surface-2)", color: text.trim() ? "var(--tb-bg)" : "var(--tb-muted)" }}
+        >
+          Send
+        </button>
+      </div>
+    </CardShell>
+  );
+}
+
+function BlockedUsersCard() {
+  const [open, setOpen] = useState(false);
+  const [busyId, setBusyId] = useState(null);
+  const list = (window.communityAPI && window.communityAPI.blockList) || [];
+  if (list.length === 0) return null;
+
+  async function unblock(uid) {
+    setBusyId(uid);
+    try {
+      await window.communityAPI.unblockUser(uid);
+    } catch (e) {
+      // leave the list as is
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <div className="pt-2">
+      <button onClick={() => setOpen((v) => !v)} className="tb-mono text-[11px] block mx-auto" style={{ color: "var(--tb-muted)" }}>
+        {open ? "Hide blocked anglers" : `Blocked anglers (${list.length})`}
+      </button>
+      {open && (
+        <div className="mt-2 space-y-2">
+          {list.map((b) => (
+            <div key={b.uid} className="flex items-center justify-between rounded-lg px-3 py-2" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+              <span className="text-sm" style={{ color: "var(--tb-text)" }}>{b.nickname}</span>
+              <button onClick={() => unblock(b.uid)} disabled={busyId === b.uid} className="tb-mono text-[11px]" style={{ color: "var(--tb-blue)" }}>
+                {busyId === b.uid ? "..." : "Unblock"}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DeleteAccountCard({ onDeleted }) {
+  const [open, setOpen] = useState(false);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function confirmDelete() {
+    if (!password || busy) return;
+    setBusy(true);
+    setError(null);
+    const result = await window.communityAPI.deleteAccount(password);
+    setBusy(false);
+    if (result.error) {
+      setError(result.error);
+    } else {
+      onDeleted();
+    }
+  }
+
+  if (!open) {
+    return (
+      <div className="pt-2 text-center">
+        <button onClick={() => setOpen(true)} className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>
+          Delete my account
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <CardShell title="DELETE ACCOUNT" subtitle="this can't be undone">
+      <p className="text-xs leading-relaxed mb-3" style={{ color: "var(--tb-muted)" }}>
+        This permanently deletes your Community account and removes your shared catches, spots, chat messages,
+        and comments. Your private tackle box and catch log stay on this device.
+      </p>
+      <input
+        type="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && confirmDelete()}
+        placeholder="Enter your password to confirm"
+        className="w-full rounded-lg py-2.5 px-3 text-sm outline-none"
+        style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+      />
+      {error && <div className="tb-mono text-xs mt-2" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      <div className="flex gap-3 mt-3">
+        <button
+          onClick={() => { setOpen(false); setPassword(""); setError(null); }}
+          className="flex-1 py-2.5 rounded-lg text-sm font-semibold"
+          style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}
+        >
+          Cancel
+        </button>
+        <button
+          onClick={confirmDelete}
+          disabled={!password || busy}
+          className="flex-1 py-2.5 rounded-lg text-sm font-semibold"
+          style={{ background: password ? "var(--tb-flare)" : "var(--tb-surface-2)", color: password ? "var(--tb-bg)" : "var(--tb-muted)" }}
+        >
+          {busy ? "Deleting..." : "Delete forever"}
+        </button>
+      </div>
+    </CardShell>
+  );
+}
+
 function CommunityView() {
-  const [sub, setSub] = useState("feed"); // feed | spots | leaderboard
+  const [sub, setSub] = useState("feed"); // feed | chat | messages | map | spots | leaderboard
+  const [profile, setProfile] = useState(null); // { uid, nickname } of the profile sheet
+  const [dmTarget, setDmTarget] = useState(null); // { uid, nickname } of the open conversation
+  const [, setBlocksTick] = useState(0);
+
+  useEffect(() => {
+    const bump = () => setBlocksTick((t) => t + 1);
+    window.addEventListener("community-blocks", bump);
+    return () => window.removeEventListener("community-blocks", bump);
+  }, []);
   const [ready, setReady] = useState(!!(typeof window !== "undefined" && window.communityAPI && window.communityAPI.ready));
   const [signedIn, setSignedIn] = useState(!!(typeof window !== "undefined" && window.communityAPI && window.communityAPI.signedIn));
   const configured = typeof window !== "undefined" && window.communityAPI && window.communityAPI.configured;
@@ -2400,8 +3345,11 @@ function CommunityView() {
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <div className="flex gap-2">
+        <div className="flex gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }}>
           <TabButton active={sub === "feed"} onClick={() => setSub("feed")} label="Feed" />
+          <TabButton active={sub === "chat"} onClick={() => setSub("chat")} label="Chat" />
+          <TabButton active={sub === "messages"} onClick={() => setSub("messages")} label="DMs" />
+          <TabButton active={sub === "map"} onClick={() => setSub("map")} label="Map" />
           <TabButton active={sub === "spots"} onClick={() => setSub("spots")} label="Spots" />
           <TabButton active={sub === "leaderboard"} onClick={() => setSub("leaderboard")} label="Ranks" />
         </div>
@@ -2431,26 +3379,48 @@ function CommunityView() {
         )}
       </CardShell>
 
-      {sub === "feed" && <CommunityFeed />}
-      {sub === "spots" && <CommunitySpots />}
+      {sub === "feed" && <CommunityFeed onOpenProfile={setProfile} />}
+      {sub === "chat" && <CommunityChat onOpenProfile={setProfile} />}
+      {sub === "messages" && <MessagesView target={dmTarget} onOpen={setDmTarget} />}
+      {sub === "map" && <CommunityMap />}
+      {sub === "spots" && <CommunitySpots onOpenProfile={setProfile} />}
       {sub === "leaderboard" && <CommunityLeaderboard />}
+      {profile && (
+        <ProfileSheet
+          user={profile}
+          onClose={() => setProfile(null)}
+          onMessage={(u) => { setProfile(null); setDmTarget(u); setSub("messages"); }}
+        />
+      )}
+      <BlockedUsersCard />
+      <DeleteAccountCard onDeleted={() => setSignedIn(false)} />
     </div>
   );
 }
 
-function CommunityFeed() {
+function CommunityFeed({ onOpenProfile }) {
+  const [scope, setScope] = useState("all"); // all | following
   const [catches, setCatches] = useState(null);
   const [error, setError] = useState(null);
+  const [lightboxSrc, setLightboxSrc] = useState(null);
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      const data = await window.communityAPI.listCatches(30);
-      setCatches(data);
+      if (scope === "following") {
+        const [data, uids] = await Promise.all([
+          window.communityAPI.listCatches(100),
+          window.communityAPI.getFollowingUids(),
+        ]);
+        const followed = new Set(uids);
+        setCatches(data.filter((c) => followed.has(c.uid)));
+      } else {
+        setCatches(await window.communityAPI.listCatches(30));
+      }
     } catch (e) {
       setError("Couldn't load the community feed right now.");
     }
-  }, []);
+  }, [scope]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -2463,58 +3433,431 @@ function CommunityFeed() {
     }
   }
 
+  const shown = catches ? catches.filter((c) => !isBlocked(c.uid)) : null;
+
   return (
     <CardShell title="RECENT CATCHES" subtitle="shared by everyone using this app">
-      <div className="flex justify-end mb-2">
+      <div className="flex justify-between items-center mb-2">
+        <div className="flex gap-2">
+          <TabButton active={scope === "all"} onClick={() => { setCatches(null); setScope("all"); }} label="Everyone" />
+          <TabButton active={scope === "following"} onClick={() => { setCatches(null); setScope("following"); }} label="Following" />
+        </div>
         <button onClick={load} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
           <RefreshCw size={13} style={{ color: "var(--tb-muted)" }} />
         </button>
       </div>
       {error && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{error}</div>}
       {!error && catches === null && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading feed...</div>}
-      {!error && catches && catches.length === 0 && <EmptyState text="No shared catches yet — be the first from the Catches tab." />}
-      {!error && catches && catches.length > 0 && (
+      {!error && shown && shown.length === 0 && (
+        <EmptyState text={scope === "following" ? "Nothing here yet — tap an angler's name and follow them to fill this feed." : "No shared catches yet — be the first from the Catches tab."} />
+      )}
+      {!error && shown && shown.length > 0 && (
         <div className="space-y-2">
-          {catches.map((c) => {
+          {shown.map((c) => {
             const dt = c.dateTime ? new Date(c.dateTime) : null;
             const mine = window.communityAPI.uid && c.uid === window.communityAPI.uid;
             return (
-              <div key={c.id} className="rounded-lg p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{c.species || "Unknown species"}</span>
-                  <span className="tb-mono text-[10px]" style={{ color: "var(--tb-brass)" }}>{c.nickname || "Angler"}</span>
-                </div>
-                <div className="tb-mono text-[11px] mt-0.5" style={{ color: "var(--tb-muted)" }}>
-                  {[
-                    c.length ? `${c.length} ${c.lengthUnit}` : null,
-                    c.weight ? `${c.weight} ${c.weightUnit}` : null,
-                    dt ? dt.toLocaleDateString([], { month: "short", day: "numeric" }) : null,
-                  ].filter(Boolean).join(" · ")}
-                </div>
-                {(c.lure || c.location) && (
-                  <div className="tb-mono text-[11px] mt-1" style={{ color: "var(--tb-blue)" }}>
-                    {[c.lure, c.location].filter(Boolean).join(" · ")}
+              <div key={c.id} className="rounded-lg p-3 flex gap-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+                {c.photo && (
+                  <img
+                    src={c.photo}
+                    alt=""
+                    onClick={() => setLightboxSrc(c.photo)}
+                    className="w-14 h-14 rounded-lg object-cover shrink-0"
+                    style={{ border: "1px solid var(--tb-line)" }}
+                  />
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{c.species || "Unknown species"}</span>
+                    <button
+                      onClick={() => onOpenProfile && onOpenProfile({ uid: c.uid, nickname: c.nickname || "Angler" })}
+                      className="tb-mono text-[10px] shrink-0 ml-2"
+                      style={{ color: "var(--tb-brass)", textDecoration: "underline" }}
+                    >
+                      {c.nickname || "Angler"}
+                    </button>
                   </div>
-                )}
-                {mine && (
-                  <button onClick={() => handleDelete(c.id)} className="tb-mono text-[10px] mt-1.5" style={{ color: "var(--tb-flare)" }}>
-                    Remove my post
-                  </button>
-                )}
+                  <div className="tb-mono text-[11px] mt-0.5" style={{ color: "var(--tb-muted)" }}>
+                    {[
+                      c.length ? `${c.length} ${c.lengthUnit}` : null,
+                      c.weight ? `${c.weight} ${c.weightUnit}` : null,
+                      dt ? dt.toLocaleDateString([], { month: "short", day: "numeric" }) : null,
+                    ].filter(Boolean).join(" · ")}
+                  </div>
+                  {(c.lure || c.location) && (
+                    <div className="tb-mono text-[11px] mt-1" style={{ color: "var(--tb-blue)" }}>
+                      {[c.lure, c.location].filter(Boolean).join(" · ")}
+                    </div>
+                  )}
+                  {mine && (
+                    <button onClick={() => handleDelete(c.id)} className="tb-mono text-[10px] mt-1.5" style={{ color: "var(--tb-flare)" }}>
+                      Remove my post
+                    </button>
+                  )}
+                  <div className="mt-2"><LikeButton catchId={c.id} /></div>
+                  <CommentThread parentCol="community_catches" parentId={c.id} onOpenProfile={onOpenProfile} />
+                </div>
               </div>
             );
           })}
         </div>
       )}
+      {lightboxSrc && <PhotoLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
     </CardShell>
   );
 }
 
-function CommunitySpots() {
+function isBlocked(uid) {
+  return !!(uid && window.communityAPI && window.communityAPI.blocked && window.communityAPI.blocked.has(uid));
+}
+
+function formatCommentTime(ts) {
+  try {
+    const d = ts && typeof ts.toDate === "function" ? ts.toDate() : ts ? new Date(ts) : null;
+    if (!d || Number.isNaN(d.getTime())) return "";
+    const sameDay = d.toDateString() === new Date().toDateString();
+    return sameDay
+      ? d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+      : d.toLocaleDateString([], { month: "short", day: "numeric" });
+  } catch (e) {
+    return "";
+  }
+}
+
+function ReportButton({ kind, path, excerpt }) {
+  const [state, setState] = useState("idle"); // idle | sending | done
+  async function send() {
+    if (state !== "idle") return;
+    setState("sending");
+    try {
+      await window.communityAPI.report(kind, path, excerpt, "reported by user");
+      setState("done");
+    } catch (e) {
+      setState("idle");
+    }
+  }
+  return (
+    <button onClick={send} disabled={state !== "idle"} className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>
+      {state === "done" ? "Reported ✓" : state === "sending" ? "..." : "Report"}
+    </button>
+  );
+}
+
+function CommentThread({ parentCol, parentId, onOpenProfile }) {
+  const [open, setOpen] = useState(false);
+  const [comments, setComments] = useState(null);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      setComments(await window.communityAPI.listComments(parentCol, parentId));
+    } catch (e) {
+      setError("Couldn't load comments.");
+    }
+  }, [parentCol, parentId]);
+
+  useEffect(() => {
+    if (open && comments === null) load();
+  }, [open, comments, load]);
+
+  async function submit() {
+    const clean = text.trim();
+    if (!clean || sending) return;
+    setSending(true);
+    setError(null);
+    try {
+      await window.communityAPI.addComment(parentCol, parentId, clean);
+      setText("");
+      await load();
+    } catch (e) {
+      setError("Couldn't post that — try again.");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function remove(id) {
+    try {
+      await window.communityAPI.deleteComment(parentCol, parentId, id);
+      setComments((prev) => (prev || []).filter((c) => c.id !== id));
+    } catch (e) {
+      setError("Couldn't delete that comment.");
+    }
+  }
+
+  const count = comments ? comments.length : null;
+
+  return (
+    <div className="mt-2">
+      <button onClick={() => setOpen((v) => !v)} className="tb-mono text-[11px]" style={{ color: "var(--tb-blue)" }}>
+        {open ? "Hide comments" : count ? `Comments (${count})` : "Comments"}
+      </button>
+
+      {open && (
+        <div className="mt-2 space-y-2">
+          {comments === null && !error && <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>Loading...</div>}
+          {comments && comments.length === 0 && (
+            <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>No comments yet — start the conversation.</div>
+          )}
+          {comments && comments.filter((cm) => !isBlocked(cm.uid)).map((cm) => {
+            const mine = window.communityAPI.uid && cm.uid === window.communityAPI.uid;
+            return (
+              <div key={cm.id} className="rounded-lg px-2.5 py-2" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    onClick={() => onOpenProfile && onOpenProfile({ uid: cm.uid, nickname: cm.nickname || "Angler" })}
+                    className="tb-mono text-[10px]"
+                    style={{ color: "var(--tb-brass)", textDecoration: "underline" }}
+                  >
+                    {cm.nickname || "Angler"}
+                  </button>
+                  <span className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{formatCommentTime(cm.createdAt)}</span>
+                </div>
+                <div className="text-xs mt-0.5 break-words" style={{ color: "var(--tb-text)" }}>{cm.text}</div>
+                <div className="mt-1">
+                  {mine ? (
+                    <button onClick={() => remove(cm.id)} className="tb-mono text-[10px]" style={{ color: "var(--tb-flare)" }}>Delete</button>
+                  ) : (
+                    <ReportButton kind="comment" path={`${parentCol}/${parentId}/comments/${cm.id}`} excerpt={cm.text} />
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          <div className="flex gap-2">
+            <input
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()}
+              maxLength={500}
+              placeholder="Add a comment..."
+              className="flex-1 min-w-0 rounded-lg py-2 px-3 text-xs outline-none"
+              style={{ background: "var(--tb-surface)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+            />
+            <button
+              onClick={submit}
+              disabled={!text.trim() || sending}
+              className="px-3 rounded-lg text-xs tb-mono font-semibold shrink-0"
+              style={{ background: text.trim() ? "var(--tb-brass)" : "var(--tb-surface)", color: text.trim() ? "var(--tb-bg)" : "var(--tb-muted)" }}
+            >
+              {sending ? "..." : "Post"}
+            </button>
+          </div>
+          {error && <div className="tb-mono text-[11px]" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CommunityChat({ onOpenProfile }) {
+  const [messages, setMessages] = useState(null);
+  const [error, setError] = useState(null);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const endRef = useRef(null);
+
+  useEffect(() => {
+    const unsubscribe = window.communityAPI.subscribeChat(
+      (msgs) => { setMessages(msgs); setError(null); },
+      () => setError("Couldn't connect to chat right now.")
+    );
+    return () => { if (typeof unsubscribe === "function") unsubscribe(); };
+  }, []);
+
+  useEffect(() => {
+    if (endRef.current) endRef.current.scrollIntoView({ block: "end" });
+  }, [messages]);
+
+  async function send() {
+    const clean = text.trim();
+    if (!clean || sending) return;
+    setSending(true);
+    try {
+      await window.communityAPI.sendChat(clean);
+      setText("");
+    } catch (e) {
+      setError("Message didn't send — try again.");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function remove(id) {
+    try {
+      await window.communityAPI.deleteChat(id);
+    } catch (e) {
+      setError("Couldn't delete that message.");
+    }
+  }
+
+  return (
+    <CardShell title="ANGLER CHAT" subtitle="live — everyone signed in sees this room">
+      <div className="rounded-lg p-2 space-y-2 overflow-y-auto tb-scroll" style={{ height: "340px", background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+        {messages === null && !error && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Connecting...</div>}
+        {messages && messages.length === 0 && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No messages yet — say hello.</div>}
+        {messages && messages.filter((m) => !isBlocked(m.uid)).map((m) => {
+          const mine = window.communityAPI.uid && m.uid === window.communityAPI.uid;
+          return (
+            <div key={m.id} className={mine ? "flex flex-col items-end" : "flex flex-col items-start"}>
+              <div className="tb-mono text-[10px] mb-0.5" style={{ color: mine ? "var(--tb-blue)" : "var(--tb-brass)" }}>
+                {mine ? "You" : (
+                  <button
+                    onClick={() => onOpenProfile && onOpenProfile({ uid: m.uid, nickname: m.nickname || "Angler" })}
+                    style={{ color: "inherit", textDecoration: "underline" }}
+                  >
+                    {m.nickname || "Angler"}
+                  </button>
+                )} · {formatCommentTime(m.createdAt)}
+              </div>
+              <div
+                className="rounded-xl px-3 py-1.5 text-xs break-words"
+                style={{
+                  maxWidth: "85%",
+                  background: mine ? "var(--tb-brass)" : "var(--tb-surface)",
+                  color: mine ? "var(--tb-bg)" : "var(--tb-text)",
+                  border: mine ? "none" : "1px solid var(--tb-line)",
+                }}
+              >
+                {m.text}
+              </div>
+              <div className="mt-0.5">
+                {mine ? (
+                  <button onClick={() => remove(m.id)} className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>Delete</button>
+                ) : (
+                  <ReportButton kind="chat" path={`community_chat/${m.id}`} excerpt={m.text} />
+                )}
+              </div>
+            </div>
+          );
+        })}
+        <div ref={endRef} />
+      </div>
+
+      {error && <div className="tb-mono text-xs mt-2" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+
+      <div className="flex gap-2 mt-2">
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+          maxLength={300}
+          placeholder="Message the room..."
+          className="flex-1 min-w-0 rounded-lg py-2.5 px-3 text-sm outline-none"
+          style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+        />
+        <button
+          onClick={send}
+          disabled={!text.trim() || sending}
+          className="px-4 rounded-lg text-xs tb-mono font-semibold shrink-0"
+          style={{ background: text.trim() ? "var(--tb-brass)" : "var(--tb-surface-2)", color: text.trim() ? "var(--tb-bg)" : "var(--tb-muted)" }}
+        >
+          Send
+        </button>
+      </div>
+    </CardShell>
+  );
+}
+
+function CommunityMap() {
+  const mapRef = useRef(null);
+  const mapInstance = useRef(null);
+  const markersRef = useRef([]);
+  const [catches, setCatches] = useState(null);
+  const [error, setError] = useState(null);
+  const leafletAvailable = typeof window !== "undefined" && !!window.L;
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const data = await window.communityAPI.listCatches(100);
+      setCatches(data.filter((c) => typeof c.lat === "number" && typeof c.lon === "number" && !isBlocked(c.uid)));
+    } catch (e) {
+      setError("Couldn't load the community map right now.");
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    if (!leafletAvailable || !mapRef.current || mapInstance.current) return;
+    mapInstance.current = window.L.map(mapRef.current, { attributionControl: true }).setView([30, -20], 2);
+    window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "© OpenStreetMap contributors",
+      maxZoom: 17,
+    }).addTo(mapInstance.current);
+    return () => {
+      if (mapInstance.current) {
+        mapInstance.current.remove();
+        mapInstance.current = null;
+      }
+    };
+  }, [leafletAvailable]);
+
+  useEffect(() => {
+    if (!mapInstance.current || !catches) return;
+    markersRef.current.forEach((m) => mapInstance.current.removeLayer(m));
+    markersRef.current = [];
+    if (catches.length === 0) return;
+
+    catches.forEach((c) => {
+      const marker = window.L.marker([c.lat, c.lon]).addTo(mapInstance.current);
+      const label = [c.species || "Catch", c.nickname ? `by ${c.nickname}` : null, c.weight ? `${c.weight} ${c.weightUnit}` : null]
+        .filter(Boolean)
+        .join(" — ");
+      marker.bindPopup(label);
+      markersRef.current.push(marker);
+    });
+
+    const group = window.L.featureGroup(markersRef.current);
+    mapInstance.current.fitBounds(group.getBounds().pad(0.4), { maxZoom: 10 });
+  }, [catches]);
+
+  if (!leafletAvailable) {
+    return (
+      <CardShell title="CATCH MAP">
+        <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>
+          The map needs the installed app to load — not available in this preview.
+        </div>
+      </CardShell>
+    );
+  }
+
+  return (
+    <CardShell title="CATCH MAP" subtitle="only catches with an approximate shared location appear here">
+      <div className="flex justify-end mb-2">
+        <button onClick={load} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
+          <RefreshCw size={13} style={{ color: "var(--tb-muted)" }} />
+        </button>
+      </div>
+      {error && <div className="tb-mono text-xs mb-2" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      {!error && catches && catches.length === 0 && (
+        <EmptyState text="No catches with a shared location yet — check the box for it next time you post one." />
+      )}
+      <div
+        ref={mapRef}
+        style={{
+          height: "320px",
+          borderRadius: "12px",
+          overflow: "hidden",
+          display: !error && catches && catches.length > 0 ? "block" : "none",
+        }}
+      />
+    </CardShell>
+  );
+}
+
+function CommunitySpots({ onOpenProfile }) {
   const [spots, setSpots] = useState(null);
   const [error, setError] = useState(null);
   const [showForm, setShowForm] = useState(false);
   const [votedIds, setVotedIds] = useState({});
+  const [lightboxSrc, setLightboxSrc] = useState(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -2555,41 +3898,62 @@ function CommunitySpots() {
         {!error && spots && spots.length === 0 && <EmptyState text="No community spots yet — add the first one." />}
         {!error && spots && spots.length > 0 && (
           <div className="space-y-2">
-            {spots.map((s) => (
-              <div key={s.id} className="rounded-lg p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
-                <div className="flex items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <div className="text-sm font-semibold truncate" style={{ color: "var(--tb-text)" }}>{s.name}</div>
-                    <div className="tb-mono text-[10px] mt-0.5" style={{ color: "var(--tb-brass)" }}>added by {s.nickname || "Angler"}</div>
-                  </div>
-                  <button
-                    onClick={() => vote(s.id)}
-                    disabled={!!votedIds[s.id]}
-                    className="flex flex-col items-center px-2 py-1 rounded-lg shrink-0"
-                    style={{ background: votedIds[s.id] ? "var(--tb-brass)" : "var(--tb-surface)", color: votedIds[s.id] ? "var(--tb-bg)" : "var(--tb-text)" }}
-                  >
-                    <ArrowUp size={13} />
-                    <span className="tb-mono text-[10px]">{s.voteCount || 0}</span>
-                  </button>
-                </div>
-                {s.notes && <div className="text-xs mt-1.5" style={{ color: "var(--tb-muted)" }}>{s.notes}</div>}
-                {typeof s.lat === "number" && (
-                  <a
-                    href={`https://www.google.com/maps?q=${s.lat},${s.lon}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="tb-mono text-[11px] mt-1.5 inline-flex items-center gap-1"
-                    style={{ color: "var(--tb-blue)" }}
-                  >
-                    <MapPin size={11} /> Open in Maps
-                  </a>
+            {spots.filter((s) => !isBlocked(s.uid)).map((s) => (
+              <div key={s.id} className="rounded-lg p-3 flex gap-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+                {s.photo && (
+                  <img
+                    src={s.photo}
+                    alt=""
+                    onClick={() => setLightboxSrc(s.photo)}
+                    className="w-14 h-14 rounded-lg object-cover shrink-0"
+                    style={{ border: "1px solid var(--tb-line)" }}
+                  />
                 )}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold truncate" style={{ color: "var(--tb-text)" }}>{s.name}</div>
+                      <div className="tb-mono text-[10px] mt-0.5" style={{ color: "var(--tb-brass)" }}>
+                        added by{" "}
+                        <button
+                          onClick={() => onOpenProfile && onOpenProfile({ uid: s.uid, nickname: s.nickname || "Angler" })}
+                          style={{ color: "inherit", textDecoration: "underline" }}
+                        >
+                          {s.nickname || "Angler"}
+                        </button>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => vote(s.id)}
+                      disabled={!!votedIds[s.id]}
+                      className="flex flex-col items-center px-2 py-1 rounded-lg shrink-0"
+                      style={{ background: votedIds[s.id] ? "var(--tb-brass)" : "var(--tb-surface)", color: votedIds[s.id] ? "var(--tb-bg)" : "var(--tb-text)" }}
+                    >
+                      <ArrowUp size={13} />
+                      <span className="tb-mono text-[10px]">{s.voteCount || 0}</span>
+                    </button>
+                  </div>
+                  {s.notes && <div className="text-xs mt-1.5" style={{ color: "var(--tb-muted)" }}>{s.notes}</div>}
+                  {typeof s.lat === "number" && (
+                    <a
+                      href={`https://www.google.com/maps?q=${s.lat},${s.lon}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="tb-mono text-[11px] mt-1.5 inline-flex items-center gap-1"
+                      style={{ color: "var(--tb-blue)" }}
+                    >
+                      <MapPin size={11} /> Open in Maps
+                    </a>
+                  )}
+                  <CommentThread parentCol="community_spots" parentId={s.id} onOpenProfile={onOpenProfile} />
+                </div>
               </div>
             ))}
           </div>
         )}
       </CardShell>
 
+      {lightboxSrc && <PhotoLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
       {showForm && <AddSpotForm onCancel={() => setShowForm(false)} onSaved={() => { setShowForm(false); load(); }} />}
     </>
   );
@@ -2598,6 +3962,7 @@ function CommunitySpots() {
 function AddSpotForm({ onCancel, onSaved }) {
   const [name, setName] = useState("");
   const [notes, setNotes] = useState("");
+  const [photo, setPhoto] = useState(null);
   const [gps, setGps] = useState(null);
   const [gpsStatus, setGpsStatus] = useState("idle");
   const [saving, setSaving] = useState(false);
@@ -2627,6 +3992,7 @@ function AddSpotForm({ onCancel, onSaved }) {
       await window.communityAPI.addSpot({
         name: name.trim(),
         notes: notes.trim(),
+        photo: photo || null,
         lat: gps ? gps.lat : null,
         lon: gps ? gps.lon : null,
       });
@@ -2649,6 +4015,7 @@ function AddSpotForm({ onCancel, onSaved }) {
           <Field label="Spot name">
             <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. North Cove boat ramp" className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
           </Field>
+          <PhotoField photo={photo} onChange={setPhoto} label="Photo (optional)" />
           <Field label="Notes (optional)">
             <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} placeholder="What's good here, access tips, etc." className="w-full rounded-lg py-2 px-3 text-sm outline-none resize-none" style={inputStyle} />
           </Field>
@@ -3087,6 +4454,12 @@ async function exportAllData() {
   } catch (e) {
     data.license = null;
   }
+  try {
+    const r = await window.storage.get(WAYPOINT_KEY, false);
+    data.waypoints = r && r.value ? JSON.parse(r.value) : [];
+  } catch (e) {
+    data.waypoints = [];
+  }
   data.nickname = (typeof window !== "undefined" && window.communityAPI && window.communityAPI.getNickname)
     ? window.communityAPI.getNickname()
     : null;
@@ -3109,6 +4482,7 @@ async function importAllData(file) {
   if (Array.isArray(data.catches)) await window.storage.set(CATCH_KEY, JSON.stringify(data.catches), false);
   if (data.location) await window.storage.set(LOCATION_KEY, JSON.stringify(data.location), false);
   if (data.license) await window.storage.set(LICENSE_KEY, JSON.stringify(data.license), false);
+  if (Array.isArray(data.waypoints)) await window.storage.set(WAYPOINT_KEY, JSON.stringify(data.waypoints), false);
   if (data.nickname && typeof window !== "undefined" && window.communityAPI && window.communityAPI.setNickname) {
     window.communityAPI.setNickname(data.nickname);
   }
@@ -3182,6 +4556,10 @@ function SettingsPanel({ onClose }) {
           <button onClick={onClose}><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
         </div>
 
+        <SafetyNotifyCard />
+
+        <div className="h-3" />
+
         <CardShell title="LICENSE & LIMITS">
           {loading ? (
             <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading...</div>
@@ -3237,6 +4615,9 @@ function SettingsPanel({ onClose }) {
               Importing replaces your current tackle box, catches, and location with the backup's contents.
               Worth doing this occasionally — everything lives only on this device otherwise.
             </p>
+            <a href="privacy.html" target="_blank" rel="noopener noreferrer" className="tb-mono text-[11px] inline-block mt-1" style={{ color: "var(--tb-blue)" }}>
+              Privacy policy
+            </a>
           </div>
         </CardShell>
       </div>

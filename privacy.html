@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Epic Fishy — Privacy Policy</title>
+<meta name="theme-color" content="#070f0f" />
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #070f0f; color: #f5faf9; font: 16px/1.65 -apple-system, "Segoe UI", Roboto, Inter, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 28px; margin: 0 0 4px; color: #2dd4bf; }
+  h2 { font-size: 18px; margin: 32px 0 8px; color: #5eead4; }
+  p, li { color: #d6e6e4; }
+  li { margin: 4px 0; }
+  a { color: #5eead4; }
+  .meta { color: #9fb8b5; font-size: 14px; margin-bottom: 24px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; margin: 8px 0; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #1f4a47; vertical-align: top; }
+  th { color: #9fb8b5; font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Epic Fishy — Privacy Policy</h1>
+  <div class="meta">Last updated: November 8, 2026</div>
+
+  <p>Epic Fishy is a fishing app that helps you organize tackle, check conditions, log catches, and (optionally) share with other anglers. This policy explains what information the app handles and why. We do not sell your data, show ads, or use analytics or tracking tools.</p>
+
+  <h2>1. Information stored only on your device</h2>
+  <p>Your tackle inventory, catch log, photos, saved location, trip names, license notes, and settings are stored in your browser's local storage on your own device. We do not receive or store this information on our servers. If you export a backup, that file is saved wherever you choose. Clearing your browser or app data erases this information unless you have a backup.</p>
+
+  <h2>2. Community features (optional)</h2>
+  <p>You can use the whole app without an account. If you choose to join the Community, we collect and store the following with Google Firebase (Authentication and Cloud Firestore):</p>
+  <ul>
+    <li><strong>Account:</strong> your email address and a password (the password is handled by Firebase Authentication; we cannot read it).</li>
+    <li><strong>Nickname:</strong> the angler name you choose.</li>
+    <li><strong>Catch posts:</strong> species, size, weight, date, lure, location name, and photo that you choose to share. If you opt in to the Community map, an <em>approximate</em> location is shared — your real coordinates are randomly shifted by up to about half a mile before being sent. Exact catch GPS is never shared.</li>
+    <li><strong>Spots:</strong> name, notes, photo, and the coordinates of spots you submit. Spot coordinates are shared exactly as submitted, so only add spots you are comfortable sharing.</li>
+    <li><strong>Comments, likes, votes, and chat messages</strong> you post.</li>
+    <li><strong>Follows and private messages:</strong> who you follow or block, and direct messages you send to another member.</li>
+    <li><strong>Reports</strong> you file about other users' content.</li>
+  </ul>
+  <p><strong>Who can see it:</strong> catch posts, spots, and comments are readable by anyone using the app. Chat messages are readable by signed-in members. Direct messages are readable only by you and the person you wrote to. Likes and follows are visible to other members. Your email address is not shown to other users; your nickname is.</p>
+
+  <h2>3. Location and third-party services</h2>
+  <p>With your permission, the app reads your device location to tag catches, add spots, and look up conditions. To show weather, tides, water temperature, radar, and nearby waters and marinas, the app sends the coordinates of the location you select to these third-party services, which have their own privacy policies:</p>
+  <table>
+    <tr><th>Service</th><th>Used for</th></tr>
+    <tr><td>Open-Meteo</td><td>Weather and water temperature</td></tr>
+    <tr><td>NOAA Tides &amp; Currents</td><td>Tide predictions</td></tr>
+    <tr><td>OpenStreetMap (Overpass API and map tiles)</td><td>Nearby waters, marinas, and the Community map</td></tr>
+    <tr><td>RainViewer</td><td>Weather radar</td></tr>
+    <tr><td>National Weather Service (weather.gov)</td><td>Severe-weather alerts for your saved location (U.S.)</td></tr>
+    <tr><td>Google Maps</td><td>Only if you tap an "Open in Maps" link</td></tr>
+    <tr><td>Google Firebase</td><td>Community accounts and shared content (section 2)</td></tr>
+  </table>
+
+  <h2>3a. Weather safety notifications (optional)</h2>
+  <p>If you turn on weather safety notifications, the app asks your device for notification permission and uses your saved location to check for severe-weather alerts and storm forecasts. Your alert preferences and saved location are kept on your device only. Alerts are informational — always use your own judgment and official sources when weather is threatening.</p>
+
+  <h2>4. Camera and photos</h2>
+  <p>The app accesses your camera or photo library only when you tap the photo button, and only the picture you select is used. Photos are resized and stored on your device; a photo leaves your device only if you share it to the Community.</p>
+
+  <h2>5. How we use information</h2>
+  <p>We use the information above only to provide the app's features: to sign you in, show your posts to the community, and operate comments, chat, rankings, and the map. We do not use it for advertising or sell or rent it to anyone.</p>
+
+  <h2 id="delete-account">6. Deleting your account and information</h2>
+  <ul>
+    <li><strong>Delete your account in the app:</strong> open <em>Community</em>, scroll to the bottom, tap <em>Delete my account</em>, enter your password, and confirm. This permanently deletes your Community account and removes the catches, spots, chat messages, comments, follows, and blocks you created. Direct messages you already sent remain visible to the person who received them. Anonymous upvote markers may remain, as they contain no personal details.</li>
+    <li><strong>Can't use the app?</strong> Request deletion by opening an issue at <a href="https://github.com/ser710/Epic-Fishy/issues">github.com/ser710/Epic-Fishy/issues</a>, and we will remove your account and content.</li>
+    <li>You can also delete individual catch posts, comments, and chat messages inside the app at any time.</li>
+    <li>Data stored only on your device can be removed by clearing the app's data or uninstalling it.</li>
+  </ul>
+
+  <h2>7. Moderation</h2>
+  <p>Community content can be reported inside the app. We may remove content or accounts that are abusive, unlawful, or that expose another person's private information.</p>
+
+  <h2>8. Children</h2>
+  <p>Epic Fishy is not directed to children under 13, and we do not knowingly collect personal information from them. If you believe a child has created an account, contact us and we will delete it.</p>
+
+  <h2>9. Security</h2>
+  <p>Community data is stored with Google Firebase using access rules that limit who can create, change, and delete content. No method of transmission or storage is perfectly secure, so please don't post sensitive personal information.</p>
+
+  <h2>10. Changes to this policy</h2>
+  <p>If we change this policy, we will update the date at the top of this page.</p>
+
+  <h2>11. Contact</h2>
+  <p>Questions or deletion requests: please open an issue at <a href="https://github.com/ser710/Epic-Fishy/issues">github.com/ser710/Epic-Fishy/issues</a>.</p>
+</main>
+</body>
+</html>
