@@ -143,7 +143,32 @@ const NICKNAME_KEY = "tackle-community-nickname";
 const LICENSE_KEY = "tackle-license-v1";
 const WAYPOINT_KEY = "tackle-waypoints-v1";
 const MAIN_VIEWS = ["tackle", "conditions", "catches", "spots", "community"];
-const APP_VERSION = "2.0";
+const APP_VERSION = "2.1";
+const UNITS_KEY = "tackle-units-v1";
+
+// Everything is fetched and stored in US units; these only change how values are shown.
+function getUnits() {
+  try { return localStorage.getItem(UNITS_KEY) === "metric" ? "metric" : "imperial"; } catch (e) { return "imperial"; }
+}
+function setUnits(u) {
+  try { localStorage.setItem(UNITS_KEY, u); } catch (e) { /* ignore */ }
+  window.dispatchEvent(new Event("tackle-units-changed"));
+}
+function useUnits() {
+  const [units, setU] = useState(getUnits);
+  useEffect(() => {
+    const on = () => setU(getUnits());
+    window.addEventListener("tackle-units-changed", on);
+    return () => window.removeEventListener("tackle-units-changed", on);
+  }, []);
+  return units;
+}
+const isMetric = () => getUnits() === "metric";
+const fmtTemp = (f, withUnit = true) => (f == null ? "—" : isMetric() ? `${Math.round(((f - 32) * 5) / 9)}°${withUnit ? "C" : ""}` : `${Math.round(f)}°${withUnit ? "F" : ""}`);
+const fmtSpeed = (mph) => (mph == null ? "—" : isMetric() ? `${Math.round(mph * 1.609)} km/h` : `${Math.round(mph)} mph`);
+const fmtDist = (mi) => (mi == null ? "—" : isMetric() ? `${(mi * 1.609).toFixed(1)} km` : `${mi.toFixed(1)} mi`);
+const fmtHeight = (ft) => (ft == null ? "—" : isMetric() ? `${(ft * 0.3048).toFixed(2)} m` : `${Number(ft).toFixed(1)} ft`);
+const fmtShort = (ft) => (ft == null ? "" : isMetric() ? `${Math.round(ft * 0.3048)} m` : `${Math.round(ft)} ft`);
 const MAKER = "Epec Stuff, Things & Co";
 const APP_URL = "https://ser710.github.io/Epic-Fishy/";
 const COMMON_SPECIES = ["Largemouth bass", "Smallmouth bass", "Crappie", "Bluegill", "Catfish", "Redfish", "Speckled trout", "Snook", "Walleye", "Northern pike", "Rainbow trout", "Striped bass", "Flounder", "Tarpon"];
@@ -1887,9 +1912,9 @@ function toDatetimeLocal(d) {
 function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onCancel, onSave }) {
   const [species, setSpecies] = useState(initial?.species || "");
   const [length, setLength] = useState(initial?.length || "");
-  const [lengthUnit, setLengthUnit] = useState(initial?.lengthUnit || "in");
+  const [lengthUnit, setLengthUnit] = useState(initial?.lengthUnit || (isMetric() ? "cm" : "in"));
   const [weight, setWeight] = useState(initial?.weight || "");
-  const [weightUnit, setWeightUnit] = useState(initial?.weightUnit || "lb");
+  const [weightUnit, setWeightUnit] = useState(initial?.weightUnit || (isMetric() ? "kg" : "lb"));
   const [dateTime, setDateTime] = useState(initial?.dateTime ? initial.dateTime.slice(0, 16) : toDatetimeLocal(new Date()));
   const [location, setLocation] = useState(initial?.location || "");
   const [tripName, setTripName] = useState(initial?.tripName || "");
@@ -2289,6 +2314,7 @@ function ConditionsView({ items = [], onQuickAdd }) {
 }
 
 function WeatherCard({ weather, loading, error, waterTemp }) {
+  useUnits();
   if (loading) return <CardShell><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading weather...</span></CardShell>;
   if (error) return <CardShell><span className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{error}</span></CardShell>;
   if (!weather || !weather.current) return null;
@@ -2306,21 +2332,21 @@ function WeatherCard({ weather, loading, error, waterTemp }) {
     <CardShell title="WEATHER">
       <div className="flex items-end justify-between mb-5 pt-1">
         <div>
-          <div className="tb-stencil text-[68px] leading-[0.9]" style={{ color: "var(--tb-text)" }}>{Math.round(cur.temperature_2m)}°</div>
+          <div className="tb-stencil text-[68px] leading-[0.9]" style={{ color: "var(--tb-text)" }}>{fmtTemp(cur.temperature_2m, false)}</div>
           <div className="text-[17px] font-bold mt-2" style={{ color: "var(--tb-text)" }}>{label}</div>
-          <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Feels like {Math.round(cur.apparent_temperature)}°</div>
+          <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Feels like {fmtTemp(cur.apparent_temperature, false)}</div>
         </div>
         <Icon size={64} strokeWidth={1.3} style={{ color: "var(--tb-brass)" }} aria-hidden="true" />
       </div>
       <div className="grid grid-cols-2 gap-x-3 gap-y-4">
-        <StatRow icon={Wind} label="Wind" value={`${Math.round(cur.wind_speed_10m)} mph ${compassDir(cur.wind_direction_10m)}`} />
-        <StatRow icon={Wind} label="Gusts" value={`${Math.round(cur.wind_gusts_10m)} mph`} />
+        <StatRow icon={Wind} label="Wind" value={`${fmtSpeed(cur.wind_speed_10m)} ${compassDir(cur.wind_direction_10m)}`} />
+        <StatRow icon={Wind} label="Gusts" value={fmtSpeed(cur.wind_gusts_10m)} />
         <StatRow icon={Gauge} label="Pressure" value={`${Math.round(cur.pressure_msl)} hPa${trend ? " · " + trend : ""}`} trendIcon={trend === "rising" ? TrendingUp : trend === "falling" ? TrendingDown : null} />
-        <StatRow icon={Droplets} label="Precip" value={`${cur.precipitation ?? 0} in`} />
+        <StatRow icon={Droplets} label="Precip" value={isMetric() ? `${Math.round((cur.precipitation ?? 0) * 25.4)} mm` : `${cur.precipitation ?? 0} in`} />
         <StatRow icon={Sunrise} label="Sunrise" value={fmtTime(sunrise)} />
         <StatRow icon={Sunset} label="Sunset" value={fmtTime(sunset)} />
         {typeof waterTemp === "number" && (
-          <StatRow icon={Waves} label="Water" value={`${Math.round(waterTemp)}°F`} />
+          <StatRow icon={Waves} label="Water" value={fmtTemp(waterTemp)} />
         )}
       </div>
     </CardShell>
@@ -2393,12 +2419,13 @@ function StatRow({ icon: Icon, label, value, trendIcon: TrendIcon }) {
 }
 
 function TideCard({ tide, loading, error }) {
+  useUnits();
   if (loading) return <CardShell><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading tides...</span></CardShell>;
   if (error) return <CardShell title="TIDES"><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>{error}</span></CardShell>;
   if (!tide) return null;
 
   return (
-    <CardShell title="TIDES" subtitle={`nearest station: ${tide.station.name} (${tide.distance.toFixed(1)} mi)`}>
+    <CardShell title="TIDES" subtitle={`nearest station: ${tide.station.name} (${fmtDist(tide.distance)})`}>
       {tide.predictions.length === 0 ? (
         <span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No predictions available.</span>
       ) : (
@@ -2415,7 +2442,7 @@ function TideCard({ tide, loading, error }) {
                 <div style={{ color: "var(--tb-muted)" }}>
                   {dt.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
                 </div>
-                <div style={{ color: "var(--tb-text)" }}>{Number(p.v).toFixed(1)} ft</div>
+                <div style={{ color: "var(--tb-text)" }}>{fmtHeight(Number(p.v))}</div>
               </div>
             );
           })}
@@ -2583,6 +2610,7 @@ function LocationPicker({ onPick, onClose, onUseMyLocation }) {
 
 function WaypointsCard() {
   const [points, setPoints] = useState(null);
+  useUnits();
   const [status, setStatus] = useState("idle"); // idle | locating
   const [error, setError] = useState(null);
   const [note, setNote] = useState(null);
@@ -2602,6 +2630,7 @@ function WaypointsCard() {
 
   async function persist(next) {
     setPoints(next);
+    window.dispatchEvent(new CustomEvent("tackle-waypoints-changed", { detail: next }));
     try {
       await window.storage.set(WAYPOINT_KEY, JSON.stringify(next), false);
     } catch (e) {
@@ -2741,7 +2770,7 @@ function WaypointsCard() {
               {new Date(wp.time).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
               {" · "}
               {wp.lat.toFixed(5)}, {wp.lon.toFixed(5)}
-              {typeof wp.accuracyFt === "number" ? ` · ±${wp.accuracyFt} ft` : ""}
+              {typeof wp.accuracyFt === "number" ? ` · ±${fmtShort(wp.accuracyFt)}` : ""}
             </div>
             <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5">
               <a href={`https://www.google.com/maps?q=${wp.lat},${wp.lon}`} target="_blank" rel="noopener noreferrer" className="tb-mono text-[11px]" style={{ color: "var(--tb-blue)" }}>
@@ -2763,7 +2792,90 @@ function WaypointsCard() {
   );
 }
 
+function MyMapCard({ catches }) {
+  const mapRef = useRef(null);
+  const mapInstance = useRef(null);
+  const layerRef = useRef(null);
+  const [points, setPoints] = useState([]);
+  const [filter, setFilter] = useState("all"); // all | catches | waypoints
+  const leafletAvailable = typeof window !== "undefined" && !!window.L;
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(WAYPOINT_KEY, false);
+        setPoints(r && r.value ? JSON.parse(r.value) : []);
+      } catch (e) { setPoints([]); }
+    })();
+    const on = (e) => setPoints(Array.isArray(e.detail) ? e.detail : []);
+    window.addEventListener("tackle-waypoints-changed", on);
+    return () => window.removeEventListener("tackle-waypoints-changed", on);
+  }, []);
+
+  const pins = [];
+  if (filter !== "waypoints") {
+    for (const c of catches || []) {
+      if (c.gps && typeof c.gps.lat === "number") pins.push({ kind: "catch", lat: c.gps.lat, lon: c.gps.lon, label: [c.species || "Catch", c.weight ? `${c.weight} ${c.weightUnit}` : null, c.location || null].filter(Boolean).join(" · ") });
+    }
+  }
+  if (filter !== "catches") {
+    for (const w of points) pins.push({ kind: "waypoint", lat: w.lat, lon: w.lon, label: w.name || "Waypoint" });
+  }
+
+  useEffect(() => {
+    if (!leafletAvailable || !mapRef.current || mapInstance.current) return undefined;
+    const map = window.L.map(mapRef.current, { attributionControl: true, zoomControl: false }).setView([39, -96], 3);
+    window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 18 }).addTo(map);
+    window.L.control.zoom({ position: "bottomright" }).addTo(map);
+    mapInstance.current = map;
+    return () => { map.remove(); mapInstance.current = null; };
+  }, [leafletAvailable]);
+
+  useEffect(() => {
+    const map = mapInstance.current;
+    if (!map) return;
+    if (layerRef.current) map.removeLayer(layerRef.current);
+    const group = window.L.featureGroup();
+    for (const p of pins) {
+      const color = p.kind === "catch" ? "#2dd4bf" : "#ff6f5e";
+      window.L.circleMarker([p.lat, p.lon], { radius: 8, color: "#040707", weight: 2, fillColor: color, fillOpacity: 0.95 })
+        .bindPopup(`<strong>${p.label}</strong>`)
+        .addTo(group);
+    }
+    group.addTo(map);
+    layerRef.current = group;
+    if (pins.length) map.fitBounds(group.getBounds().pad(0.35), { maxZoom: 13 });
+    setTimeout(() => map.invalidateSize(), 50);
+  }, [pins.length, filter, leafletAvailable]);
+
+  const catchCount = (catches || []).filter((c) => c.gps).length;
+  if (!leafletAvailable) return null;
+
+  return (
+    <CardShell title="My map" subtitle="Your GPS-tagged catches and saved waypoints" noPad>
+      <div className="px-4 pt-3 pb-2 flex items-center gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }}>
+        <ChipButton active={filter === "all"} onClick={() => setFilter("all")} label={`All (${catchCount + points.length})`} />
+        <ChipButton active={filter === "catches"} onClick={() => setFilter("catches")} label={`Catches (${catchCount})`} />
+        <ChipButton active={filter === "waypoints"} onClick={() => setFilter("waypoints")} label={`Waypoints (${points.length})`} />
+      </div>
+      {pins.length === 0 ? (
+        <div className="px-4 pb-4">
+          <EmptyState text="Nothing to show yet. Log a catch with GPS or tap Log my location and it will appear here." />
+        </div>
+      ) : (
+        <div ref={mapRef} style={{ height: "300px" }} />
+      )}
+      <div className="flex gap-4 px-4 py-2.5 text-[12px]" style={{ color: "var(--tb-muted)", borderTop: "1px solid var(--tb-line)" }}>
+        <span className="flex items-center gap-1.5"><span className="inline-block w-3 h-3 rounded-full" style={{ background: "#2dd4bf" }} /> Catch</span>
+        <span className="flex items-center gap-1.5"><span className="inline-block w-3 h-3 rounded-full" style={{ background: "#ff6f5e" }} /> Waypoint</span>
+        <span className="ml-auto">Private to this device</span>
+      </div>
+    </CardShell>
+  );
+}
+
 function SpotsView({ catches }) {
+  useUnits();
   const [location, setLocation] = useState(null);
   const [locLoading, setLocLoading] = useState(true);
   const [showLocationPicker, setShowLocationPicker] = useState(false);
@@ -2915,6 +3027,8 @@ function SpotsView({ catches }) {
     <div className="space-y-3">
       <WaypointsCard />
 
+      <MyMapCard catches={catches} />
+
       <CardShell title="YOUR BEST SPOTS" subtitle="ranked from your GPS-tagged catches">
         {clusters.length === 0 ? (
           <EmptyState text="Log a few GPS-tagged catches and your top spots will show up here." />
@@ -2991,7 +3105,7 @@ function SpotsView({ catches }) {
                   <div className="text-xs font-semibold truncate" style={{ color: "var(--tb-text)" }}>{s.name}</div>
                   <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{s.type}</div>
                 </div>
-                <div className="tb-mono text-[11px] shrink-0" style={{ color: "var(--tb-blue)" }}>{s.distance.toFixed(1)} mi</div>
+                <div className="tb-mono text-[11px] shrink-0" style={{ color: "var(--tb-blue)" }}>{fmtDist(s.distance)}</div>
               </a>
             ))}
           </div>
@@ -3030,11 +3144,11 @@ function SpotsView({ catches }) {
                   >
                     <div className="min-w-0">
                       <div className="text-xs font-semibold truncate" style={{ color: "var(--tb-text)" }}>{m.name}</div>
-                      <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{m.distance.toFixed(1)} mi away</div>
+                      <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{fmtDist(m.distance)} away</div>
                     </div>
                     <div className="tb-mono text-xs shrink-0 flex items-center gap-1" style={{ color: typeof m.waterTemp === "number" ? "var(--tb-brass)" : "var(--tb-muted)" }}>
                       <Waves size={12} />
-                      {typeof m.waterTemp === "number" ? `${Math.round(m.waterTemp)}°F` : "no data"}
+                      {typeof m.waterTemp === "number" ? fmtTemp(m.waterTemp) : "no data"}
                     </div>
                   </a>
                 ))}
@@ -4899,11 +5013,39 @@ function SettingsPanel({ onClose }) {
 
         <div className="h-3" />
 
+        <UnitsCard />
+
+        <div className="h-3" />
+
         <InstallCard />
 
         <AboutFooter />
       </div>
     </div>
+  );
+}
+
+function UnitsCard() {
+  const units = useUnits();
+  const opt = (id, label, sub) => (
+    <button
+      key={id}
+      onClick={() => { haptic(); setUnits(id); }}
+      aria-pressed={units === id}
+      className="flex-1 rounded-xl px-3 py-3 text-left"
+      style={{ background: units === id ? "rgba(45,212,191,0.14)" : "var(--tb-surface-2)", border: "1px solid " + (units === id ? "var(--tb-brass)" : "var(--tb-line)") }}
+    >
+      <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{label}</div>
+      <div className="text-[12px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{sub}</div>
+    </button>
+  );
+  return (
+    <CardShell title="Units" subtitle="How temperatures, distances and sizes are shown">
+      <div className="flex gap-2">
+        {opt("imperial", "US", "°F, mph, miles, in, lb")}
+        {opt("metric", "Metric", "°C, km/h, km, cm, kg")}
+      </div>
+    </CardShell>
   );
 }
 
