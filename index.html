@@ -7,7 +7,7 @@
 <meta name="description" content="Track your fishing gear, weather, tides, live radar, catches, spots, and a shared community in one place." />
 
 <link rel="manifest" href="manifest.json" />
-<meta name="theme-color" content="#070f0f" />
+<meta name="theme-color" content="#040707" />
 <link rel="icon" href="icons/icon-192.png" />
 <link rel="apple-touch-icon" href="icons/icon-180.png" />
 <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png" />
@@ -32,7 +32,7 @@
 <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
 
 <style>
-  html, body { margin: 0; padding: 0; background: #020707; height: 100%; }
+  html, body { margin: 0; padding: 0; background: #000000; height: 100%; }
   #root { min-height: 100vh; display: flex; align-items: flex-start; justify-content: center; }
 </style>
 </head>
@@ -120,7 +120,7 @@ import {
   Trash2, AlertTriangle, ChevronLeft, Minus, Wind, Droplets, Gauge,
   Sunrise, Sunset, Waves, MapPin, RefreshCw, CloudRain, Sun, Cloud,
   CloudFog, CloudSnow, CloudLightning, TrendingUp, TrendingDown, ArrowUp,
-  Ruler, Scale, Trophy, Calendar, Pencil, Camera, ChevronDown, ExternalLink, Settings, Heart
+  Ruler, Scale, Trophy, Calendar, Pencil, Camera, ChevronDown, ExternalLink, Settings, Heart, Users, CloudSun
 } from "lucide-react";
 
 const CATEGORIES = [
@@ -140,7 +140,7 @@ const CATCH_KEY = "catch-records-v1";
 const NICKNAME_KEY = "tackle-community-nickname";
 const LICENSE_KEY = "tackle-license-v1";
 const WAYPOINT_KEY = "tackle-waypoints-v1";
-const MAIN_VIEWS = ["tackle", "conditions", "catches", "spots", "community", "knots"];
+const MAIN_VIEWS = ["tackle", "conditions", "catches", "spots", "community"];
 
 function weightToLb(value, unit) {
   const v = Number(value) || 0;
@@ -620,7 +620,7 @@ function SafetyBanner({ alerts }) {
 
   return (
     <div
-      className="mx-4 mt-3 rounded-xl px-3 py-2.5"
+      className="mb-4 rounded-xl px-3 py-2.5"
       style={{ background: danger ? "rgba(249,115,98,0.12)" : "rgba(45,212,191,0.10)", border: `1px solid ${accent}` }}
       role="alert"
     >
@@ -741,7 +741,7 @@ export default function TackleTracker() {
   const [showForm, setShowForm] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
   const [formPrefill, setFormPrefill] = useState(null);
-  const [tackleSubView, setTackleSubView] = useState("gear"); // 'gear' | 'guide'
+  const [tackleSubView, setTackleSubView] = useState("gear"); // 'gear' | 'guide' | 'knots'
   const [showSettings, setShowSettings] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const [toast, setToast] = useState(null);
@@ -902,103 +902,145 @@ export default function TackleTracker() {
   const activeItems =
     !loading && activeCategory ? items.filter((i) => i.category === activeCategory) : [];
 
+  const lowTotal = CATEGORIES.reduce((n, c) => n + (lowCounts[c.id] || 0), 0);
+  const itemCount = items ? items.length : 0;
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const SCREEN_META = {
+    tackle: {
+      title: "Tackle",
+      note: tackleSubView === "guide" ? "Learn to spot lures, hooks and rigs" : tackleSubView === "knots" ? "Knots you can tie on the water" : loading ? "" : itemCount === 0 ? "Your box is empty. Add your first item." : lowTotal > 0 ? `${plural(itemCount, "item")}, ${lowTotal} running low` : `${plural(itemCount, "item")}, all stocked`,
+    },
+    conditions: { title: "Conditions", note: "Weather, tides and when the bite is on" },
+    catches: {
+      title: "Catches",
+      note: catches === null ? "" : catches.length === 0 ? "No fish logged yet" : `${plural(catches.length, "catch")} logged`,
+    },
+    spots: { title: "Spots", note: "Where you catch fish, and where to try next" },
+    community: { title: "Community", note: "Anglers, catches and chat" },
+  };
+  const meta = SCREEN_META[view] || SCREEN_META.tackle;
+
   return (
     <div
-      style={{ fontFamily: "'Inter', sans-serif", background: "var(--tb-bg)", minHeight: "640px" }}
-      className="w-full max-w-md mx-auto relative overflow-hidden rounded-2xl"
+      style={{
+        fontFamily: "'Atkinson Hyperlegible', system-ui, sans-serif",
+        background: "var(--tb-bg)",
+        color: "var(--tb-text)",
+        height: "100dvh",
+        boxShadow: "0 0 0 1px var(--tb-line)",
+      }}
+      className="w-full max-w-md mx-auto relative overflow-hidden flex flex-col"
     >
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil:wght@600;800&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Big+Shoulders+Stencil:wght@700;800&display=swap');
         :root {
-          --tb-bg: #070f0f;
-          --tb-surface: #0d1e1d;
-          --tb-surface-2: #143231;
-          --tb-line: #1f4a47;
+          --tb-bg: #040707;
+          --tb-surface: #0e1514;
+          --tb-surface-2: #172321;
+          --tb-line: #234440;
           --tb-brass: #2dd4bf;
-          --tb-brass-dim: #0f766e;
-          --tb-flare: #f97362;
-          --tb-text: #f5faf9;
-          --tb-muted: #9fb8b5;
-          --tb-blue: #5eead4;
+          --tb-brass-dim: #0f8f82;
+          --tb-flare: #ff6f5e;
+          --tb-text: #f6fbfa;
+          --tb-muted: #9db6b2;
+          --tb-blue: #6ee7d8;
         }
-        .tb-stencil { font-family: 'Big Shoulders Stencil', sans-serif; letter-spacing: 0.04em; }
-        .tb-mono { font-family: 'IBM Plex Mono', monospace; }
+        .tb-stencil { font-family: 'Big Shoulders Stencil', 'Arial Narrow', sans-serif; letter-spacing: 0.03em; font-weight: 800; text-transform: uppercase; }
+        /* "tb-mono" is the old data-label class; it now means tabular figures in the body face. */
+        .tb-mono { font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: 0; }
+        /* Legibility floor: nothing smaller than 12px, so it stays readable in sunlight. */
+        .text-\[9px\], .text-\[10px\] { font-size: 12px !important; line-height: 1.35 !important; }
+        .text-\[11px\] { font-size: 12.5px !important; line-height: 1.4 !important; }
         .tb-scroll::-webkit-scrollbar { width: 4px; }
         .tb-scroll::-webkit-scrollbar-thumb { background: var(--tb-line); border-radius: 4px; }
+        .tb-waterline {
+          height: 10px; opacity: 0.5; background-repeat: repeat-x; background-position: left center;
+          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='10' viewBox='0 0 40 10'%3E%3Cpath d='M0 5 Q10 0 20 5 T40 5' fill='none' stroke='%232dd4bf' stroke-width='1.5'/%3E%3C/svg%3E");
+        }
+        input:focus, textarea:focus, select:focus { border-color: var(--tb-brass) !important; }
+        button:focus-visible, a:focus-visible { outline: 2px solid var(--tb-blue); outline-offset: 2px; border-radius: 8px; }
+        input::placeholder, textarea::placeholder { color: var(--tb-muted); opacity: 0.75; }
         @keyframes tb-slide-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
         @keyframes tb-fade-in { from { opacity: 0; } to { opacity: 1; } }
         @keyframes tb-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        @keyframes tb-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
         .tb-tray { animation: tb-slide-up 0.28s cubic-bezier(.2,.8,.3,1); }
         .tb-overlay { animation: tb-fade-in 0.2s ease; }
         .tb-toast { animation: tb-fade-in 0.15s ease; }
         .tb-spin { animation: tb-spin 1s linear infinite; }
+        .tb-skeleton {
+          border-radius: 16px; border: 1px solid var(--tb-line);
+          background: linear-gradient(100deg, var(--tb-surface) 30%, var(--tb-surface-2) 50%, var(--tb-surface) 70%);
+          background-size: 200% 100%; animation: tb-shimmer 1.6s linear infinite;
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .tb-tray, .tb-overlay, .tb-toast, .tb-skeleton { animation: none !important; }
+          .tb-spin { animation-duration: 3s; }
+        }
       `}</style>
 
       {/* Header */}
-      <div
-        className="px-5 pt-6 pb-3 relative"
-        style={{ background: "linear-gradient(180deg, var(--tb-surface) 0%, var(--tb-bg) 100%)", borderBottom: "1px solid var(--tb-line)" }}
-      >
-        <div className="flex items-center justify-between mb-3">
-          <h1 className="tb-stencil text-3xl" style={{ color: "var(--tb-text)" }}>
-            EPIC FISHY
-          </h1>
+      <header className="shrink-0 px-5" style={{ paddingTop: "calc(env(safe-area-inset-top, 0px) + 14px)" }}>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <BrandMark />
+            <span className="tb-stencil text-[26px] leading-none" style={{ color: "var(--tb-text)" }}>EPIC FISHY</span>
+          </div>
           <button
             onClick={() => setShowSettings(true)}
-            className="w-8 h-8 rounded-full flex items-center justify-center"
-            style={{ background: "var(--tb-surface-2)", border: "2px solid var(--tb-brass-dim)" }}
+            aria-label="Settings"
+            className="w-11 h-11 -mr-2.5 rounded-full flex items-center justify-center active:opacity-60"
           >
-            <Settings size={14} style={{ color: "var(--tb-brass)" }} />
+            <Settings size={22} style={{ color: "var(--tb-muted)" }} />
           </button>
         </div>
 
-        {/* Tabs */}
-        <div className="flex gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }}>
-          <TabButton active={view === "tackle"} onClick={() => setView("tackle")} label="Tackle" />
-          <TabButton active={view === "conditions"} onClick={() => setView("conditions")} label="Conditions" />
-          <TabButton active={view === "catches"} onClick={() => setView("catches")} label="Catches" />
-          <TabButton active={view === "spots"} onClick={() => setView("spots")} label="Spots" />
-          <TabButton active={view === "community"} onClick={() => setView("community")} label="Community" />
-          <TabButton active={view === "knots"} onClick={() => setView("knots")} label="Knots" />
-        </div>
-
-        {view === "tackle" && tackleSubView === "gear" && (
-          <div className="mt-3 relative">
-            <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--tb-muted)" }} />
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search gear, size, or box..."
-              className="w-full rounded-lg py-2.5 pl-9 pr-3 text-sm outline-none"
-              style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
-            />
-          </div>
-        )}
-      </div>
-
-      <SafetyBanner alerts={safety.alerts} />
+        <div className="tb-waterline mt-3 -mx-5" aria-hidden="true" />
+      </header>
 
       {/* Body */}
-      <div
-        className="px-4 py-4 tb-scroll"
-        style={{ maxHeight: "660px", overflowY: "auto" }}
+      <main
+        className="flex-1 min-h-0 overflow-y-auto tb-scroll px-4 pt-5"
+        style={{ paddingBottom: "calc(112px + env(safe-area-inset-bottom, 0px))" }}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
       >
+        <div className="mb-5">
+          <h1 className="tb-stencil text-[44px] leading-[0.95]" style={{ color: "var(--tb-text)" }}>{meta.title}</h1>
+          <p className="text-[15px] mt-1.5 min-h-[22px]" style={{ color: "var(--tb-muted)" }}>{meta.note}</p>
+        </div>
+
+        <SafetyBanner alerts={safety.alerts} />
+
         {view === "tackle" && (
           <>
-            <div className="flex gap-2 mb-3">
-              <TabButton active={tackleSubView === "gear"} onClick={() => setTackleSubView("gear")} label="My Gear" />
-              <TabButton active={tackleSubView === "guide"} onClick={() => setTackleSubView("guide")} label="ID Guide" />
+            <div className="flex gap-1 mb-4 -mx-1">
+              <TabButton active={tackleSubView === "gear"} onClick={() => setTackleSubView("gear")} label="My gear" />
+              <TabButton active={tackleSubView === "guide"} onClick={() => setTackleSubView("guide")} label="ID guide" />
+              <TabButton active={tackleSubView === "knots"} onClick={() => setTackleSubView("knots")} label="Knots" />
             </div>
 
             {tackleSubView === "guide" && <TackleGuideView />}
+            {tackleSubView === "knots" && <KnotsView />}
 
             {tackleSubView === "gear" && (
               <>
+                <div className="relative mb-4">
+                  <Search size={18} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: "var(--tb-muted)" }} />
+                  <input
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Search by name, size or box"
+                    aria-label="Search your gear"
+                    className="w-full rounded-xl py-3 pl-11 pr-3 text-[15px] outline-none"
+                    style={{ background: "var(--tb-surface)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
+                  />
+                </div>
+
                 {loading && (
-                  <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>
-                    Loading your gear...
+                  <div className="space-y-3" aria-busy="true" aria-label="Loading your gear">
+                    <div className="tb-skeleton h-[132px]" />
+                    <div className="tb-skeleton h-[132px]" />
                   </div>
                 )}
 
@@ -1020,26 +1062,38 @@ export default function TackleTracker() {
                 )}
 
                 {!loading && !filteredSearch && (
-                  <div className="grid grid-cols-2 gap-3">
-                    {CATEGORIES.map((c) => {
+                  <div
+                    className="rounded-3xl overflow-hidden grid grid-cols-2 gap-px"
+                    style={{ background: "var(--tb-line)", border: "1px solid var(--tb-line)" }}
+                  >
+                    {CATEGORIES.map((c, idx) => {
                       const Icon = c.icon;
                       const count = counts[c.id] || 0;
                       const low = lowCounts[c.id] || 0;
+                      const wide = CATEGORIES.length % 2 === 1 && idx === CATEGORIES.length - 1;
                       return (
                         <button
                           key={c.id}
                           onClick={() => setActiveCategory(c.id)}
-                          className="relative rounded-xl p-4 text-left transition-transform active:scale-95"
-                          style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}
+                          className={"text-left p-4 active:brightness-150 transition " + (wide ? "col-span-2" : "")}
+                          style={{ background: "var(--tb-surface)" }}
                         >
-                          {low > 0 && (
-                            <div className="absolute -top-1.5 -right-1.5 rounded-full w-5 h-5 flex items-center justify-center tb-mono text-[10px] font-bold" style={{ background: "var(--tb-flare)", color: "var(--tb-bg)" }}>
-                              {low}
+                          <div className={wide ? "flex items-center gap-4" : ""}>
+                            <div className="w-11 h-11 rounded-xl flex items-center justify-center shrink-0" style={{ background: "rgba(45,212,191,0.12)" }}>
+                              <Icon size={22} style={{ color: "var(--tb-brass)" }} />
                             </div>
-                          )}
-                          <Icon size={22} style={{ color: "var(--tb-brass)" }} />
-                          <div className="mt-3 text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{c.label}</div>
-                          <div className="tb-mono text-xs mt-0.5" style={{ color: "var(--tb-muted)" }}>{count} item{count !== 1 ? "s" : ""}</div>
+                            <div className={wide ? "" : "mt-4"}>
+                              <div className="text-[17px] font-bold leading-tight" style={{ color: "var(--tb-text)" }}>{c.label}</div>
+                              <div className="text-[14px] mt-0.5" style={{ color: "var(--tb-muted)" }}>
+                                {count === 0 ? "Empty" : `${count} item${count !== 1 ? "s" : ""}`}
+                              </div>
+                              {low > 0 && (
+                                <div className="text-[13px] font-bold mt-1.5 flex items-center gap-1.5" style={{ color: "var(--tb-flare)" }}>
+                                  <AlertTriangle size={13} /> {low} running low
+                                </div>
+                              )}
+                            </div>
+                          </div>
                         </button>
                       );
                     })}
@@ -1065,39 +1119,28 @@ export default function TackleTracker() {
 
         {view === "community" && <CommunityView />}
 
-        {view === "knots" && <KnotsView />}
-      </div>
+      </main>
 
       {/* Add button */}
       {view === "tackle" && tackleSubView === "gear" && (
-        <button
-          onClick={() => { setEditingItem(null); setShowForm(true); }}
-          className="absolute bottom-5 right-5 w-14 h-14 rounded-full flex items-center justify-center shadow-lg active:scale-95 transition-transform"
-          style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}
-        >
-          <Plus size={26} />
-        </button>
+        <AddFab label="Add gear" onClick={() => { setEditingItem(null); setShowForm(true); }} />
       )}
       {view === "catches" && (
-        <button
-          onClick={() => { setEditingCatch(null); setShowCatchForm(true); }}
-          className="absolute bottom-5 right-5 w-14 h-14 rounded-full flex items-center justify-center shadow-lg active:scale-95 transition-transform"
-          style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}
-        >
-          <Plus size={26} />
-        </button>
+        <AddFab label="Log a catch" onClick={() => { setEditingCatch(null); setShowCatchForm(true); }} />
       )}
+
+      <BottomNav view={view} onChange={setView} />
 
       {/* Toast */}
       {toast && (
-        <div className="tb-toast absolute bottom-24 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs tb-mono" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>
+        <div className="tb-toast absolute left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-full text-[14px] z-20" style={{ bottom: "calc(150px + env(safe-area-inset-bottom, 0px))", background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>
           {toast}
         </div>
       )}
 
       {saveError && (
-        <div className="absolute top-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-[10px] tb-mono" style={{ background: "var(--tb-flare)", color: "var(--tb-bg)" }}>
-          couldn't save — check connection
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full text-[12px] font-bold z-20" style={{ background: "var(--tb-flare)", color: "var(--tb-bg)" }}>
+          Couldn't save. Check your connection.
         </div>
       )}
 
@@ -1151,22 +1194,116 @@ function TabButton({ active, onClick, label }) {
   return (
     <button
       onClick={onClick}
-      className="px-4 py-1.5 rounded-full text-xs font-semibold tb-mono transition-colors shrink-0"
+      aria-pressed={active}
+      className="relative shrink-0 px-3.5 py-2.5 text-[15px] font-bold transition-colors"
+      style={{ color: active ? "var(--tb-text)" : "var(--tb-muted)" }}
+    >
+      {label}
+      <span
+        className="absolute left-2 right-2 bottom-0 h-[3px] rounded-full transition-opacity"
+        style={{ background: "var(--tb-brass)", opacity: active ? 1 : 0 }}
+      />
+    </button>
+  );
+}
+
+function ChipButton({ active, onClick, label }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-pressed={active}
+      className="shrink-0 px-3.5 py-1.5 rounded-full text-[14px] font-bold transition-colors"
       style={{
-        background: active ? "var(--tb-brass)" : "var(--tb-surface-2)",
+        background: active ? "var(--tb-brass)" : "transparent",
         color: active ? "var(--tb-bg)" : "var(--tb-muted)",
         border: "1px solid " + (active ? "var(--tb-brass)" : "var(--tb-line)"),
       }}
     >
-      {label.toUpperCase()}
+      {label}
     </button>
+  );
+}
+
+const NAV_ITEMS = [
+  { id: "tackle", label: "Tackle", Icon: Package },
+  { id: "conditions", label: "Conditions", Icon: CloudSun },
+  { id: "catches", label: "Catches", Icon: Fish },
+  { id: "spots", label: "Spots", Icon: MapPin },
+  { id: "community", label: "Community", Icon: Users },
+];
+
+function BottomNav({ view, onChange }) {
+  return (
+    <nav
+      aria-label="Main"
+      className="absolute bottom-0 left-0 right-0 z-10 flex"
+      style={{
+        background: "rgba(4,7,7,0.94)",
+        backdropFilter: "blur(14px)",
+        WebkitBackdropFilter: "blur(14px)",
+        borderTop: "1px solid var(--tb-line)",
+        paddingBottom: "env(safe-area-inset-bottom, 0px)",
+      }}
+    >
+      {NAV_ITEMS.map(({ id, label, Icon }) => {
+        const active = view === id;
+        return (
+          <button
+            key={id}
+            onClick={() => onChange(id)}
+            aria-current={active ? "page" : undefined}
+            className="flex-1 relative flex flex-col items-center justify-center gap-1 pt-2.5 pb-2 min-h-[64px] active:opacity-60"
+          >
+            {active && (
+              <span
+                className="absolute top-0 h-[3px] w-10 rounded-b-full"
+                style={{ background: "var(--tb-brass)", boxShadow: "0 0 14px 2px rgba(45,212,191,0.55)" }}
+              />
+            )}
+            <Icon size={24} strokeWidth={active ? 2.4 : 1.8} style={{ color: active ? "var(--tb-brass)" : "var(--tb-muted)" }} />
+            <span className="text-[12px] font-bold leading-none whitespace-nowrap" style={{ color: active ? "var(--tb-text)" : "var(--tb-muted)" }}>{label}</span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+function AddFab({ onClick, label }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-label={label}
+      className="absolute right-4 z-10 w-[60px] h-[60px] rounded-[20px] flex items-center justify-center active:scale-95 transition-transform"
+      style={{
+        bottom: "calc(80px + env(safe-area-inset-bottom, 0px))",
+        background: "var(--tb-brass)",
+        color: "var(--tb-bg)",
+        boxShadow: "0 12px 30px -8px rgba(45,212,191,0.6), inset 0 0 0 1px rgba(255,255,255,0.14)",
+      }}
+    >
+      <Plus size={28} strokeWidth={2.6} />
+    </button>
+  );
+}
+
+function BrandMark() {
+  // An open fish hook: ring eye, straight shank, deep curve, barbed tip.
+  return (
+    <svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true">
+      <rect width="32" height="32" rx="9" fill="var(--tb-brass)" />
+      <circle cx="16" cy="7.4" r="2.1" fill="none" stroke="var(--tb-bg)" strokeWidth="1.9" />
+      <path d="M16 9.5V21.5a5.6 5.6 0 0 1-11.2 0v-3.2" transform="translate(5.6 0)" fill="none" stroke="var(--tb-bg)" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M10.4 18.3l-2.6 2.4" fill="none" stroke="var(--tb-bg)" strokeWidth="2.2" strokeLinecap="round" />
+    </svg>
   );
 }
 
 function EmptyState({ text }) {
   return (
-    <div className="rounded-xl py-10 text-center text-sm" style={{ background: "var(--tb-surface)", color: "var(--tb-muted)", border: "1px dashed var(--tb-line)" }}>
-      {text}
+    <div className="rounded-2xl px-6 py-10 text-center" style={{ border: "1px dashed var(--tb-line)" }}>
+      <Waves size={28} className="mx-auto mb-3" style={{ color: "var(--tb-brass-dim)" }} aria-hidden="true" />
+      <p className="text-[15px] leading-snug mx-auto max-w-[270px]" style={{ color: "var(--tb-muted)" }}>{text}</p>
     </div>
   );
 }
@@ -1335,7 +1472,7 @@ function ItemForm({ initial, defaultCategory, onCancel, onSave }) {
 function Field({ label, children }) {
   return (
     <label className="block">
-      <span className="tb-mono text-[11px] block mb-1" style={{ color: "var(--tb-muted)" }}>{label}</span>
+      <span className="text-[14px] font-bold block mb-1.5" style={{ color: "var(--tb-muted)" }}>{label}</span>
       {children}
     </label>
   );
@@ -1529,12 +1666,12 @@ function CatchesView({ catches, items, onEdit, onDelete }) {
 
 function StatTile({ label, value, icon: Icon, small }) {
   return (
-    <div className="rounded-xl p-3 text-center" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
-      {Icon && <Icon size={14} className="mx-auto mb-1" style={{ color: "var(--tb-brass)" }} />}
-      <div className={small ? "text-xs font-semibold truncate" : "text-lg font-semibold"} style={{ color: "var(--tb-text)" }}>
+    <div className="rounded-2xl px-2 py-3 text-center" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+      {Icon && <Icon size={16} className="mx-auto mb-1" style={{ color: "var(--tb-brass)" }} />}
+      <div className={small ? "text-[14px] font-bold truncate" : "text-[22px] font-bold leading-tight"} style={{ color: "var(--tb-text)" }}>
         {value}
       </div>
-      <div className="tb-mono text-[10px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{label}</div>
+      <div className="text-[12px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{label}</div>
     </div>
   );
 }
@@ -1570,7 +1707,7 @@ function CatchRow({ record, onEdit, onDelete }) {
             </div>
           )}
           {record.tripName && (
-            <div className="tb-mono text-[10px] mt-1" style={{ color: "var(--tb-brass)" }}>🎒 {record.tripName}</div>
+            <div className="text-[13px] mt-1 flex items-center gap-1.5" style={{ color: "var(--tb-brass)" }}><Calendar size={13} aria-hidden="true" /> {record.tripName}</div>
           )}
           {record.gps && (
             <div className="tb-mono text-[10px] mt-1 flex items-center gap-1" style={{ color: "var(--tb-blue)" }}>
@@ -2040,14 +2177,15 @@ function WeatherCard({ weather, loading, error, waterTemp }) {
 
   return (
     <CardShell title="WEATHER">
-      <div className="flex items-center gap-3 mb-3">
-        <Icon size={30} style={{ color: "var(--tb-brass)" }} />
+      <div className="flex items-end justify-between mb-5 pt-1">
         <div>
-          <div className="text-2xl font-semibold tb-mono" style={{ color: "var(--tb-text)" }}>{Math.round(cur.temperature_2m)}°F</div>
-          <div className="text-xs" style={{ color: "var(--tb-muted)" }}>{label} · feels {Math.round(cur.apparent_temperature)}°</div>
+          <div className="tb-stencil text-[68px] leading-[0.9]" style={{ color: "var(--tb-text)" }}>{Math.round(cur.temperature_2m)}°</div>
+          <div className="text-[17px] font-bold mt-2" style={{ color: "var(--tb-text)" }}>{label}</div>
+          <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Feels like {Math.round(cur.apparent_temperature)}°</div>
         </div>
+        <Icon size={64} strokeWidth={1.3} style={{ color: "var(--tb-brass)" }} aria-hidden="true" />
       </div>
-      <div className="grid grid-cols-2 gap-2 tb-mono text-xs">
+      <div className="grid grid-cols-2 gap-x-3 gap-y-4">
         <StatRow icon={Wind} label="Wind" value={`${Math.round(cur.wind_speed_10m)} mph ${compassDir(cur.wind_direction_10m)}`} />
         <StatRow icon={Wind} label="Gusts" value={`${Math.round(cur.wind_gusts_10m)} mph`} />
         <StatRow icon={Gauge} label="Pressure" value={`${Math.round(cur.pressure_msl)} hPa${trend ? " · " + trend : ""}`} trendIcon={trend === "rising" ? TrendingUp : trend === "falling" ? TrendingDown : null} />
@@ -2092,7 +2230,7 @@ function BestBiteCard({ weather }) {
       </div>
       <div className="grid grid-cols-2 gap-2">
         <div>
-          <div className="tb-mono text-[10px] mb-1" style={{ color: "var(--tb-brass)" }}>MAJOR (strongest)</div>
+          <div className="text-[14px] font-bold mb-1" style={{ color: "var(--tb-brass)" }}>Major (strongest)</div>
           {periods.majors.map((p, i) => (
             <div key={i} className="tb-mono text-xs" style={{ color: isNowIn(p) ? "var(--tb-brass)" : "var(--tb-text)" }}>
               {fmt(p.start)}–{fmt(p.end)}
@@ -2100,7 +2238,7 @@ function BestBiteCard({ weather }) {
           ))}
         </div>
         <div>
-          <div className="tb-mono text-[10px] mb-1" style={{ color: "var(--tb-blue)" }}>MINOR</div>
+          <div className="text-[14px] font-bold mb-1" style={{ color: "var(--tb-blue)" }}>Minor</div>
           {periods.minors.map((p, i) => (
             <div key={i} className="tb-mono text-xs" style={{ color: isNowIn(p) ? "var(--tb-brass)" : "var(--tb-text)" }}>
               {fmt(p.start)}–{fmt(p.end)}
@@ -2114,11 +2252,15 @@ function BestBiteCard({ weather }) {
 
 function StatRow({ icon: Icon, label, value, trendIcon: TrendIcon }) {
   return (
-    <div className="flex items-center gap-1.5" style={{ color: "var(--tb-muted)" }}>
-      <Icon size={13} style={{ color: "var(--tb-blue)" }} />
-      <span>{label}:</span>
-      <span style={{ color: "var(--tb-text)" }}>{value}</span>
-      {TrendIcon && <TrendIcon size={12} style={{ color: "var(--tb-brass)" }} />}
+    <div className="flex items-start gap-2.5">
+      <Icon size={18} className="shrink-0 mt-0.5" style={{ color: "var(--tb-brass)" }} />
+      <div className="min-w-0">
+        <div className="text-[13px] leading-none" style={{ color: "var(--tb-muted)" }}>{label}</div>
+        <div className="text-[16px] font-bold mt-1 flex items-center gap-1.5" style={{ color: "var(--tb-text)" }}>
+          <span className="break-words min-w-0">{value}</span>
+          {TrendIcon && <TrendIcon size={14} style={{ color: "var(--tb-brass)" }} />}
+        </div>
+      </div>
     </div>
   );
 }
@@ -2220,17 +2362,22 @@ function RadarCard({ lat, lon }) {
   );
 }
 
+// Titles are written in capitals around the codebase; show them as normal sentences.
+function sentenceCase(t) {
+  return typeof t === "string" && /[A-Z]/.test(t) && t === t.toUpperCase() ? t.charAt(0) + t.slice(1).toLowerCase() : t;
+}
+
 function CardShell({ title, subtitle, children, noPad }) {
   return (
-    <div className="rounded-xl overflow-hidden" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+    <section className="rounded-2xl overflow-hidden" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
       {title && (
-        <div className="px-4 pt-3 pb-1.5" style={{ borderBottom: noPad ? "1px solid var(--tb-line)" : "none" }}>
-          <div className="tb-stencil text-sm" style={{ color: "var(--tb-brass)" }}>{title}</div>
-          {subtitle && <div className="tb-mono text-[10px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{subtitle}</div>}
+        <div className="px-4 pt-4 pb-2" style={{ borderBottom: noPad ? "1px solid var(--tb-line)" : "none" }}>
+          <h2 className="text-[18px] font-bold leading-tight" style={{ color: "var(--tb-text)" }}>{sentenceCase(title)}</h2>
+          {subtitle && <p className="text-[14px] mt-0.5 leading-snug" style={{ color: "var(--tb-muted)" }}>{(() => { const t = sentenceCase(subtitle); return typeof t === "string" ? t.charAt(0).toUpperCase() + t.slice(1) : t; })()}</p>}
         </div>
       )}
-      <div className={noPad ? "" : "px-4 pb-4 pt-1"}>{children}</div>
-    </div>
+      <div className={noPad ? "" : "px-4 pb-4 pt-1.5"}>{children}</div>
+    </section>
   );
 }
 
@@ -3117,7 +3264,7 @@ function DMThread({ other, onBack }) {
   }
 
   return (
-    <CardShell title={`CHAT WITH ${String(other.nickname || "Angler").toUpperCase()}`} subtitle="private conversation">
+    <CardShell title={`Chat with ${other.nickname || "Angler"}`} subtitle="private conversation">
       <button onClick={onBack} className="tb-mono text-[11px] mb-2" style={{ color: "var(--tb-blue)" }}>← All messages</button>
       <div className="rounded-lg p-2 space-y-2 overflow-y-auto tb-scroll" style={{ height: "320px", background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
         {messages === null && !error && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Opening...</div>}
@@ -4360,7 +4507,7 @@ function KnotsView() {
     <div className="space-y-3">
       <div className="flex gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }}>
         {KNOT_CATEGORIES.map((c) => (
-          <TabButton key={c.id} active={category === c.id} onClick={() => setCategory(c.id)} label={c.label} />
+          <ChipButton key={c.id} active={category === c.id} onClick={() => setCategory(c.id)} label={c.label} />
         ))}
       </div>
 
@@ -4391,7 +4538,7 @@ function KnotsView() {
                     ))}
                   </ol>
                   <div className="tb-mono text-[11px] mt-3 rounded-lg p-2.5" style={{ background: "var(--tb-surface-2)", color: "var(--tb-muted)" }}>
-                    💡 {knot.tip}
+                    <strong style={{ color: "var(--tb-brass)" }}>Tip: </strong>{knot.tip}
                   </div>
                   <a
                     href={videoUrl}
@@ -4886,7 +5033,7 @@ function TackleGuideView() {
       </p>
       <div className="flex gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }}>
         {TACKLE_REF_CATEGORIES.map((c) => (
-          <TabButton key={c.id} active={category === c.id} onClick={() => setCategory(c.id)} label={c.label} />
+          <ChipButton key={c.id} active={category === c.id} onClick={() => setCategory(c.id)} label={c.label} />
         ))}
       </div>
 
