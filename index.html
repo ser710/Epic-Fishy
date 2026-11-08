@@ -4,7 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>Epic Fishy</title>
-<meta name="description" content="Track your fishing gear, weather, tides, live radar, catches, spots, and a shared community in one place." />
+<meta name="description" content="Track your fishing gear, weather, tides, live radar, catches, spots, and a shared community in one place. Powered by Epec Stuff, Things &amp; Co." />
+<meta name="author" content="Epec Stuff, Things &amp; Co" />
 
 <link rel="manifest" href="manifest.json" />
 <meta name="theme-color" content="#040707" />
@@ -40,6 +41,7 @@
 <div id="root">
   <div style="color:#9fb8b5;text-align:center;padding:60px 20px;font-family:sans-serif;font-size:14px;">
     Loading Epic Fishy...
+    <div style="margin-top:10px;font-size:12px;color:#2dd4bf;">Powered by Epec Stuff, Things &amp; Co</div>
   </div>
 </div>
 
@@ -141,6 +143,63 @@ const NICKNAME_KEY = "tackle-community-nickname";
 const LICENSE_KEY = "tackle-license-v1";
 const WAYPOINT_KEY = "tackle-waypoints-v1";
 const MAIN_VIEWS = ["tackle", "conditions", "catches", "spots", "community"];
+const APP_VERSION = "2.0";
+const MAKER = "Epec Stuff, Things & Co";
+const APP_URL = "https://ser710.github.io/Epic-Fishy/";
+const COMMON_SPECIES = ["Largemouth bass", "Smallmouth bass", "Crappie", "Bluegill", "Catfish", "Redfish", "Speckled trout", "Snook", "Walleye", "Northern pike", "Rainbow trout", "Striped bass", "Flounder", "Tarpon"];
+
+// A short tap you can feel. Quietly does nothing where unsupported (iPhone Safari).
+function haptic(kind = "tap") {
+  try {
+    if (!navigator.vibrate) return;
+    navigator.vibrate(kind === "success" ? [12, 40, 18] : kind === "warn" ? [30, 30, 30] : 10);
+  } catch (e) { /* ignore */ }
+}
+
+async function dataUrlToFile(dataUrl, name) {
+  const res = await fetch(dataUrl);
+  const blob = await res.blob();
+  return new File([blob], name, { type: blob.type || "image/jpeg" });
+}
+
+// Share a catch through the phone's own share sheet (Messages, Instagram, etc.).
+async function shareCatch(record) {
+  const parts = [
+    record.species || "A fish",
+    record.length ? `${record.length} ${record.lengthUnit}` : null,
+    record.weight ? `${record.weight} ${record.weightUnit}` : null,
+  ].filter(Boolean);
+  const where = record.location ? ` at ${record.location}` : "";
+  const lure = record.lure ? ` on a ${record.lure}` : "";
+  const text = `${parts.join(", ")}${where}${lure}. Logged with Epic Fishy.`;
+  if (!navigator.share) {
+    try { await navigator.clipboard.writeText(`${text} ${APP_URL}`); return "copied"; } catch (e) { return "unsupported"; }
+  }
+  const payload = { title: "My catch", text, url: APP_URL };
+  try {
+    if (record.photo && navigator.canShare) {
+      const file = await dataUrlToFile(record.photo, "catch.jpg");
+      if (navigator.canShare({ files: [file] })) payload.files = [file];
+    }
+    await navigator.share(payload);
+    return "shared";
+  } catch (e) {
+    return e && e.name === "AbortError" ? "cancelled" : "failed";
+  }
+}
+
+// Which catches are a personal best (heaviest of their species)?
+function personalBestIds(catches) {
+  const best = {};
+  for (const c of catches || []) {
+    const lb = weightToLb(c.weight, c.weightUnit);
+    if (!c.species || lb <= 0) continue;
+    const key = c.species.trim().toLowerCase();
+    if (!best[key] || lb > best[key].lb) best[key] = { lb, id: c.id };
+  }
+  return new Set(Object.values(best).map((b) => b.id));
+}
+
 
 function weightToLb(value, unit) {
   const v = Number(value) || 0;
@@ -748,6 +807,26 @@ export default function TackleTracker() {
   const toastTimer = useRef(null);
   const touchStart = useRef(null);
   const safety = useSafetyAlerts();
+  const [updateReady, setUpdateReady] = useState(false);
+
+  // A new version was installed in the background: offer a one-tap reload instead of
+  // making people open the app twice.
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return undefined;
+    let cancelled = false;
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (!reg || cancelled) return;
+      if (reg.waiting && navigator.serviceWorker.controller) setUpdateReady(true);
+      reg.addEventListener("updatefound", () => {
+        const w = reg.installing;
+        if (!w) return;
+        w.addEventListener("statechange", () => {
+          if (w.state === "installed" && navigator.serviceWorker.controller) setUpdateReady(true);
+        });
+      });
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   function handleTouchStart(e) {
     const overlayOpen = showForm || showCatchForm || showSettings || activeCategory;
@@ -904,7 +983,7 @@ export default function TackleTracker() {
 
   const lowTotal = CATEGORIES.reduce((n, c) => n + (lowCounts[c.id] || 0), 0);
   const itemCount = items ? items.length : 0;
-  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : word.endsWith("ch") ? "es" : "s"}`;
   const SCREEN_META = {
     tackle: {
       title: "Tackle",
@@ -1112,6 +1191,7 @@ export default function TackleTracker() {
             items={items || []}
             onEdit={(c) => { setEditingCatch(c); setShowCatchForm(true); }}
             onDelete={deleteCatch}
+            onToast={showToast}
           />
         )}
 
@@ -1123,13 +1203,33 @@ export default function TackleTracker() {
 
       {/* Add button */}
       {view === "tackle" && tackleSubView === "gear" && (
-        <AddFab label="Add gear" onClick={() => { setEditingItem(null); setShowForm(true); }} />
+        <AddFab label="Add gear" onClick={() => { haptic(); setEditingItem(null); setShowForm(true); }} />
       )}
       {view === "catches" && (
-        <AddFab label="Log a catch" onClick={() => { setEditingCatch(null); setShowCatchForm(true); }} />
+        <AddFab label="Log a catch" onClick={() => { haptic(); setEditingCatch(null); setShowCatchForm(true); }} />
       )}
 
-      <BottomNav view={view} onChange={setView} />
+      {updateReady && (
+        <div
+          className="absolute left-4 right-4 z-20 rounded-2xl px-4 py-3 flex items-center justify-between gap-3"
+          style={{ bottom: "calc(84px + env(safe-area-inset-bottom, 0px))", background: "var(--tb-surface-2)", border: "1px solid var(--tb-brass)", boxShadow: "0 12px 30px -10px rgba(0,0,0,0.8)" }}
+          role="status"
+        >
+          <div className="min-w-0">
+            <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>Update ready</div>
+            <div className="text-[13px]" style={{ color: "var(--tb-muted)" }}>A new version of Epic Fishy is installed.</div>
+          </div>
+          <button
+            onClick={() => { haptic("success"); window.location.reload(); }}
+            className="shrink-0 px-4 py-2 rounded-xl text-[14px] font-bold"
+            style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}
+          >
+            Reload
+          </button>
+        </div>
+      )}
+
+      <BottomNav view={view} onChange={(v) => { haptic(); setView(v); }} />
 
       {/* Toast */}
       {toast && (
@@ -1180,6 +1280,7 @@ export default function TackleTracker() {
           initial={editingCatch}
           items={items || []}
           existingTrips={[...new Set((catches || []).map((c) => c.tripName).filter(Boolean))]}
+          recentSpecies={[...new Set([...(catches || [])].sort((a, b) => new Date(b.dateTime) - new Date(a.dateTime)).map((c) => c.species).filter(Boolean))].slice(0, 6)}
           onCancel={() => { setShowCatchForm(false); setEditingCatch(null); }}
           onSave={upsertCatch}
         />
@@ -1574,8 +1675,9 @@ function groupCatchesByTrip(sortedCatches) {
     });
 }
 
-function CatchesView({ catches, items, onEdit, onDelete }) {
+function CatchesView({ catches, items, onEdit, onDelete, onToast }) {
   const [groupByTrip, setGroupByTrip] = useState(false);
+  const bestIds = personalBestIds(catches || []);
 
   if (catches === null) {
     return <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>Loading your catch log...</div>;
@@ -1635,7 +1737,7 @@ function CatchesView({ catches, items, onEdit, onDelete }) {
       {!groupByTrip && (
         <div className="space-y-2">
           {sorted.map((c) => (
-            <CatchRow key={c.id} record={c} onEdit={() => onEdit(c)} onDelete={() => onDelete(c.id)} />
+            <CatchRow key={c.id} record={c} isBest={bestIds.has(c.id)} onToast={onToast} onEdit={() => onEdit(c)} onDelete={() => onDelete(c.id)} />
           ))}
         </div>
       )}
@@ -1653,7 +1755,7 @@ function CatchesView({ catches, items, onEdit, onDelete }) {
               </div>
               <div className="space-y-2">
                 {t.catches.map((c) => (
-                  <CatchRow key={c.id} record={c} onEdit={() => onEdit(c)} onDelete={() => onDelete(c.id)} />
+                  <CatchRow key={c.id} record={c} isBest={bestIds.has(c.id)} onToast={onToast} onEdit={() => onEdit(c)} onDelete={() => onDelete(c.id)} />
                 ))}
               </div>
             </div>
@@ -1676,8 +1778,16 @@ function StatTile({ label, value, icon: Icon, small }) {
   );
 }
 
-function CatchRow({ record, onEdit, onDelete }) {
+function CatchRow({ record, onEdit, onDelete, isBest, onToast }) {
   const [showMap, setShowMap] = useState(false);
+  async function share() {
+    haptic();
+    const r = await shareCatch(record);
+    if (onToast) {
+      if (r === "copied") onToast("Copied to clipboard");
+      else if (r === "failed" || r === "unsupported") onToast("Sharing isn't available here");
+    }
+  }
   const [showPhoto, setShowPhoto] = useState(false);
   const dt = record.dateTime ? new Date(record.dateTime) : null;
   return (
@@ -1693,7 +1803,14 @@ function CatchRow({ record, onEdit, onDelete }) {
           />
         )}
         <div className="flex-1 min-w-0" onClick={onEdit}>
-          <div className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{record.species || "Unknown species"}</div>
+          <div className="text-[16px] font-bold flex items-center gap-2" style={{ color: "var(--tb-text)" }}>
+            <span>{record.species || "Unknown species"}</span>
+            {isBest && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[12px] font-bold" style={{ background: "rgba(45,212,191,0.14)", color: "var(--tb-brass)" }} title="Personal best for this species">
+                <Trophy size={12} aria-hidden="true" /> Best
+              </span>
+            )}
+          </div>
           <div className="tb-mono text-[11px] mt-0.5" style={{ color: "var(--tb-muted)" }}>
             {[
               record.length ? `${record.length} ${record.lengthUnit}` : null,
@@ -1720,23 +1837,23 @@ function CatchRow({ record, onEdit, onDelete }) {
           )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
-          {record.gps && (
-            <button
-              onClick={() => setShowMap((s) => !s)}
-              className="w-7 h-7 rounded-md flex items-center justify-center"
-              style={{ background: showMap ? "var(--tb-brass)" : "var(--tb-surface-2)", color: showMap ? "var(--tb-bg)" : "var(--tb-blue)" }}
-              title="View catch location"
-            >
-              <MapPin size={13} />
-            </button>
-          )}
-          <button onClick={onEdit} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>
-            <Pencil size={13} />
+          <button onClick={onEdit} aria-label="Edit catch" className="w-9 h-9 rounded-lg flex items-center justify-center" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+            <Pencil size={15} />
           </button>
-          <button onClick={onDelete} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ color: "var(--tb-flare)" }}>
-            <Trash2 size={14} />
+          <button onClick={() => { haptic("warn"); onDelete(); }} aria-label="Delete catch" className="w-9 h-9 rounded-lg flex items-center justify-center" style={{ color: "var(--tb-flare)" }}>
+            <Trash2 size={16} />
           </button>
         </div>
+      </div>
+      <div className="flex gap-5 mt-2.5 pt-2.5" style={{ borderTop: "1px solid var(--tb-line)" }}>
+        <button onClick={share} className="flex items-center gap-1.5 text-[14px] font-bold" style={{ color: "var(--tb-brass)" }}>
+          <ExternalLink size={15} aria-hidden="true" /> Share
+        </button>
+        {record.gps && (
+          <button onClick={() => setShowMap((v) => !v)} className="flex items-center gap-1.5 text-[14px] font-bold" style={{ color: showMap ? "var(--tb-text)" : "var(--tb-brass)" }}>
+            <MapPin size={15} aria-hidden="true" /> {showMap ? "Hide map" : "Map"}
+          </button>
+        )}
       </div>
       {showMap && record.gps && (
         <div className="mt-2 rounded-lg overflow-hidden" style={{ border: "1px solid var(--tb-line)" }}>
@@ -1767,7 +1884,7 @@ function toDatetimeLocal(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function CatchForm({ initial, items, existingTrips = [], onCancel, onSave }) {
+function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onCancel, onSave }) {
   const [species, setSpecies] = useState(initial?.species || "");
   const [length, setLength] = useState(initial?.length || "");
   const [lengthUnit, setLengthUnit] = useState(initial?.lengthUnit || "in");
@@ -1854,8 +1971,18 @@ function CatchForm({ initial, items, existingTrips = [], onCancel, onSave }) {
 
         <div className="space-y-3">
           <Field label="Species">
-            <input autoFocus value={species} onChange={(e) => setSpecies(e.target.value)} placeholder="e.g. Largemouth bass" className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+            <input autoFocus value={species} onChange={(e) => setSpecies(e.target.value)} placeholder="e.g. Largemouth bass" list="species-suggestions" className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle} />
+            <datalist id="species-suggestions">
+              {[...new Set([...recentSpecies, ...COMMON_SPECIES])].map((sp) => <option key={sp} value={sp} />)}
+            </datalist>
           </Field>
+          {!species && (
+            <div className="flex gap-2 overflow-x-auto tb-scroll -mt-1 pb-1" style={{ scrollbarWidth: "none" }}>
+              {[...new Set([...recentSpecies, ...COMMON_SPECIES])].slice(0, 8).map((sp) => (
+                <ChipButton key={sp} active={false} onClick={() => { haptic(); setSpecies(sp); }} label={sp} />
+              ))}
+            </div>
+          )}
 
           <PhotoField photo={photo} onChange={setPhoto} label="Catch photo" />
 
@@ -2501,6 +2628,7 @@ function WaypointsCard() {
           time: new Date().toISOString(),
           name: "",
         };
+        haptic("success");
         persist([wp, ...(points || [])]);
         setNamingId(wp.id);
         setNameDraft("");
@@ -3014,6 +3142,7 @@ function LikeButton({ catchId }) {
 
   async function toggle() {
     if (!info || busy) return;
+    haptic();
     setBusy(true);
     const before = info;
     setInfo({ count: Math.max(0, before.count + (before.liked ? -1 : 1)), liked: !before.liked });
@@ -4767,6 +4896,89 @@ function SettingsPanel({ onClose }) {
             </a>
           </div>
         </CardShell>
+
+        <div className="h-3" />
+
+        <InstallCard />
+
+        <AboutFooter />
+      </div>
+    </div>
+  );
+}
+
+function InstallCard() {
+  const [promptEvent, setPromptEvent] = useState(null);
+  const [installed, setInstalled] = useState(() => window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+  const [shared, setShared] = useState(null);
+
+  useEffect(() => {
+    const onPrompt = (e) => { e.preventDefault(); setPromptEvent(e); };
+    const onInstalled = () => { setInstalled(true); setPromptEvent(null); };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onPrompt);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+
+  async function install() {
+    if (!promptEvent) return;
+    haptic();
+    promptEvent.prompt();
+    try { await promptEvent.userChoice; } catch (e) { /* ignore */ }
+    setPromptEvent(null);
+  }
+
+  async function shareApp() {
+    haptic();
+    const data = { title: "Epic Fishy", text: "Tackle box, conditions, catch log and a fishing community in one app.", url: APP_URL };
+    try {
+      if (navigator.share) { await navigator.share(data); setShared("Thanks for spreading the word"); }
+      else { await navigator.clipboard.writeText(APP_URL); setShared("Link copied"); }
+    } catch (e) { /* cancelled */ }
+  }
+
+  const btn = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+
+  return (
+    <CardShell title="Get the app" subtitle="Works offline and opens like any other app">
+      <div className="space-y-2">
+        {installed ? (
+          <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Epic Fishy is installed on this device.</div>
+        ) : promptEvent ? (
+          <button onClick={install} className="w-full py-2.5 rounded-lg text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+            Add to home screen
+          </button>
+        ) : (
+          <div className="text-[14px] leading-snug" style={{ color: "var(--tb-muted)" }}>
+            {isIOS
+              ? "In Safari, tap the Share button, then \"Add to Home Screen\"."
+              : "In your browser menu, choose \"Install app\" or \"Add to Home screen\"."}
+          </div>
+        )}
+        <button onClick={shareApp} className="w-full py-2.5 rounded-lg text-[14px] font-bold" style={btn}>
+          Share Epic Fishy with a friend
+        </button>
+        {shared && <div className="text-[13px]" style={{ color: "var(--tb-brass)" }}>{shared}</div>}
+      </div>
+    </CardShell>
+  );
+}
+
+function AboutFooter() {
+  return (
+    <div className="pt-6 pb-2 text-center">
+      <div className="flex items-center justify-center gap-2">
+        <BrandMark />
+        <span className="tb-stencil text-[20px]" style={{ color: "var(--tb-text)" }}>EPIC FISHY</span>
+      </div>
+      <div className="text-[13px] mt-2" style={{ color: "var(--tb-muted)" }}>Version {APP_VERSION}</div>
+      <div className="text-[14px] font-bold mt-1" style={{ color: "var(--tb-brass)" }}>Powered by {MAKER}</div>
+      <div className="text-[12px] mt-2" style={{ color: "var(--tb-muted)" }}>
+        Weather by Open-Meteo and the National Weather Service. Tides by NOAA. Map data by OpenStreetMap contributors.
       </div>
     </div>
   );

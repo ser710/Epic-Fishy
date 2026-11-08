@@ -1,7 +1,7 @@
 {
   "name": "Epic Fishy",
   "short_name": "Epic Fishy",
-  "description": "Track your fishing gear, weather, tides, and radar in one place.",
+  "description": "Tackle box, conditions, catch log, spots and a fishing community in one app. Powered by Epec Stuff, Things & Co.",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",

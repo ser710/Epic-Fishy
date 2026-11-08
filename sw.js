@@ -1,4 +1,4 @@
-const CACHE_NAME = "tackle-box-v22";
+const CACHE_NAME = "tackle-box-v23";
 const PREFS_CACHE = "epic-fishy-prefs"; // small settings shared with the page (alert prefs); never deleted on update
 const APP_SHELL = ["./", "./index.html", "./manifest.json", "./firebase-config.js", "./firebase-bootstrap.js", "./icons/icon-180.png", "./icons/icon-192.png", "./icons/icon-512.png"];
 

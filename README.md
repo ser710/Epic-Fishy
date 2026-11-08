@@ -1,5 +1,7 @@
 # Epic Fishy — Android install guide
 
+Made by **Epec Stuff, Things & Co**.
+
 This is a Progressive Web App (PWA), not a Play Store APK — but on Android,
 Chrome installs PWAs as real standalone apps: their own icon on your home
 screen, their own window with no browser bar, and offline support for your
