@@ -1471,7 +1471,7 @@ function ProLockBox() {
   return (
       <div className="mt-3 rounded-xl p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-brass)" }}>
         <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>Epic Fishy Pro · {ent.price || "$3.50"} once</div>
-        <div className="text-[13px] mt-0.5" style={{ color: "var(--tb-muted)" }}>4-day bite forecast, lure picks and catch insights. Pay once, keep it.</div>
+        <div className="text-[13px] mt-0.5" style={{ color: "var(--tb-muted)" }}>Rank all your spots for today and tomorrow, every lure pick, and your full catch insights. Pay once, keep it.</div>
         {ent.supported ? (
           <div className="flex items-center gap-3 mt-2.5">
             <button onClick={() => { haptic(); proBillingBuy(); }} disabled={ent.busy} className="px-4 py-2 rounded-xl text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)", opacity: ent.busy ? 0.6 : 1 }}>{ent.busy ? "Working…" : "Unlock Pro"}</button>
@@ -1588,7 +1588,6 @@ function proCondLine(c) {
 
 function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQuickAdd, refresh, loading }) {
   useUnits();
-  const ent = useProEntitlement();
   const [dayIdx, setDayIdx] = useState(0);
   const [selT, setSelT] = useState(null);
 
@@ -1610,10 +1609,9 @@ function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQ
   }
 
   const tz = st.fc.tz;
-  const locked = dayIdx > 0 && !ent.unlocked;
-  const day = model.days[locked ? 0 : Math.min(dayIdx, model.days.length - 1)];
+  const day = model.days[Math.min(dayIdx, model.days.length - 1)];
   const now = Date.now();
-  const isToday = day === model.days[0];
+  const isToday = dayIdx === 0;
   const nowHour = isToday ? day.hours.find((h) => now >= h.t && now < h.t + 3600000) : null;
   const bestHour = day.hours.reduce((b, h) => (!b || h.score > b.score ? h : b), null);
   const sel = (selT != null && day.hours.find((h) => h.t === selT)) || nowHour || bestHour;
@@ -1638,14 +1636,13 @@ function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQ
 
         <div className="flex gap-1 mt-1 mb-2">
           {model.days.map((d, i) => (
-            <button key={d.date} onClick={() => setDayIdx(i)} aria-pressed={i === dayIdx} aria-label={i > 0 && !ent.unlocked ? `${proFmtDay(d.start, tz, { weekday: "long" })}, Pro` : undefined} className="flex-1 rounded-lg py-1.5 text-center" style={{ background: i === dayIdx ? "var(--tb-surface-2)" : "transparent", border: "1px solid " + (i === dayIdx ? "var(--tb-brass)" : "var(--tb-line)") }}>
+            <button key={d.date} onClick={() => setDayIdx(i)} aria-pressed={i === dayIdx} className="flex-1 rounded-lg py-1.5 text-center" style={{ background: i === dayIdx ? "var(--tb-surface-2)" : "transparent", border: "1px solid " + (i === dayIdx ? "var(--tb-brass)" : "var(--tb-line)") }}>
               <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>{i === 0 ? "Today" : proFmtDay(d.start, tz, { weekday: "short" })}</div>
-              <div className="text-[15px] font-bold" style={{ color: d.best >= 65 && (i === 0 || ent.unlocked) ? "var(--tb-brass)" : "var(--tb-text)" }}>{i > 0 && !ent.unlocked ? "🔒" : d.best}</div>
+              <div className="text-[15px] font-bold" style={{ color: d.best >= 65 ? "var(--tb-brass)" : "var(--tb-text)" }}>{d.best}</div>
             </button>
           ))}
         </div>
 
-        {locked && <div className="rounded-lg px-3 py-2 mb-2 text-[14px]" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-brass)", color: "var(--tb-text)" }}>Days 2–4 are part of Epic Fishy Pro. Showing today.<ProLockBox /></div>}
         {headline && (
           <div className="flex items-end justify-between my-2">
             <div>
@@ -1754,11 +1751,11 @@ function ProLurePicks({ st, model, catches, items, onQuickAdd, nowHour }) {
   }, [st, model, catches, items, nowHour]);
   const ent = useProEntitlement();
   if (!picks.length) return null;
-  if (!ent.unlocked) return <ProLockCard title="WHAT TO THROW">Lure and bait picks matched to today's conditions, your tackle box and your own catch history.</ProLockCard>;
+  const shownPicks = ent.unlocked ? picks : picks.slice(0, 1);
   return (
     <CardShell title="WHAT TO THROW" subtitle={`for ${model.profile.id === "generic" ? "general fishing" : model.profile.label.toLowerCase()} in today's conditions`}>
       <div>
-        {picks.map((p, idx) => (
+        {shownPicks.map((p, idx) => (
           <div key={p.title} style={{ borderTop: idx > 0 ? "1px solid var(--tb-line)" : "none", paddingTop: idx > 0 ? 10 : 0, marginTop: idx > 0 ? 10 : 0 }}>
             <div className="flex items-center gap-2 flex-wrap">
               <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{p.title}</div>
@@ -1780,6 +1777,98 @@ function ProLurePicks({ st, model, catches, items, onQuickAdd, nowHour }) {
           </div>
         ))}
       </div>
+      {!ent.unlocked && picks.length > 1 && (
+        <div className="mt-3">
+          <div className="text-[13px]" style={{ color: "var(--tb-muted)" }}>{picks.length - 1} more pick{picks.length - 2 === 0 ? "" : "s"} for these conditions, including ones from your own catch history.</div>
+          <ProLockBox />
+        </div>
+      )}
+    </CardShell>
+  );
+}
+
+/* ---------------- "Where to fish today": rank your own spots by today's bite ---------------- */
+
+function proSpotList(catches, waypoints) {
+  const out = [];
+  const add = (s) => { if (!out.some((o) => haversineMiles(o.lat, o.lon, s.lat, s.lon) < 0.6)) out.push(s); };
+  (waypoints || []).forEach((w) => { if (typeof w.lat === "number" && typeof w.lon === "number") add({ name: w.name || "Waypoint", lat: w.lat, lon: w.lon, kind: "waypoint" }); });
+  clusterCatchesByLocation(catches || []).forEach((c) => add({ name: c.name || "Catch spot", lat: c.lat, lon: c.lon, kind: "catches", count: c.count }));
+  return out.slice(0, 8);
+}
+
+function ProSpotRanker({ catches, targetName }) {
+  const ent = useProEntitlement();
+  const [wps, setWps] = useState([]);
+  const [rows, setRows] = useState(null);
+  useEffect(() => {
+    let off = false;
+    const read = async () => { try { const r = await window.storage.get(WAYPOINT_KEY, false); if (!off) setWps(r && r.value ? JSON.parse(r.value) : []); } catch (e) { if (!off) setWps([]); } };
+    read();
+    const on = (e) => setWps(Array.isArray(e.detail) ? e.detail : []);
+    window.addEventListener("tackle-waypoints-changed", on);
+    return () => { off = true; window.removeEventListener("tackle-waypoints-changed", on); };
+  }, []);
+  const spots = useMemo(() => proSpotList(catches, wps), [catches, wps]);
+  const spotKey = spots.map((s) => `${s.lat.toFixed(2)},${s.lon.toFixed(2)}`).join("|");
+  useEffect(() => {
+    if (spots.length < 2) { setRows(null); return undefined; }
+    let off = false;
+    setRows(null);
+    Promise.all(spots.map(async (sp) => {
+      try {
+        const f = await proLoadForecast(sp.lat, sp.lon);
+        const m = await proLoadMarine(sp.lat, sp.lon).then((r) => r.data).catch(() => null);
+        const fc = proNormalizeForecast(f.data);
+        const model = proBuildDays(fc, m, targetName);
+        const today = model.days[0], tomorrow = model.days[1];
+        const w = today.windows[0];
+        const now = today.hours.find((h) => Date.now() >= h.t && Date.now() < h.t + 3600000);
+        return { ...sp, tz2: fc.tz, best: today.best, win: w || null, nowScore: now ? now.score : null, tomorrow: tomorrow ? tomorrow.best : null };
+      } catch (e) { return { ...sp, failed: true }; }
+    })).then((r) => { if (!off) setRows(r); });
+    return () => { off = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spotKey, targetName]);
+
+  if (spots.length < 2) {
+    return (
+      <CardShell title="WHERE TO FISH TODAY" subtitle="compares your saved spots">
+        <p className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Save two or more spots (log a catch with a GPS tag, or add a waypoint on the Spots tab) and this ranks them by today's bite, so you know which one to hit first.</p>
+      </CardShell>
+    );
+  }
+  if (!rows) return <CardShell title="WHERE TO FISH TODAY"><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Checking {spots.length} spots…</span></CardShell>;
+  const ranked = rows.filter((r) => !r.failed).sort((a, b) => (b.win ? b.win.avg : b.best) - (a.win ? a.win.avg : a.best));
+  if (!ranked.length) return null;
+  const free = ent.unlocked ? ranked : ranked.slice(0, 1);
+  const labelFor = (v) => (v >= 80 ? "Excellent" : v >= 65 ? "Good" : v >= 45 ? "Fair" : "Slow");
+  return (
+    <CardShell title="WHERE TO FISH TODAY" subtitle={`your ${ranked.length} spots, ranked for ${targetName ? targetName.toLowerCase() : "any fish"}`}>
+      <div className="space-y-2">
+        {free.map((r, i) => {
+          const v = r.win ? r.win.avg : r.best;
+          return (
+            <div key={r.lat + "," + r.lon} className="rounded-xl p-3 flex items-center gap-3" style={{ background: "var(--tb-surface-2)", border: "1px solid " + (i === 0 ? "var(--tb-brass)" : "var(--tb-line)") }}>
+              <div className="tb-stencil text-[30px] leading-none w-9 text-center" style={{ color: i === 0 ? "var(--tb-brass)" : "var(--tb-muted)" }}>{i + 1}</div>
+              <div className="flex-1 min-w-0">
+                <div className="text-[15px] font-bold truncate" style={{ color: "var(--tb-text)" }}>{r.name}</div>
+                <div className="text-[13px]" style={{ color: "var(--tb-muted)" }}>
+                  {labelFor(v)} · {r.win ? `best ${proFmtTime(r.win.start, r.tz2)}–${proFmtTime(r.win.end, r.tz2)}` : "no strong window"}
+                  {ent.unlocked && typeof r.tomorrow === "number" ? ` · tomorrow ${r.tomorrow}` : ""}
+                </div>
+              </div>
+              <div className="text-[22px] font-bold" style={{ color: v >= 65 ? "var(--tb-brass)" : "var(--tb-text)" }}>{v}</div>
+            </div>
+          );
+        })}
+      </div>
+      {!ent.unlocked && ranked.length > 1 && (
+        <div className="mt-3">
+          <div className="text-[13px]" style={{ color: "var(--tb-muted)" }}>{ranked.length - 1} more spot{ranked.length - 1 === 1 ? "" : "s"} ranked, plus tomorrow's pick for each.</div>
+          <ProLockBox />
+        </div>
+      )}
     </CardShell>
   );
 }
@@ -1859,6 +1948,7 @@ function ProConditions({ location, items, catches, onQuickAdd, noaaTideMissing }
   return (
     <>
       <ProBiteForecast st={st} targetName={target} onTarget={setTarget} catches={catches} nearby={nearby.list} items={items} onQuickAdd={onQuickAdd} refresh={refresh} loading={st.status === "loading"} />
+      <ProSpotRanker catches={catches} targetName={target} />
       {noaaTideMissing && <ProModelTideCard st={st} />}
       <ProNearbySpecies nearby={nearby} place={st.status === "ok" ? st.place : null} catches={catches} onPick={setTarget} targetName={target} />
     </>
@@ -1991,7 +2081,9 @@ function ProCatchHub({ catches }) {
         </div>
       )}
       {open && tab === "insights" && !ent.unlocked && (
-        <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Insights show when you catch fish, which barometer and moon phases work for you, and your best months.
+        <div>
+          {topBin && topBin.value > 0 ? <p className="text-[16px] font-bold" style={{ color: "var(--tb-text)" }}>You catch most of your fish at {topBin.label.toLowerCase()}.</p> : <p className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Log a few more fish and patterns will show up here.</p>}
+          <p className="text-[14px] mt-1" style={{ color: "var(--tb-muted)" }}>Pro adds the full picture: your hour-by-hour pattern, which pressure trends and moon phases bring your bites, and your best months and lures.</p>
           <ProLockBox />
         </div>
       )}
@@ -4149,7 +4241,7 @@ function MyMapCard({ catches }) {
     for (const p of pins) {
       const color = p.kind === "catch" ? "#2dd4bf" : "#ff6f5e";
       window.L.circleMarker([p.lat, p.lon], { radius: 8, color: "#040707", weight: 2, fillColor: color, fillOpacity: 0.95 })
-        .bindPopup(`<strong>${p.label}</strong>`)
+        .bindPopup(`<strong>${proEscape(p.label)}</strong>`)
         .addTo(group);
     }
     group.addTo(map);

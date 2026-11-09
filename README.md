@@ -98,9 +98,11 @@ automatically — same for anyone else using the same hosted link.
 
 ## Epic Fishy Pro (optional one-time unlock)
 
-The app is free. Pro (a one-time Google Play purchase, product ID
-`epic_fishy_pro`) adds the 4-day bite forecast beyond today, lure & bait picks
-and catch insights. It is **off by default**: the switch is `PRO_PAYWALL_ON` in
+The app is free, including the full 4-day bite forecast, the first lure pick,
+the life list and a headline from your own catch data. Pro (a one-time Google
+Play purchase, product ID `epic_fishy_pro`) adds **Where to fish today** (ranks
+all your saved spots for today and tomorrow), every lure pick, and the full
+catch insights. It is **off by default**: the switch is `PRO_PAYWALL_ON` in
 `tackle-tracker.jsx` (currently `false`), so nothing is locked until it is set to
 `true` and the Play product exists. It only sells inside the Android app (Digital
 Goods API); the web version shows how to unlock it. Setup order: merchant account
