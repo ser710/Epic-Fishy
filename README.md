@@ -1,6 +1,6 @@
 # Epic Fishy — Android install guide
 
-Made by **Epec Stuff, Things & Co**.
+Made by **Epic Stuff, Things & Co**.
 
 This is a Progressive Web App (PWA), not a Play Store APK — but on Android,
 Chrome installs PWAs as real standalone apps: their own icon on your home
@@ -39,8 +39,15 @@ Either works fine — just keep the folder structure intact (icons stay in an
 ## Features
 
 - **Tackle** — your gear, organized by compartment, with photos and low-stock alerts.
-- **Conditions** — live weather, tides, and radar for your spot.
-- **Catches** — a catch log with GPS tagging and photos.
+- **Conditions** — live weather, tides, and radar for your spot, plus a
+  4-day hourly **bite forecast** (light, moon position, pressure trend, wind,
+  sky, tide flow and water temperature, tuned to the species you pick),
+  **lure & bait picks** matched to your tackle box and your own catch history,
+  and the fish people have actually recorded near you. Works worldwide
+  (Open-Meteo + iNaturalist); US-only extras are NOAA tides and NWS alerts.
+- **Catches** — a catch log with GPS tagging and photos, a life list of
+  species caught, and insights (best time of day, barometer, moon phase)
+  built from the weather recorded at each catch.
 - **Spots** — combines your own catch data (which locations produce the most
   and biggest fish, and what's working there) with nearby named lakes,
   rivers, and fishing spots pulled live from OpenStreetMap so you can find
@@ -49,13 +56,21 @@ Either works fine — just keep the folder structure intact (icons stay in an
 ## Features
 
 - **Tackle** — your gear, organized by compartment, with photos and low-stock alerts.
-- **Conditions** — live weather, tides, and radar for your spot.
-- **Catches** — a catch log with GPS tagging and photos.
+- **Conditions** — live weather, tides, and radar for your spot, plus a
+  4-day hourly **bite forecast** (light, moon position, pressure trend, wind,
+  sky, tide flow and water temperature, tuned to the species you pick),
+  **lure & bait picks** matched to your tackle box and your own catch history,
+  and the fish people have actually recorded near you. Works worldwide
+  (Open-Meteo + iNaturalist); US-only extras are NOAA tides and NWS alerts.
+- **Catches** — a catch log with GPS tagging and photos, a life list of
+  species caught, and insights (best time of day, barometer, moon phase)
+  built from the weather recorded at each catch.
 - **Spots** — combines your own catch data (which locations produce the most
   and biggest fish, and what's working there) with nearby named lakes,
   rivers, and fishing spots pulled live from OpenStreetMap so you can find
   new water to try.
-- **Community** (optional) — a shared feed of catches, crowd-sourced spots
+- **Community** (optional) — a shared feed of catches, an opt-in catch map
+  (clustered, filterable by species, locations blurred to ~1 km), crowd-sourced spots
   with upvotes, and a leaderboard, visible to everyone using this app.
   Requires the one-time Firebase setup below; until then, this tab shows a
   simple "not set up yet" message and everything else works as normal.
@@ -80,6 +95,21 @@ Either works fine — just keep the folder structure intact (icons stay in an
 
 Once that's live, reload the app and the Community tab will connect
 automatically — same for anyone else using the same hosted link.
+
+## Epic Fishy Pro (optional one-time unlock)
+
+The app is free, including the full 4-day bite forecast, the first lure pick,
+the life list and a headline from your own catch data. Pro (a one-time Google
+Play purchase, product ID `epic_fishy_pro`) adds **Where to fish today** (ranks
+all your saved spots for today and tomorrow), every lure pick, the full
+catch insights, **My map layers** (USGS satellite, NOAA nautical charts, NASA
+sea-surface temperature, GEBCO ocean depth, OpenSeaMap seamarks), **calendar
+reminders** for your best bite windows (.ics) and **GPX export** of your spots. It is **off by default**: the switch is `PRO_PAYWALL_ON` in
+`tackle-tracker.jsx` (currently `false`), so nothing is locked until it is set to
+`true` and the Play product exists. It only sells inside the Android app (Digital
+Goods API); the web version shows how to unlock it. Setup order: merchant account
+in Play Console, create the one-time product, rebuild the package with Play
+Billing enabled in PWABuilder, then flip the switch.
 
 ## What works offline vs. needs a connection
 
