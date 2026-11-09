@@ -39,8 +39,15 @@ Either works fine — just keep the folder structure intact (icons stay in an
 ## Features
 
 - **Tackle** — your gear, organized by compartment, with photos and low-stock alerts.
-- **Conditions** — live weather, tides, and radar for your spot.
-- **Catches** — a catch log with GPS tagging and photos.
+- **Conditions** — live weather, tides, and radar for your spot, plus a
+  4-day hourly **bite forecast** (light, moon position, pressure trend, wind,
+  sky, tide flow and water temperature, tuned to the species you pick),
+  **lure & bait picks** matched to your tackle box and your own catch history,
+  and the fish people have actually recorded near you. Works worldwide
+  (Open-Meteo + iNaturalist); US-only extras are NOAA tides and NWS alerts.
+- **Catches** — a catch log with GPS tagging and photos, a life list of
+  species caught, and insights (best time of day, barometer, moon phase)
+  built from the weather recorded at each catch.
 - **Spots** — combines your own catch data (which locations produce the most
   and biggest fish, and what's working there) with nearby named lakes,
   rivers, and fishing spots pulled live from OpenStreetMap so you can find
@@ -49,13 +56,21 @@ Either works fine — just keep the folder structure intact (icons stay in an
 ## Features
 
 - **Tackle** — your gear, organized by compartment, with photos and low-stock alerts.
-- **Conditions** — live weather, tides, and radar for your spot.
-- **Catches** — a catch log with GPS tagging and photos.
+- **Conditions** — live weather, tides, and radar for your spot, plus a
+  4-day hourly **bite forecast** (light, moon position, pressure trend, wind,
+  sky, tide flow and water temperature, tuned to the species you pick),
+  **lure & bait picks** matched to your tackle box and your own catch history,
+  and the fish people have actually recorded near you. Works worldwide
+  (Open-Meteo + iNaturalist); US-only extras are NOAA tides and NWS alerts.
+- **Catches** — a catch log with GPS tagging and photos, a life list of
+  species caught, and insights (best time of day, barometer, moon phase)
+  built from the weather recorded at each catch.
 - **Spots** — combines your own catch data (which locations produce the most
   and biggest fish, and what's working there) with nearby named lakes,
   rivers, and fishing spots pulled live from OpenStreetMap so you can find
   new water to try.
-- **Community** (optional) — a shared feed of catches, crowd-sourced spots
+- **Community** (optional) — a shared feed of catches, an opt-in catch map
+  (clustered, filterable by species, locations blurred to ~1 km), crowd-sourced spots
   with upvotes, and a leaderboard, visible to everyone using this app.
   Requires the one-time Firebase setup below; until then, this tab shows a
   simple "not set up yet" message and everything else works as normal.

@@ -115,7 +115,7 @@
 
 <script type="text/babel" data-presets="react" data-type="module">
 import React from "react";
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Fish, Circle, Disc, Weight, Anchor, Wrench, Package, Plus, X, Search,
@@ -143,12 +143,16 @@ const NICKNAME_KEY = "tackle-community-nickname";
 const LICENSE_KEY = "tackle-license-v1";
 const WAYPOINT_KEY = "tackle-waypoints-v1";
 const MAIN_VIEWS = ["tackle", "conditions", "catches", "spots", "community"];
-const APP_VERSION = "2.1";
+const APP_VERSION = "2.2";
 const UNITS_KEY = "tackle-units-v1";
 
 // Everything is fetched and stored in US units; these only change how values are shown.
 function getUnits() {
-  try { return localStorage.getItem(UNITS_KEY) === "metric" ? "metric" : "imperial"; } catch (e) { return "imperial"; }
+  try {
+    const v = localStorage.getItem(UNITS_KEY);
+    if (v === "metric" || v === "imperial") return v;
+  } catch (e) { /* fall through to the region default */ }
+  return proDefaultUnits(); // first run: metric outside the US, imperial in it
 }
 function setUnits(u) {
   try { localStorage.setItem(UNITS_KEY, u); } catch (e) { /* ignore */ }
@@ -331,154 +335,6 @@ function getPressureTrend(weather) {
   }
 }
 
-// --- Solunar estimate: moon phase + approximate major/minor feeding windows ---
-// Moonrise/transit calculations are approximated (not full astronomical
-// precision) using the moon's age relative to the local solar noon, which is
-// the standard simplification hobby solunar calculators use.
-function getMoonPhase(date) {
-  const synodicMonth = 29.530588853;
-  const knownNewMoon = Date.UTC(2000, 0, 6, 18, 14); // a known new moon reference point
-  const daysSince = (date.getTime() - knownNewMoon) / 86400000;
-  const age = daysSince % synodicMonth;
-  const ageNorm = age < 0 ? age + synodicMonth : age;
-  const illumination = Math.round((1 - Math.cos((2 * Math.PI * ageNorm) / synodicMonth)) * 50);
-
-  let name, emoji;
-  if (ageNorm < 1.5 || ageNorm > synodicMonth - 1.5) { name = "New Moon"; emoji = "🌑"; }
-  else if (ageNorm < 6.4) { name = "Waxing Crescent"; emoji = "🌒"; }
-  else if (ageNorm < 8.4) { name = "First Quarter"; emoji = "🌓"; }
-  else if (ageNorm < 13.3) { name = "Waxing Gibbous"; emoji = "🌔"; }
-  else if (ageNorm < 16.3) { name = "Full Moon"; emoji = "🌕"; }
-  else if (ageNorm < 21.2) { name = "Waning Gibbous"; emoji = "🌖"; }
-  else if (ageNorm < 23.2) { name = "Last Quarter"; emoji = "🌗"; }
-  else { name = "Waning Crescent"; emoji = "🌘"; }
-
-  return { ageDays: ageNorm, illumination, name, emoji };
-}
-
-function getSolunarPeriods(sunriseIso, sunsetIso, moonAgeDays) {
-  if (!sunriseIso || !sunsetIso) return null;
-  const sunrise = new Date(sunriseIso);
-  const sunset = new Date(sunsetIso);
-  const solarNoon = new Date((sunrise.getTime() + sunset.getTime()) / 2);
-
-  // Moon transit drifts ~50.5 minutes later each day relative to the sun, starting near solar noon at new moon.
-  const driftMs = moonAgeDays * 50.5 * 60000;
-  const moonTransit = new Date(solarNoon.getTime() + driftMs);
-
-  const H = 3600000;
-  const major1 = { start: new Date(moonTransit - H), end: new Date(moonTransit.getTime() + H) };
-  const major2Center = new Date(moonTransit.getTime() + 12.42 * H);
-  const major2 = { start: new Date(major2Center.getTime() - H), end: new Date(major2Center.getTime() + H) };
-  const minor1Center = new Date(moonTransit.getTime() - 6.2 * H);
-  const minor1 = { start: new Date(minor1Center.getTime() - 0.5 * H), end: new Date(minor1Center.getTime() + 0.5 * H) };
-  const minor2Center = new Date(moonTransit.getTime() + 6.2 * H);
-  const minor2 = { start: new Date(minor2Center.getTime() - 0.5 * H), end: new Date(minor2Center.getTime() + 0.5 * H) };
-
-  return { majors: [major1, major2], minors: [minor1, minor2] };
-}
-
-function itemMatchesKeywords(item, keywords) {
-  const hay = `${item.name} ${item.spec} ${item.notes || ""}`.toLowerCase();
-  return keywords.some((k) => hay.includes(k.toLowerCase()));
-}
-
-function buildRecommendations(weather, tide) {
-  const recs = [];
-  const cur = weather?.current;
-  if (!cur) return recs;
-
-  const now = new Date();
-  const sunrise = weather.daily?.sunrise?.[0] ? new Date(weather.daily.sunrise[0]) : null;
-  const sunset = weather.daily?.sunset?.[0] ? new Date(weather.daily.sunset[0]) : null;
-  const minutesFrom = (d) => (d ? Math.abs(now - d) / 60000 : Infinity);
-  const nearSunrise = minutesFrom(sunrise) < 60;
-  const nearSunset = minutesFrom(sunset) < 60;
-  const trend = getPressureTrend(weather);
-  const cloud = cur.cloud_cover ?? 50;
-  const wind = cur.wind_speed_10m ?? 0;
-  const temp = cur.temperature_2m;
-  const skyLabel = weatherCodeInfo(cur.weather_code).label;
-
-  if ((nearSunrise || nearSunset) && wind < 14) {
-    recs.push({
-      title: "Low-light topwater window",
-      reason: `${nearSunrise ? "Sunrise" : "Sunset"} plus calm wind (${Math.round(wind)} mph) — fish push shallow to feed on top.`,
-      keywords: ["topwater", "popper", "walking bait", "buzzbait", "frog"],
-    });
-  }
-
-  if (trend === "falling") {
-    recs.push({
-      title: "Reaction baits before the front",
-      reason: "Falling pressure usually fires fish up before a system moves in — moving baits get eaten.",
-      keywords: ["spinnerbait", "chatterbait", "crankbait", "swim jig", "lipless"],
-    });
-  } else if (trend === "rising") {
-    recs.push({
-      title: "Slow down and downsize",
-      reason: "Rising pressure after a front puts fish in a tight, finicky mood — go smaller and slower.",
-      keywords: ["ned rig", "drop shot", "finesse", "jig", "soft plastic", "worm"],
-    });
-  }
-
-  if (cloud > 60 || skyLabel === "Rain" || skyLabel === "Thunderstorms") {
-    recs.push({
-      title: "Overcast: let them roam",
-      reason: "Low light lets fish move off cover to chase — moving baits and darker colors shine.",
-      keywords: ["spinnerbait", "chatterbait", "swim jig", "crankbait"],
-    });
-  } else if (cloud < 25) {
-    recs.push({
-      title: "Bright and clear: go natural",
-      reason: "Bluebird skies push fish tight to cover or deeper — natural colors and subtler baits work better.",
-      keywords: ["finesse", "shad", "natural", "soft plastic", "drop shot"],
-    });
-  }
-
-  if (wind > 15) {
-    recs.push({
-      title: "Wind-driven feed",
-      reason: `${Math.round(wind)} mph wind stirs up baitfish — search baits cover water fast.`,
-      keywords: ["crankbait", "spinnerbait", "swimbait"],
-    });
-  }
-
-  if (typeof temp === "number" && temp < 50) {
-    recs.push({
-      title: "Cold water, slow it down",
-      reason: "Below 50°F fish metabolism slows way down — a slow, subtle presentation gets more bites.",
-      keywords: ["jig", "soft plastic", "ned rig", "finesse"],
-    });
-  } else if (typeof temp === "number" && temp > 82) {
-    recs.push({
-      title: "Beat the heat",
-      reason: "In the heat, target shade and deeper structure through midday — save reaction baits for the edges of the day.",
-      keywords: ["deep diving", "jig", "texas rig", "carolina rig"],
-    });
-  }
-
-  if (tide && tide.predictions && tide.predictions.length >= 1) {
-    const sorted = tide.predictions
-      .map((p) => ({ ...p, time: new Date(p.t.replace(" ", "T")) }))
-      .sort((a, b) => a.time - b.time);
-    const next = sorted.find((p) => p.time > now);
-    if (next) {
-      const rising = next.type === "H";
-      recs.push({
-        title: rising ? "Incoming tide" : "Outgoing tide",
-        reason: rising
-          ? "Rising water pulls baitfish onto flats and structure — game fish follow them in."
-          : "Falling water pulls bait off structure into channels — target the edges and drop-offs.",
-        keywords: ["swimbait", "jig", "soft plastic", "topwater"],
-      });
-    }
-  }
-
-  // de-dupe by title, keep first 4
-  const seen = new Set();
-  return recs.filter((r) => (seen.has(r.title) ? false : (seen.add(r.title), true))).slice(0, 4);
-}
 
 function clusterCatchesByLocation(catches) {
   const tagged = catches.filter((c) => c.gps && typeof c.gps.lat === "number");
@@ -817,6 +673,1412 @@ function SafetyNotifyCard() {
   );
 }
 
+// <<PRO-DATA-START>>
+/* ======================================================================
+   Epic Fishy 2.2 — live, worldwide data layer + bite model
+   Sources (all free, no API key, browser-callable):
+     • Open-Meteo forecast / marine / archive  — weather, sea state, tides (global)
+     • iNaturalist species_counts              — fish actually recorded near you
+     • BigDataCloud reverse-geocode (client)   — country / region for rules links
+   Moon + solunar windows are computed on-device from astronomy (no API).
+   ====================================================================== */
+
+const PRO_PREFIX = "efpro:";
+const PRO_RAD = Math.PI / 180;
+
+function proCacheGet(key, maxAgeMs) {
+  try {
+    const raw = localStorage.getItem(PRO_PREFIX + key);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj.t !== "number") return null;
+    if (Date.now() - obj.t > maxAgeMs) return null;
+    return obj;
+  } catch (e) { return null; }
+}
+function proCacheSet(key, v) {
+  try { localStorage.setItem(PRO_PREFIX + key, JSON.stringify({ t: Date.now(), v })); } catch (e) { /* storage full or blocked */ }
+}
+async function proFetchJson(url, timeoutMs = 12000) {
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+  try {
+    const res = await fetch(url, ctrl ? { signal: ctrl.signal } : undefined);
+    if (!res.ok) throw new Error("http " + res.status);
+    return await res.json();
+  } finally { if (timer) clearTimeout(timer); }
+}
+// Fresh cache → network → stale cache (so the app still shows the last forecast offline).
+async function proCached(key, maxAgeMs, loader) {
+  const fresh = proCacheGet(key, maxAgeMs);
+  if (fresh) return { data: fresh.v, stale: false, at: fresh.t };
+  try {
+    const data = await loader();
+    proCacheSet(key, data);
+    return { data, stale: false, at: Date.now() };
+  } catch (e) {
+    const old = proCacheGet(key, Infinity);
+    if (old) return { data: old.v, stale: true, at: old.t };
+    throw e;
+  }
+}
+
+// "2026-11-08T14:00" in the SPOT's local time → real UTC milliseconds.
+function proLocalToMs(iso, offSec) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso || "");
+  if (!m) return NaN;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) - (offSec || 0) * 1000;
+}
+function proFmtTime(ms, tz, opts) {
+  if (!Number.isFinite(ms)) return "--";
+  const o = Object.assign({ hour: "numeric", minute: "2-digit" }, opts || {});
+  try { return new Date(ms).toLocaleTimeString([], Object.assign({}, o, tz ? { timeZone: tz } : {})); }
+  catch (e) { return new Date(ms).toLocaleTimeString([], o); }
+}
+function proFmtDay(ms, tz, opts) {
+  const o = Object.assign({ weekday: "short", month: "short", day: "numeric" }, opts || {});
+  try { return new Date(ms).toLocaleDateString([], Object.assign({}, o, tz ? { timeZone: tz } : {})); }
+  catch (e) { return new Date(ms).toLocaleDateString([], o); }
+}
+function proYmdIn(ms, tz) {
+  try { return new Date(ms).toLocaleDateString("en-CA", tz ? { timeZone: tz } : undefined); } catch (e) { return new Date(ms).toISOString().slice(0, 10); }
+}
+const proRound1 = (n) => Math.round(n * 10) / 10;
+
+/* ---------------- live loaders ---------------- */
+
+function proLoadForecast(lat, lon) {
+  return proCached(`fc:${lat.toFixed(2)},${lon.toFixed(2)}`, 20 * 60000, () => proFetchJson(
+    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+    `&hourly=temperature_2m,pressure_msl,cloud_cover,wind_speed_10m,wind_gusts_10m,precipitation_probability,precipitation,weather_code` +
+    `&daily=sunrise,sunset&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&timezone=auto&past_days=5&forecast_days=4`
+  ));
+}
+function proLoadMarine(lat, lon) {
+  return proCached(`mr:${lat.toFixed(2)},${lon.toFixed(2)}`, 60 * 60000, () => proFetchJson(
+    `https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}` +
+    `&hourly=sea_surface_temperature,wave_height,sea_level_height_msl&temperature_unit=fahrenheit&length_unit=imperial&timezone=auto&past_days=1&forecast_days=4`
+  ));
+}
+function proLoadNearbySpecies(lat, lon) {
+  const la = proRound1(lat), lo = proRound1(lon); // ~11 km rounding keeps the exact spot private
+  const lang = ((typeof navigator !== "undefined" && navigator.language) || "en").split("-")[0];
+  return proCached(`sp:${la},${lo},${lang}`, 7 * 86400000, async () => {
+    const raw = await proFetchJson(
+      `https://api.inaturalist.org/v1/observations/species_counts?taxon_id=47178&lat=${la}&lng=${lo}&radius=60` +
+      `&quality_grade=research&captive=false&per_page=60&locale=${encodeURIComponent(lang)}`
+    );
+    return (raw.results || [])
+      .filter((r) => r && r.taxon && r.taxon.rank === "species")
+      .map((r) => ({
+        id: r.taxon.id,
+        sci: r.taxon.name,
+        name: r.taxon.preferred_common_name || r.taxon.name,
+        count: r.count,
+        photo: r.taxon.default_photo ? r.taxon.default_photo.square_url : null,
+        photoMed: r.taxon.default_photo ? (r.taxon.default_photo.medium_url || r.taxon.default_photo.square_url) : null,
+        credit: r.taxon.default_photo ? r.taxon.default_photo.attribution : "",
+      }));
+  });
+}
+function proLoadPlace(lat, lon) {
+  return proCached(`cc:${lat.toFixed(1)},${lon.toFixed(1)}`, 90 * 86400000, async () => {
+    const raw = await proFetchJson(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat.toFixed(2)}&longitude=${lon.toFixed(2)}&localityLanguage=en`);
+    return { countryCode: raw.countryCode || "", country: (raw.countryName || "").replace(/\s*\(the\)$/i, "").replace(/^United States of America$/i, "United States"), region: raw.principalSubdivision || "", city: raw.city || raw.locality || "" };
+  });
+}
+
+// Normalise an Open-Meteo forecast / archive payload into hour rows with real UTC times.
+function proNormalizeForecast(raw) {
+  const off = raw.utc_offset_seconds || 0;
+  const h = raw.hourly || { time: [] };
+  const at = (arr, i) => (arr && typeof arr[i] === "number" ? arr[i] : null);
+  const hours = h.time.map((iso, i) => ({
+    t: proLocalToMs(iso, off),
+    temp: at(h.temperature_2m, i),
+    pressure: at(h.pressure_msl, i),
+    cloud: at(h.cloud_cover, i),
+    wind: at(h.wind_speed_10m, i),
+    gust: at(h.wind_gusts_10m, i),
+    pop: at(h.precipitation_probability, i),
+    precip: at(h.precipitation, i),
+    code: at(h.weather_code, i),
+  })).filter((r) => Number.isFinite(r.t));
+  const d = raw.daily || { time: [], sunrise: [], sunset: [] };
+  const days = (d.time || []).map((date, i) => ({
+    date,
+    start: proLocalToMs(date + "T00:00", off),
+    sunrise: proLocalToMs(d.sunrise ? d.sunrise[i] : "", off),
+    sunset: proLocalToMs(d.sunset ? d.sunset[i] : "", off),
+  }));
+  return { hours, days, tz: raw.timezone || null, off, lat: raw.latitude, lon: raw.longitude };
+}
+
+// Rolling air-temperature average → a rough surface-water temperature for lakes/ponds/rivers
+// (used only when the ocean model has no value). Always labelled "estimated" in the UI.
+function proEstimateWaterF(fc, uptoMs) {
+  const limit = typeof uptoMs === "number" ? uptoMs : Date.now();
+  let ema = null;
+  const k = 1 / 72;
+  for (const h of fc.hours) {
+    if (h.t > limit) break;
+    if (typeof h.temp !== "number") continue;
+    ema = ema === null ? h.temp : ema + k * (h.temp - ema);
+  }
+  if (ema === null) return null;
+  return Math.max(34, Math.min(92, ema));
+}
+function proMarineSstNow(marine) {
+  try {
+    const off = marine.utc_offset_seconds || 0;
+    const h = marine.hourly;
+    const now = Date.now();
+    let best = null, bestD = Infinity;
+    h.time.forEach((iso, i) => {
+      const v = h.sea_surface_temperature[i];
+      if (typeof v !== "number") return;
+      const d = Math.abs(proLocalToMs(iso, off) - now);
+      if (d < bestD) { bestD = d; best = v; }
+    });
+    return bestD < 6 * 3600000 ? best : null;
+  } catch (e) { return null; }
+}
+
+// Tide highs/lows from the global ocean model (sea_level_height_msl, hourly, parabola-refined).
+// Coarse model: good for planning (±30–60 min), not for navigation. Returns null where there is no real tide.
+function proTideExtrema(marine) {
+  try {
+    const h = marine.hourly;
+    const lv = h.sea_level_height_msl;
+    if (!lv || !lv.some((v) => typeof v === "number")) return null;
+    const off = marine.utc_offset_seconds || 0;
+    const ts = h.time.map((iso) => proLocalToMs(iso, off));
+    const raw = [];
+    for (let i = 1; i < lv.length - 1; i++) {
+      const a = lv[i - 1], b = lv[i], c = lv[i + 1];
+      if ([a, b, c].some((v) => typeof v !== "number")) continue;
+      const isMax = b > a && b >= c;
+      const isMin = b < a && b <= c;
+      if (!isMax && !isMin) continue;
+      const denom = a - 2 * b + c;
+      const shift = denom !== 0 ? (0.5 * (a - c)) / denom : 0;
+      raw.push({ t: ts[i] + Math.max(-1, Math.min(1, shift)) * 3600000, v: b - 0.25 * (a - c) * shift, type: isMax ? "H" : "L" });
+    }
+    if (raw.length < 2) return null;
+    const vals = raw.map((e) => e.v);
+    if (Math.max(...vals) - Math.min(...vals) < 0.8) return null; // < ~0.25 m swing: effectively non-tidal
+    return raw;
+  } catch (e) { return null; }
+}
+// Adapt model extrema to the shape the tide card already renders.
+function proModelTide(marine, tz) {
+  const ext = proTideExtrema(marine);
+  if (!ext) return null;
+  const now = Date.now();
+  const list = ext.filter((e) => e.t > now - 3 * 3600000 && e.t < now + 40 * 3600000);
+  if (!list.length) return null;
+  return {
+    model: true, tz, distance: 0,
+    station: { name: "Global ocean model" },
+    predictions: list.map((e) => ({ t: new Date(e.t).toISOString().slice(0, 16).replace("T", " "), ms: e.t, v: String(e.v.toFixed(2)), type: e.type })),
+  };
+}
+
+/* ---------------- astronomy: moon position, phase, solunar windows ---------------- */
+
+function proJulian(ms) { return ms / 86400000 + 2440587.5; }
+function proSin(d) { return Math.sin(d * PRO_RAD); }
+
+// Low-precision lunar position (Meeus ch. 47, main terms): good to a few minutes for transit/rise times.
+function proMoonEq(jd) {
+  const T = (jd - 2451545.0) / 36525;
+  const Lp = 218.3164477 + 481267.88123421 * T;
+  const D = 297.8501921 + 445267.1114034 * T;
+  const M = 357.5291092 + 35999.0502909 * T;
+  const Mp = 134.9633964 + 477198.8675055 * T;
+  const F = 93.2720950 + 483202.0175233 * T;
+  const lon = Lp
+    + 6.288774 * proSin(Mp) + 1.274027 * proSin(2 * D - Mp) + 0.658314 * proSin(2 * D) + 0.213618 * proSin(2 * Mp)
+    - 0.185116 * proSin(M) - 0.114332 * proSin(2 * F) + 0.058793 * proSin(2 * D - 2 * Mp) + 0.057066 * proSin(2 * D - M - Mp)
+    + 0.053322 * proSin(2 * D + Mp) + 0.045758 * proSin(2 * D - M) - 0.040923 * proSin(M - Mp) - 0.034720 * proSin(D)
+    - 0.030383 * proSin(M + Mp) + 0.015327 * proSin(2 * D - 2 * F) - 0.012528 * proSin(Mp + 2 * F) + 0.010980 * proSin(Mp - 2 * F);
+  const lat = 5.128122 * proSin(F) + 0.280602 * proSin(Mp + F) + 0.277693 * proSin(Mp - F) + 0.173237 * proSin(2 * D - F)
+    + 0.055413 * proSin(2 * D - Mp + F) + 0.046271 * proSin(2 * D - Mp - F) + 0.032573 * proSin(2 * D + F) + 0.017198 * proSin(2 * Mp + F);
+  const eps = (23.439291 - 0.0130042 * T) * PRO_RAD;
+  const l = lon * PRO_RAD, b = lat * PRO_RAD;
+  const ra = Math.atan2(Math.sin(l) * Math.cos(eps) - Math.tan(b) * Math.sin(eps), Math.cos(l)) / PRO_RAD;
+  const dec = Math.asin(Math.sin(b) * Math.cos(eps) + Math.cos(b) * Math.sin(eps) * Math.sin(l)) / PRO_RAD;
+  const sunLon = 280.46646 + 36000.76983 * T + 1.914602 * proSin(M) + 0.019993 * proSin(2 * M);
+  return { ra: ((ra % 360) + 360) % 360, dec, lon: ((lon % 360) + 360) % 360, sunLon: ((sunLon % 360) + 360) % 360 };
+}
+
+function proMoonPhase(ms) {
+  const e = proMoonEq(proJulian(ms));
+  const el = (((e.lon - e.sunLon) % 360) + 360) % 360; // elongation, 0 = new, 180 = full
+  const illum = Math.round((1 - Math.cos(el * PRO_RAD)) * 50);
+  let name, emoji;
+  if (el < 11.25 || el >= 348.75) { name = "New Moon"; emoji = "🌑"; }
+  else if (el < 78.75) { name = "Waxing Crescent"; emoji = "🌒"; }
+  else if (el < 101.25) { name = "First Quarter"; emoji = "🌓"; }
+  else if (el < 168.75) { name = "Waxing Gibbous"; emoji = "🌔"; }
+  else if (el < 191.25) { name = "Full Moon"; emoji = "🌕"; }
+  else if (el < 258.75) { name = "Waning Gibbous"; emoji = "🌖"; }
+  else if (el < 281.25) { name = "Last Quarter"; emoji = "🌗"; }
+  else { name = "Waning Crescent"; emoji = "🌘"; }
+  return { name, emoji, illum, elongation: el };
+}
+
+// Real moon transits (overhead / underfoot) and rise/set for a window of time at a place.
+function proMoonEvents(startMs, hours, lat, lon) {
+  const step = 10 * 60000;
+  const out = { upper: [], lower: [], rise: [], set: [] };
+  const lerp = (t0, t1, v0, v1, target) => (v1 === v0 ? t0 : t0 + ((t1 - t0) * (target - v0)) / (v1 - v0));
+  let prev = null;
+  const endMs = startMs + hours * 3600000;
+  for (let t = startMs; t <= endMs + step; t += step) {
+    const jd = proJulian(t);
+    const e = proMoonEq(jd);
+    const gmst = 280.46061837 + 360.98564736629 * (jd - 2451545.0);
+    const H = ((((gmst + lon - e.ra) % 360) + 540) % 360) - 180; // hour angle in [-180, 180)
+    const sinAlt = Math.sin(lat * PRO_RAD) * Math.sin(e.dec * PRO_RAD) + Math.cos(lat * PRO_RAD) * Math.cos(e.dec * PRO_RAD) * Math.cos(H * PRO_RAD);
+    const alt = Math.asin(Math.max(-1, Math.min(1, sinAlt))) / PRO_RAD;
+    if (prev) {
+      if (prev.H < 0 && H >= 0 && H - prev.H < 90) out.upper.push(lerp(prev.t, t, prev.H, H, 0));
+      if (prev.H > 90 && H < -90) out.lower.push(lerp(prev.t, t, prev.H, H + 360, 180));
+      if (prev.alt < 0.125 && alt >= 0.125) out.rise.push(lerp(prev.t, t, prev.alt, alt, 0.125));
+      if (prev.alt >= 0.125 && alt < 0.125) out.set.push(lerp(prev.t, t, prev.alt, alt, 0.125));
+    }
+    prev = { t, H, alt };
+  }
+  return out;
+}
+
+// Standard solunar convention: majors = moon overhead / underfoot (±1 h), minors = moonrise / moonset (±30 min).
+function proSolunar(dayStartMs, lat, lon) {
+  const ev = proMoonEvents(dayStartMs - 6 * 3600000, 36, lat, lon);
+  const H = 3600000;
+  const majors = [
+    ...ev.upper.map((t) => ({ start: t - H, end: t + H, at: t, kind: "overhead" })),
+    ...ev.lower.map((t) => ({ start: t - H, end: t + H, at: t, kind: "underfoot" })),
+  ].sort((a, b) => a.at - b.at);
+  const minors = [
+    ...ev.rise.map((t) => ({ start: t - H / 2, end: t + H / 2, at: t, kind: "moonrise" })),
+    ...ev.set.map((t) => ({ start: t - H / 2, end: t + H / 2, at: t, kind: "moonset" })),
+  ].sort((a, b) => a.at - b.at);
+  return { phase: proMoonPhase(dayStartMs + 12 * H), majors, minors };
+}
+
+/* ---------------- species profiles (worldwide) ---------------- */
+// c = water-temperature comfort in °C: below `min` / above `max` fish are shut down;
+// `lo`–`hi` is the sweet spot. bands = what tends to work as water warms (first band whose maxC fits).
+const proB = (maxC, title, why, lures, keywords) => ({ maxC, title, why, lures, keywords });
+
+const PRO_PROFILES = [
+  { id: "striped", label: "Striped / hybrid bass", match: /striped|hybrid bass|white bass|wiper/i, c: { min: 5, lo: 14, hi: 21, max: 27 }, salt: true, surface: true, bands: [
+    proB(10, "Slow-rolled swimbaits", "Cold water: stripers sit deep and feed slowly on shad.", ["Swimbait on a heavy jig head", "Bucktail jig", "Live eel"], ["swimbait", "bucktail", "jig"]),
+    proB(18, "Match the bait schools", "Prime temperatures: follow bait and birds, cover water.", ["Topwater at first light", "Swimbait", "Bucktail", "Live herring/shad"], ["topwater", "popper", "swimbait", "bucktail", "spoon"]),
+    proB(99, "Deep and early/late", "Warm water pushes stripers deep — fish dawn, dusk and night.", ["Live bait on a downline", "Large swimbait", "Jigging spoon"], ["spoon", "swimbait", "jig"]),
+  ] },
+  { id: "euro-seabass", label: "European sea bass", match: /sea ?bass|seabass|lubina|loup/i, c: { min: 6, lo: 12, hi: 20, max: 26 }, salt: true, surface: true, bands: [
+    proB(11, "Slow soft plastics", "Cold sea: small, slow-sunk soft plastics near structure.", ["Soft-plastic sandeel", "Small shad paddle-tail", "Ragworm"], ["soft plastic", "paddle", "shad", "jig"]),
+    proB(99, "Shallow-water lures at dusk", "Bass push into surf and rocks to ambush bait on the tide.", ["Surface walker at dusk", "Minnow plug", "Soft-plastic sandeel"], ["topwater", "walking", "minnow", "soft plastic", "plug"]),
+  ] },
+  { id: "smallmouth", label: "Smallmouth bass", match: /smallmouth|small-mouth|bronzeback/i, c: { min: 6, lo: 15, hi: 24, max: 30 }, surface: true, bands: [
+    proB(10, "Finesse and slow", "Cold water: tubes and hair jigs crawled on rock.", ["Tube jig", "Hair jig", "Drop shot", "Suspending jerkbait"], ["tube", "jig", "drop shot", "jerkbait", "finesse"]),
+    proB(18, "Rock-and-gravel search", "Cool water: smallies roam shallow rock and eat crawfish.", ["Jerkbait", "Crankbait", "Ned rig", "Spinnerbait"], ["jerkbait", "crankbait", "ned rig", "spinnerbait"]),
+    proB(99, "Active and aggressive", "Warm: topwater and moving baits around current and boulders.", ["Walking topwater", "Soft-plastic jerkbait", "Drop shot", "Swimbait"], ["topwater", "popper", "walking", "drop shot", "swimbait"]),
+  ] },
+  { id: "bass", label: "Largemouth / black bass", match: /largemouth|spotted bass|kentucky|black bass|^bass$|\bbass\b/i, c: { min: 6, lo: 18, hi: 28, max: 34 }, surface: true, bands: [
+    proB(10, "Slow and low", "Cold water: bass are sluggish and hold tight to deep cover.", ["Jig & pig", "Suspending jerkbait", "Blade bait", "Hair jig"], ["jig", "jerkbait", "blade", "finesse", "ned rig"]),
+    proB(16, "Cool-water search baits", "Cool water: bass roam transitions — cover water at moderate speed.", ["Squarebill crankbait", "Lipless crankbait", "Spinnerbait", "Jerkbait"], ["crankbait", "lipless", "spinnerbait", "jerkbait"]),
+    proB(25, "Prime feeding temperatures", "Comfortable range: aggressive, shallow, around cover.", ["Chatterbait", "Texas-rig worm", "Swim jig", "Topwater at dawn/dusk", "Frog over grass"], ["chatterbait", "worm", "texas", "swim jig", "topwater", "popper", "frog", "buzzbait"]),
+    proB(99, "Hot water: go deep or go dark", "Hot water: bass slide deep midday and feed at night and on edges.", ["Deep crankbait", "Carolina rig", "Drop shot", "Big worm at night"], ["deep", "carolina", "drop shot", "worm", "jig"]),
+  ] },
+  { id: "walleye", label: "Walleye / zander", match: /walleye|zander|pikeperch|sauger/i, c: { min: 4, lo: 12, hi: 21, max: 27 }, bands: [
+    proB(9, "Jig and minnow", "Cold: slow vertical presentations near the bottom.", ["Jig tipped with minnow", "Jigging rap", "Blade bait"], ["jig", "minnow", "blade", "jigging"]),
+    proB(18, "Crawler harness & cranks", "Prime: troll or drift edges and humps at dawn and dusk.", ["Crawler harness", "Crankbait (trolled)", "Jig & minnow", "Lipless at night"], ["harness", "crankbait", "jig", "lipless", "minnow"]),
+    proB(99, "Deeper, lower light", "Warm: fish deep structure and go after dark.", ["Deep diving crankbait", "Crawler harness", "Jig & leech"], ["deep", "crankbait", "harness", "jig"]),
+  ] },
+  { id: "pike", label: "Northern pike", match: /pike|pickerel/i, c: { min: 3, lo: 12, hi: 20, max: 26 }, surface: true, bands: [
+    proB(8, "Big, slow baits", "Cold: large, slow presentations along weed edges.", ["Large suspending jerkbait", "Dead-bait rig", "Large swimbait"], ["jerkbait", "swimbait", "spoon"]),
+    proB(18, "Spinners and spoons", "Prime: cover weed lines fast and watch for the follow.", ["Spinnerbait", "Weedless spoon", "Inline spinner", "Jerkbait"], ["spinnerbait", "spoon", "spinner", "jerkbait"]),
+    proB(99, "Deep weed edges", "Warm: fish the deeper edge and cooler inflows.", ["Bucktail", "Swimbait", "Deep-diving crankbait"], ["bucktail", "swimbait", "crankbait"]),
+  ] },
+  { id: "musky", label: "Muskie / muskellunge", match: /musk/i, c: { min: 5, lo: 15, hi: 22, max: 27 }, surface: true, bands: [
+    proB(12, "Slow figure-eights", "Cool water: slow big baits, always finish with a figure-eight.", ["Large jerkbait", "Bucktail", "Large swimbait"], ["jerkbait", "bucktail", "swimbait"]),
+    proB(99, "Bucktails and topwater", "Warm: surface baits at low light, bucktails mid-day.", ["Bucktail", "Topwater prop bait", "Large soft-plastic"], ["bucktail", "topwater", "swimbait"]),
+  ] },
+  { id: "seatrout", label: "Speckled / spotted seatrout", match: /seatrout|sea trout|speckled|spotted trout|weakfish/i, c: { min: 10, lo: 18, hi: 27, max: 33 }, salt: true, surface: true, bands: [
+    proB(15, "Slow suspending baits", "Cool: slow, suspending twitchbaits and plastics in deeper holes.", ["Suspending twitchbait", "Soft plastic on light jig head"], ["twitchbait", "jerkbait", "soft plastic", "jig"]),
+    proB(99, "Popping cork and topwater", "Warm: grass flats at dawn — popping cork with shrimp or a walker.", ["Popping cork + shrimp", "Topwater walker", "Soft-plastic shrimp"], ["cork", "shrimp", "topwater", "popper", "soft plastic"]),
+  ] },
+  { id: "snapper", label: "Snapper / grouper", match: /snapper|grouper|\bcod\b|rockfish|sea ?bream|black bream|emperor|trevally|porgy/i, c: { min: 12, lo: 20, hi: 28, max: 33 }, salt: true, bands: [
+    proB(99, "Bottom fishing", "Structure fish — live/cut bait or jigs on wrecks and reefs.", ["Live bait / cut bait", "Butterfly or slow-pitch jig", "Soft-plastic on jig head"], ["jig", "live", "cut bait", "soft plastic"]),
+  ] },
+  { id: "crappie", label: "Crappie", match: /crappie|papermouth|calico/i, c: { min: 5, lo: 14, hi: 24, max: 30 }, bands: [
+    proB(12, "Deep brush, tiny jigs", "Cold: crappie stack on deep brush and bridge pilings.", ["1/32–1/16 oz jig", "Live minnow under float"], ["jig", "minnow", "crappie", "tube"]),
+    proB(99, "Spawn-time shallows", "Warmer: they move shallow to cover — go light.", ["Tube jig", "Marabou jig", "Minnow under a bobber"], ["tube", "jig", "marabou", "bobber"]),
+  ] },
+  { id: "bluegill", label: "Bluegill / sunfish", match: /bluegill|sunfish|pumpkinseed|redear|shellcracker/i, c: { min: 6, lo: 18, hi: 28, max: 33 }, bands: [
+    proB(99, "Small and simple", "Easy fish: tiny baits near cover and shade.", ["Worm under a bobber", "Small inline spinner", "1/64 oz jig", "Fly (popper/nymph)"], ["worm", "spinner", "jig", "bobber", "fly"]),
+  ] },
+  { id: "catfish", label: "Catfish (channel/blue/flathead)", match: /catfish|bullhead|cat$|channel cat|blue cat|flathead|wels/i, c: { min: 8, lo: 21, hi: 30, max: 35 }, bands: [
+    proB(15, "Slow bait in deep holes", "Cool: fish deep holes with cut bait.", ["Cut shad/herring", "Nightcrawlers"], ["cut bait", "worm", "bait"]),
+    proB(99, "Dusk-to-dawn bait", "Warm: they feed at night — use smelly bait on bottom rigs.", ["Cut bait", "Chicken liver", "Stink bait", "Live bluegill (flatheads)"], ["cut bait", "liver", "stink", "live"]),
+  ] },
+  { id: "carp", label: "Carp / coarse fish", match: /carp|tench|roach|rudd|chub|barbel|bream\b/i, c: { min: 6, lo: 16, hi: 26, max: 32 }, bands: [
+    proB(12, "Light feeding, small baits", "Cold: carp feed little — tiny, quality baits.", ["Single hookbait", "Corn", "Bread punch"], ["corn", "bread", "boilie", "bait"]),
+    proB(99, "Method feeder & boilies", "Warm: baited spots with boilies or corn over a feeder.", ["Boilies", "Sweetcorn", "Method feeder", "Surface bread"], ["boilie", "corn", "feeder", "bread", "bait"]),
+  ] },
+  { id: "trout", label: "Trout (rainbow/brown/brook)", match: /trout|brookie|char\b|grayling/i, c: { min: 2, lo: 9, hi: 16, max: 21 }, bands: [
+    proB(6, "Slow nymphs, small spoons", "Very cold: slow deep presentations.", ["Nymph under indicator", "Small spoon", "PowerBait"], ["nymph", "spoon", "powerbait", "fly", "spinner"]),
+    proB(15, "Spinners and flies", "Prime trout water: matched hatch flies or small spinners.", ["Inline spinner", "Dry fly / nymph", "Small crankbait"], ["spinner", "fly", "crankbait", "spoon"]),
+    proB(99, "Early, cold, shaded", "Warm for trout — fish early at cold inflows, release quickly.", ["Streamer", "Spoon", "Spinner"], ["streamer", "spoon", "spinner"]),
+  ] },
+  { id: "salmon", label: "Salmon", match: /salmon|steelhead|kokanee/i, c: { min: 3, lo: 8, hi: 15, max: 20 }, bands: [
+    proB(99, "Spoons, spinners and roe", "Run fish respond to flash, scent and drift presentations.", ["Spoon", "Spinner", "Cured roe", "Egg-pattern fly"], ["spoon", "spinner", "roe", "fly"]),
+  ] },
+  { id: "redfish", label: "Redfish / red drum", match: /redfish|red drum|puppy drum|channel bass|\bdrum\b/i, c: { min: 10, lo: 20, hi: 28, max: 33 }, salt: true, surface: true, bands: [
+    proB(16, "Slow plastics in deep holes", "Cool water: reds stack in deeper creeks and holes.", ["Soft plastic on 1/4 oz jig head", "Gold spoon", "Cut mullet"], ["soft plastic", "jig", "spoon", "paddle"]),
+    proB(99, "Spoons, plastics and cut bait", "Warm: tailing on flats — gold spoons and weedless plastics.", ["Gold weedless spoon", "Paddle-tail soft plastic", "Live shrimp", "Cut mullet", "Topwater at dawn"], ["spoon", "soft plastic", "paddle", "shrimp", "topwater", "cut bait"]),
+  ] },
+  { id: "snook", label: "Snook / barramundi", match: /snook|barramundi|barra\b|robalo/i, c: { min: 16, lo: 24, hi: 31, max: 35 }, salt: true, surface: true, bands: [
+    proB(22, "Cold snap = slow", "Fish slow near warm-water refuges and deep holes.", ["Soft-plastic jerkbait", "Live shrimp"], ["soft plastic", "jerkbait", "shrimp", "live"]),
+    proB(99, "Live bait & swimbaits on moving water", "Warm: ambush spots at tide changes — live bait, swimbaits, twitchbaits.", ["Live pilchard/mullet", "Paddle-tail swimbait", "Twitchbait", "Topwater at dawn"], ["swimbait", "paddle", "twitchbait", "jerkbait", "topwater", "live"]),
+  ] },
+  { id: "tarpon", label: "Tarpon", match: /tarpon/i, c: { min: 20, lo: 25, hi: 31, max: 35 }, salt: true, bands: [
+    proB(99, "Live crab, mullet and big flies", "Rolling fish on moving tide — put bait or a fly in front of them.", ["Live crab / mullet", "Large swimbait", "Tarpon fly"], ["live", "swimbait", "fly", "crab"]),
+  ] },
+  { id: "flatfish", label: "Flounder / halibut", match: /flounder|halibut|fluke|sole|plaice|turbot/i, c: { min: 6, lo: 14, hi: 24, max: 30 }, salt: true, bands: [
+    proB(99, "Drag it on the bottom", "Ambush feeders — slow bounce along edges on a moving tide.", ["Jig + Gulp/soft plastic", "Live mud minnow", "Bucktail with strip bait"], ["jig", "soft plastic", "gulp", "bucktail", "minnow", "live"]),
+  ] },
+  { id: "mahi", label: "Mahi-mahi / pelagics", match: /mahi|dorado|dolphinfish|wahoo|tuna|kingfish|king mackerel|yellowtail|amberjack/i, c: { min: 17, lo: 22, hi: 29, max: 33 }, salt: true, bands: [
+    proB(99, "Troll and chunk", "Open-water fish: troll flash and chunk near weedlines and structure.", ["Trolled ballyhoo / skirted lure", "Live bait", "Popper", "Jigging iron"], ["troll", "skirt", "popper", "jig", "live", "spoon"]),
+  ] },
+  { id: "bonefish", label: "Bonefish / permit", match: /bonefish|permit|ghost/i, c: { min: 20, lo: 24, hi: 30, max: 34 }, salt: true, bands: [
+    proB(99, "Light, quiet and accurate", "Flats sight-fishing — shrimp/crab flies or small jigs.", ["Shrimp fly", "Soft-crab fly", "1/8 oz bucktail jig"], ["fly", "jig", "shrimp", "crab", "bucktail"]),
+  ] },
+  { id: "perch", label: "Perch (yellow / European)", match: /perch(?!.*sea)|ruffe/i, c: { min: 3, lo: 14, hi: 23, max: 29 }, bands: [
+    proB(99, "Small and bright", "Schooling fish: small spinners, jigs and worms near weeds and drops.", ["Small inline spinner", "Micro jig", "Worm / minnow", "Drop shot"], ["spinner", "jig", "worm", "minnow", "drop shot"]),
+  ] },
+];
+
+const PRO_GENERIC = { id: "generic", label: "Any fish (general)", match: /^$/, c: { min: 4, lo: 15, hi: 26, max: 34 }, surface: true, bands: [
+  proB(10, "Slow it down", "Cold water: slow presentations close to the bottom.", ["Jig", "Small soft plastic", "Live bait under a float"], ["jig", "soft plastic", "bait", "worm"]),
+  proB(20, "Search with moving baits", "Comfortable water: cover ground with spinners and crankbaits.", ["Inline spinner", "Crankbait", "Spoon", "Soft plastic"], ["spinner", "crankbait", "spoon", "soft plastic"]),
+  proB(99, "Early, late or deep", "Warm: fish low light and deeper or shaded water.", ["Topwater at dawn/dusk", "Deep crankbait", "Live bait"], ["topwater", "popper", "crankbait", "live", "bait"]),
+] };
+
+function proSpeciesProfile(name) {
+  const n = (name || "").trim();
+  if (!n) return PRO_GENERIC;
+  const byId = PRO_PROFILES.find((p) => p.id === n);
+  if (byId) return byId;
+  return PRO_PROFILES.find((p) => p.match.test(n)) || PRO_GENERIC;
+}
+
+/* ---------------- bite model ---------------- */
+// A transparent heuristic, not a promise: every factor is 0–1 and shown to the angler.
+// Local names differ from the scientific/common names (redfish = red drum): normalise before comparing.
+const PRO_ALIASES = { "red drum": "redfish", "spotted seatrout": "speckled trout", "speckled seatrout": "speckled trout", "black crappie": "crappie", "white crappie": "crappie", "common snook": "snook", "atlantic tarpon": "tarpon", "channel catfish": "catfish", "blue catfish": "catfish", "flathead catfish": "catfish", "common carp": "carp", "rainbow trout": "rainbow trout", "northern pike": "northern pike" };
+function proNorm(n) {
+  const k = String(n || "").trim().toLowerCase();
+  return PRO_ALIASES[k] || k;
+}
+function proClamp01(x) { return Math.max(0, Math.min(1, x)); }
+
+function proScoreHour(ctx) {
+  const f = [];
+  const add = (key, label, weight, val, note) => f.push({ key, label, weight, val: proClamp01(val), note });
+  const { t, sunrise, sunset, solunar, pressureDelta, hour, waterF, profile, tide } = ctx;
+
+  // 1 — light (dawn / dusk)
+  const nearSun = Math.min(Math.abs(t - sunrise), Math.abs(t - sunset)) / 60000;
+  const isDay = t > sunrise && t < sunset;
+  let light = isDay ? 0.3 : 0.25, lightNote = isDay ? "Midday sun" : "Night";
+  if (nearSun <= 45) { light = 1; lightNote = "Dawn/dusk low light"; }
+  else if (nearSun <= 90) { light = 0.8; lightNote = "Near sunrise/sunset"; }
+  else if (nearSun <= 150) { light = 0.6; lightNote = "Edge of low light"; }
+  add("light", "Light", 22, light, lightNote);
+
+  // 2 — solunar (moon overhead/underfoot & rise/set) tempered by moon phase
+  let sol = 0.15, solNote = "Outside moon windows";
+  const inWin = (w, pad) => t >= w.start - pad && t <= w.end + pad;
+  const major = solunar.majors.find((w) => inWin(w, 0));
+  const minor = solunar.minors.find((w) => inWin(w, 0));
+  if (major) { sol = 1; solNote = `Major period (moon ${major.kind})`; }
+  else if (minor) { sol = 0.75; solNote = `Minor period (${minor.kind})`; }
+  else if (solunar.majors.some((w) => inWin(w, 1800000))) { sol = 0.55; solNote = "Edge of a major period"; }
+  else if (solunar.minors.some((w) => inWin(w, 1800000))) { sol = 0.4; solNote = "Edge of a minor period"; }
+  const ill = solunar.phase.illum;
+  const phaseF = ill < 10 || ill > 90 ? 1 : ill < 25 || ill > 75 ? 0.8 : 0.6;
+  add("solunar", "Moon", 16, sol * (0.65 + 0.35 * phaseF), `${solNote} · ${solunar.phase.name}`);
+
+  // 3 — barometric trend (3 h change, hPa)
+  let pr = 0.6, prNote = "Steady pressure";
+  if (typeof pressureDelta === "number") {
+    const d = pressureDelta;
+    if (d <= -4) { pr = 0.35; prNote = "Pressure crashing"; }
+    else if (d <= -2.5) { pr = 0.75; prNote = "Falling fast — front arriving"; }
+    else if (d <= -0.6) { pr = 1; prNote = "Falling pressure: pre-front feed"; }
+    else if (d < -0.2) { pr = 0.8; prNote = "Slightly falling pressure"; }
+    else if (d <= 0.2) { pr = 0.65; prNote = "Steady pressure"; }
+    else if (d < 1.2) { pr = 0.5; prNote = "Slowly rising pressure"; }
+    else if (d < 2.5) { pr = 0.4; prNote = "Rising pressure"; }
+    else { pr = 0.3; prNote = "Rising fast after a front"; }
+  } else prNote = "No pressure data";
+  if (typeof hour.pressure === "number" && (hour.pressure < 1000 || hour.pressure > 1030)) pr *= 0.9;
+  add("pressure", "Pressure", 16, pr, prNote);
+
+  // 4 — wind
+  const w = typeof hour.wind === "number" ? hour.wind : 8;
+  let wi = 0.7, wiNote = "Calm";
+  if (w < 5) { wi = 0.7; wiNote = "Light wind"; }
+  else if (w < 12) { wi = 1; wiNote = "Light breeze — ideal ripple"; }
+  else if (w < 18) { wi = 0.75; wiNote = "Breezy"; }
+  else if (w < 25) { wi = 0.4; wiNote = "Windy"; }
+  else { wi = 0.15; wiNote = "Very windy"; }
+  add("wind", "Wind", 9, wi, wiNote);
+
+  // 5 — sky & rain
+  const code = hour.code, cloud = typeof hour.cloud === "number" ? hour.cloud : 50;
+  let sky = 0.6, skyNote = "Mixed sky";
+  if (code >= 95) { sky = 0; skyNote = "Thunderstorm risk"; }
+  else if ([65, 67, 82, 81].includes(code)) { sky = 0.3; skyNote = "Heavy rain"; }
+  else if ([71, 73, 75, 77, 85, 86].includes(code)) { sky = 0.3; skyNote = "Snow"; }
+  else if ([51, 53, 55, 56, 57, 61, 63, 66, 80].includes(code)) { sky = 0.9; skyNote = "Light rain / drizzle"; }
+  else if ([45, 48].includes(code)) { sky = 0.7; skyNote = "Fog"; }
+  else if (cloud >= 40 && cloud <= 90) { sky = 1; skyNote = "Cloud cover"; }
+  else if (cloud > 90) { sky = 0.9; skyNote = "Overcast"; }
+  else if (cloud < 20 && isDay && nearSun > 150) { sky = 0.45; skyNote = "Bright, cloudless"; }
+  add("sky", "Sky", 9, sky, skyNote);
+
+  // 6 — water temperature vs the target species' comfort range
+  if (typeof waterF === "number") {
+    const c = (waterF - 32) / 1.8;
+    const { min, lo, hi, max } = profile.c;
+    let wt;
+    if (c >= lo && c <= hi) wt = 1;
+    else if (c < lo) wt = c <= min ? 0.1 : 0.1 + 0.9 * ((c - min) / (lo - min));
+    else wt = c >= max ? 0.1 : 0.1 + 0.9 * ((max - c) / (max - hi));
+    const label = c < lo ? "Cooler than ideal" : c > hi ? "Warmer than ideal" : "In the sweet spot";
+    add("water", "Water temp", 20, wt, `${label} for ${profile.id === "generic" ? "most fish" : profile.label.toLowerCase()}`);
+  }
+
+  // 7 — tide movement (coastal spots where the model has a real tide)
+  if (tide && tide.length >= 2) {
+    let before = null, after = null;
+    for (const e of tide) { if (e.t <= t) before = e; else { after = e; break; } }
+    if (before && after) {
+      const x = (t - before.t) / (after.t - before.t);
+      const move = Math.sin(Math.PI * x);
+      add("tide", "Tide", 12, 0.25 + 0.75 * move, move > 0.7 ? `Strong ${after.type === "H" ? "incoming" : "outgoing"} flow` : move < 0.3 ? "Near slack tide" : `${after.type === "H" ? "Incoming" : "Outgoing"} tide`);
+    }
+  }
+
+  const wsum = f.reduce((s, x) => s + x.weight, 0);
+  let score = (100 * f.reduce((s, x) => s + x.weight * x.val, 0)) / wsum;
+  let caution = null;
+  if (code >= 95) { score = Math.min(score, 12); caution = "Thunderstorm risk — stay off the water."; }
+  else if (typeof hour.gust === "number" && hour.gust >= 40) { score = Math.min(score, 20); caution = "Dangerous gusts."; }
+  score = Math.round(score);
+  const label = score >= 80 ? "Excellent" : score >= 65 ? "Good" : score >= 45 ? "Fair" : "Slow";
+  const ranked = [...f].sort((a, b) => b.weight * b.val - a.weight * a.val);
+  return {
+    score, label, caution, factors: f,
+    drivers: ranked.filter((x) => x.val >= 0.7).slice(0, 3),
+    drags: [...f].sort((a, b) => a.val - b.val).filter((x) => x.val < 0.45).slice(0, 2),
+  };
+}
+
+function proFindWindows(hrs) {
+  if (!hrs.length) return [];
+  const max = Math.max(...hrs.map((h) => h.score));
+  const thr = Math.max(55, max - 12);
+  const wins = [];
+  let cur = null;
+  for (const h of hrs) {
+    if (h.score >= thr) {
+      if (!cur) cur = { start: h.t, end: h.t + 3600000, peak: h, sum: h.score, n: 1 };
+      else { cur.end = h.t + 3600000; cur.sum += h.score; cur.n++; if (h.score > cur.peak.score) cur.peak = h; }
+    } else if (cur) { wins.push(cur); cur = null; }
+  }
+  if (cur) wins.push(cur);
+  return wins.map((w) => ({ start: w.start, end: w.end, avg: Math.round(w.sum / w.n), peak: w.peak })).sort((a, b) => b.avg - a.avg).slice(0, 3);
+}
+
+// Four-day hourly forecast, scored for a target species. `fc` is normalised forecast, `marine` raw marine payload.
+function proBuildDays(fc, marine, targetName) {
+  const profile = proSpeciesProfile(targetName);
+  const tides = marine ? proTideExtrema(marine) : null;
+  const sst = marine ? proMarineSstNow(marine) : null;
+  const waterEst = proEstimateWaterF(fc);
+  const waterF = typeof sst === "number" ? sst : waterEst;
+  const waterSource = typeof sst === "number" ? "model" : "estimate";
+  const lat = fc.lat, lon = fc.lon;
+  const todayStr = proYmdIn(Date.now(), fc.tz);
+  let startIdx = fc.days.findIndex((d) => d.date === todayStr);
+  if (startIdx < 0) startIdx = Math.min(5, fc.days.length - 1);
+  const days = [];
+  for (let di = startIdx; di < Math.min(fc.days.length, startIdx + 4); di++) {
+    const d = fc.days[di];
+    const solunar = proSolunar(d.start, lat, lon);
+    const hrs = [];
+    fc.hours.forEach((h, i) => {
+      if (h.t < d.start || h.t >= d.start + 86400000) return;
+      const prev = fc.hours[i - 3];
+      const pd = prev && typeof prev.pressure === "number" && typeof h.pressure === "number" ? h.pressure - prev.pressure : null;
+      const r = proScoreHour({ t: h.t, sunrise: d.sunrise, sunset: d.sunset, solunar, pressureDelta: pd, hour: h, waterF, profile, tide: tides });
+      hrs.push({ t: h.t, hour: h, pd, ...r });
+    });
+    days.push({ date: d.date, start: d.start, sunrise: d.sunrise, sunset: d.sunset, solunar, hours: hrs, windows: proFindWindows(hrs), best: hrs.length ? Math.max(...hrs.map((h) => h.score)) : 0 });
+  }
+  return { days, profile, waterF, waterSource, hasTide: !!tides };
+}
+
+/* ---------------- lure / bait picks ---------------- */
+function proTrendOf(pd) { return typeof pd !== "number" ? null : pd <= -0.6 ? "falling" : pd >= 0.6 ? "rising" : "steady"; }
+
+// Which lure has actually produced for this angler (optionally for one species).
+function proHistoryLures(catches, profileId) {
+  const counts = {};
+  for (const c of catches || []) {
+    if (!c.lure) continue;
+    if (profileId && profileId !== "generic" && proSpeciesProfile(c.species).id !== profileId) continue;
+    const k = c.lure.trim();
+    if (k) counts[k] = (counts[k] || 0) + 1;
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+}
+
+function proBuildPicks({ days, now, items, catches, tideNext, precip48h }) {
+  const profile = days.profile;
+  const waterC = typeof days.waterF === "number" ? (days.waterF - 32) / 1.8 : null;
+  const picks = [];
+  const hr = now || null; // the scored "now" hour, or best hour
+  const wf = days.waterF;
+
+  if (waterC !== null) {
+    const band = profile.bands.find((b) => waterC <= b.maxC) || profile.bands[profile.bands.length - 1];
+    picks.push({
+      title: band.title,
+      why: `${band.why} Water ≈ ${fmtTemp(wf)}${days.waterSource === "estimate" ? " (estimated)" : ""}.`,
+      lures: band.lures, keywords: band.keywords, tag: profile.id === "generic" ? "General" : profile.label,
+    });
+  }
+  if (hr) {
+    const h = hr.hour;
+    const trend = proTrendOf(hr.pd);
+    const sunrise = days.days[0] ? days.days[0].sunrise : 0, sunset = days.days[0] ? days.days[0].sunset : 0;
+    const nearSun = Math.min(Math.abs(hr.t - sunrise), Math.abs(hr.t - sunset)) / 60000;
+    if (profile.surface && nearSun < 75 && (h.wind ?? 0) < 14 && (waterC === null || waterC > 12)) {
+      picks.push({ title: "Low-light surface window", why: `Light wind (${fmtSpeed(h.wind ?? 0)}) at the edge of the day — fish push shallow and hit the surface.`, lures: ["Walking topwater", "Popper", "Buzzbait / prop bait"], keywords: ["topwater", "popper", "walking", "buzzbait", "frog", "prop"], tag: "Conditions" });
+    }
+    if (trend === "falling") picks.push({ title: "Reaction baits before the front", why: "Falling pressure usually turns fish on before a system arrives — fast, flashy baits get eaten.", lures: ["Spinnerbait", "Lipless crankbait", "Swimbait", "Spoon"], keywords: ["spinnerbait", "chatterbait", "crankbait", "swim", "lipless", "spoon"], tag: "Conditions" });
+    else if (trend === "rising") picks.push({ title: "Slow down and downsize", why: "Pressure rising after a front makes fish finicky — smaller, slower, closer to cover.", lures: ["Ned rig", "Drop shot", "Small soft plastic", "Light jig"], keywords: ["ned rig", "drop shot", "finesse", "jig", "soft plastic", "worm"], tag: "Conditions" });
+    if (typeof precip48h === "number" && precip48h > 0.6) picks.push({ title: "Stained water: add vibration and flash", why: `About ${isMetric() ? Math.round(precip48h * 25.4) + " mm" : precip48h.toFixed(1) + " in"} of rain in the last 2 days — water is likely stained, so fish find baits by vibration.`, lures: ["Spinnerbait", "Chatterbait", "Rattling crankbait", "Dark-colour plastics"], keywords: ["spinnerbait", "chatterbait", "rattle", "crankbait", "dark", "spoon"], tag: "Conditions" });
+    else if ((h.cloud ?? 50) < 25 && hr.t > sunrise && hr.t < sunset && nearSun > 150) picks.push({ title: "Bright and clear: go natural", why: "Bluebird skies push fish tight to cover or deeper — natural colours, subtle baits, lighter line.", lures: ["Natural-colour soft plastic", "Finesse jig", "Drop shot"], keywords: ["finesse", "natural", "soft plastic", "drop shot", "shad"], tag: "Conditions" });
+    if ((h.wind ?? 0) > 15) picks.push({ title: "Wind-driven feed", why: `${fmtSpeed(h.wind)} wind pushes baitfish — search baits cover water fast.`, lures: ["Crankbait", "Spinnerbait", "Swimbait"], keywords: ["crankbait", "spinnerbait", "swimbait"], tag: "Conditions" });
+  }
+  if (profile.salt && tideNext) {
+    picks.push(tideNext === "H"
+      ? { title: "Incoming tide", why: "Rising water pulls bait onto flats and structure — predators follow it in.", lures: ["Swimbait", "Live shrimp", "Topwater"], keywords: ["swimbait", "shrimp", "topwater", "soft plastic"], tag: "Tide" }
+      : { title: "Outgoing tide", why: "Falling water flushes bait out of cover — ambush the drains, edges and channels.", lures: ["Jig + soft plastic", "Live bait", "Paddle-tail"], keywords: ["jig", "soft plastic", "live", "paddle", "swimbait"], tag: "Tide" });
+  }
+  const hist = proHistoryLures(catches, profile.id);
+  if (hist.length && hist[0][1] >= 2) {
+    picks.unshift({ title: `Your own hot lure: ${hist[0][0]}`, why: `${hist[0][1]} of your ${profile.id === "generic" ? "" : profile.label.toLowerCase() + " "}catches came on it${hist[1] ? `, then ${hist[1][0]} (${hist[1][1]})` : ""}.`, lures: [hist[0][0]], keywords: [hist[0][0]], tag: "Your history" });
+  }
+  const seen = new Set();
+  return picks.filter((p) => (seen.has(p.title) ? false : (seen.add(p.title), true))).slice(0, 5).map((p) => ({
+    ...p,
+    matches: (items || []).filter((i) => p.keywords.some((k) => `${i.name} ${i.spec || ""} ${i.notes || ""}`.toLowerCase().includes(k.toLowerCase()))),
+  }));
+}
+
+/* ---------------- catch condition snapshots + personal insights ---------------- */
+const PRO_TIME_BINS = [
+  { id: "dawn", label: "Dawn", from: 4, to: 8 }, { id: "morning", label: "Morning", from: 8, to: 11 },
+  { id: "midday", label: "Midday", from: 11, to: 15 }, { id: "afternoon", label: "Afternoon", from: 15, to: 18 },
+  { id: "dusk", label: "Dusk", from: 18, to: 21 }, { id: "night", label: "Night", from: 21, to: 28 },
+];
+function proTimeBin(date) {
+  let h = date.getHours();
+  if (h < 4) h += 24;
+  return PRO_TIME_BINS.find((b) => h >= b.from && h < b.to) || PRO_TIME_BINS[5];
+}
+
+// Look up the weather around the moment a fish was caught (forecast API for the last week, archive beyond).
+async function proSnapshotForCatch(rec, fallbackLoc) {
+  const lat = rec.gps && typeof rec.gps.lat === "number" ? rec.gps.lat : fallbackLoc && fallbackLoc.lat;
+  const lon = rec.gps && typeof rec.gps.lon === "number" ? rec.gps.lon : fallbackLoc && fallbackLoc.lon;
+  if (typeof lat !== "number" || typeof lon !== "number" || !rec.dateTime) return null;
+  const when = new Date(rec.dateTime).getTime();
+  if (!Number.isFinite(when)) return null;
+  const ageDays = (Date.now() - when) / 86400000;
+  const hourly = "temperature_2m,pressure_msl,cloud_cover,wind_speed_10m";
+  const units = "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto";
+  let url;
+  if (ageDays <= 7) {
+    url = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(3)}&longitude=${lon.toFixed(3)}&hourly=${hourly}${units}&past_days=12&forecast_days=1`;
+  } else {
+    const d0 = new Date(when - 7 * 86400000).toISOString().slice(0, 10);
+    const d1 = new Date(when + 86400000).toISOString().slice(0, 10);
+    url = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat.toFixed(3)}&longitude=${lon.toFixed(3)}&start_date=${d0}&end_date=${d1}&hourly=${hourly}${units}`;
+  }
+  const fc = proNormalizeForecast(await proFetchJson(url));
+  let idx = -1, bestD = Infinity;
+  fc.hours.forEach((h, i) => { const d = Math.abs(h.t - when); if (d < bestD) { bestD = d; idx = i; } });
+  if (idx < 0 || bestD > 3 * 3600000) return null;
+  const h = fc.hours[idx], prev = fc.hours[idx - 3];
+  const pd = prev && typeof prev.pressure === "number" && typeof h.pressure === "number" ? h.pressure - prev.pressure : null;
+  const moon = proMoonPhase(when);
+  const water = proEstimateWaterF(fc, when);
+  const r = (v, n = 0) => (typeof v === "number" ? Math.round(v * 10 ** n) / 10 ** n : null);
+  return { tempF: r(h.temp), pressure: r(h.pressure), pd: r(pd, 1), trend: proTrendOf(pd), cloud: r(h.cloud), windMph: r(h.wind), moon: moon.name, illum: moon.illum, waterF: r(water), at: Date.now() };
+}
+
+function proInsights(catches) {
+  const list = catches || [];
+  const bins = Object.fromEntries(PRO_TIME_BINS.map((b) => [b.id, 0]));
+  const trend = { falling: 0, steady: 0, rising: 0 };
+  const moonPh = {};
+  const months = Array(12).fill(0);
+  const lures = {}, spots = {};
+  let withCond = 0;
+  for (const c of list) {
+    const d = new Date(c.dateTime);
+    if (!Number.isFinite(d.getTime())) continue;
+    bins[proTimeBin(d).id]++;
+    months[d.getMonth()]++;
+    if (c.lure) lures[c.lure.trim()] = (lures[c.lure.trim()] || 0) + 1;
+    if (c.location) spots[c.location.trim()] = (spots[c.location.trim()] || 0) + 1;
+    if (c.conditions) {
+      withCond++;
+      if (c.conditions.trend) trend[c.conditions.trend]++;
+      if (c.conditions.moon) moonPh[c.conditions.moon] = (moonPh[c.conditions.moon] || 0) + 1;
+    }
+  }
+  const top = (o, n = 5) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, n);
+  return { total: list.length, bins, trend, moon: top(moonPh, 8), months, lures: top(lures), spots: top(spots), withCond };
+}
+
+function proCondKey(c) {
+  const g = c && c.gps && typeof c.gps.lat === "number" ? `${c.gps.lat.toFixed(3)},${c.gps.lon.toFixed(3)}` : "-";
+  return `${c ? c.dateTime : ""}|${g}`;
+}
+
+function proBestLureFor(catches, species) {
+  const h = proHistoryLures((catches || []).filter((c) => c.species === species), null);
+  return h.length ? h[0][0] : null;
+}
+
+// Country-aware helpers
+function proDefaultUnits() {
+  const reg = (((typeof navigator !== "undefined" && navigator.language) || "en-US").split("-")[1] || "").toUpperCase();
+  return ["US", "LR", "MM"].includes(reg) || reg === "" ? "imperial" : "metric";
+}
+function proRulesUrl(place) {
+  if (!place) return null;
+  const q = encodeURIComponent(`${[place.region, place.country].filter(Boolean).join(" ")} fishing license and regulations`);
+  if (place.countryCode === "GB") return "https://www.gov.uk/fishing-licences";
+  return `https://www.google.com/search?q=${q}`;
+}
+function proEscape(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+// <<PRO-DATA-END>>
+
+// <<PRO-UI-START>>
+/* ======================================================================
+   Epic Fishy 2.2 — screens built on the live data layer
+   ====================================================================== */
+
+const PRO_TARGET_KEY = "target";
+const BITE_COLORS = { Excellent: "#2dd4bf", Good: "#0f8f82", Fair: "#8a9a97", Slow: "#3d4e4b" };
+
+function proBustForecast(lat, lon) {
+  try {
+    localStorage.removeItem(PRO_PREFIX + `fc:${lat.toFixed(2)},${lon.toFixed(2)}`);
+    localStorage.removeItem(PRO_PREFIX + `mr:${lat.toFixed(2)},${lon.toFixed(2)}`);
+  } catch (e) { /* ignore */ }
+}
+
+function useProForecast(lat, lon) {
+  const [st, setSt] = useState({ status: "loading" });
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    let off = false;
+    setSt((s) => ({ ...s, status: "loading" }));
+    (async () => {
+      try {
+        const [f, m, p] = await Promise.all([
+          proLoadForecast(lat, lon),
+          proLoadMarine(lat, lon).catch(() => null),
+          proLoadPlace(lat, lon).catch(() => null),
+        ]);
+        if (off) return;
+        setSt({ status: "ok", fc: proNormalizeForecast(f.data), marine: m ? m.data : null, place: p ? p.data : null, stale: f.stale, at: f.at });
+      } catch (e) {
+        if (!off) setSt({ status: "error" });
+      }
+    })();
+    return () => { off = true; };
+  }, [lat, lon, tick]);
+  const refresh = useCallback(() => { proBustForecast(lat, lon); setTick((t) => t + 1); }, [lat, lon]);
+  return [st, refresh];
+}
+
+function useProNearbySpecies(lat, lon) {
+  const [st, setSt] = useState({ status: lat == null ? "idle" : "loading", list: [] });
+  useEffect(() => {
+    if (typeof lat !== "number" || typeof lon !== "number") { setSt({ status: "idle", list: [] }); return undefined; }
+    let off = false;
+    setSt({ status: "loading", list: [] });
+    proLoadNearbySpecies(lat, lon)
+      .then((r) => { if (!off) setSt({ status: "ok", list: r.data, stale: r.stale }); })
+      .catch(() => { if (!off) setSt({ status: "error", list: [] }); });
+    return () => { off = true; };
+  }, [lat, lon]);
+  return st;
+}
+
+function useSavedLocation() {
+  const [loc, setLoc] = useState(null);
+  useEffect(() => {
+    let off = false;
+    const read = async () => {
+      try {
+        const r = await window.storage.get(LOCATION_KEY, false);
+        if (!off && r && r.value) setLoc(JSON.parse(r.value));
+      } catch (e) { /* none saved */ }
+    };
+    read();
+    window.addEventListener("tackle-location-changed", read);
+    return () => { off = true; window.removeEventListener("tackle-location-changed", read); };
+  }, []);
+  return loc;
+}
+async function proReadSavedLocation() {
+  try {
+    const r = await window.storage.get(LOCATION_KEY, false);
+    return r && r.value ? JSON.parse(r.value) : null;
+  } catch (e) { return null; }
+}
+
+function proUsePersisted(key, initial) {
+  const [v, setV] = useState(() => { try { const s = localStorage.getItem(PRO_PREFIX + key); return s == null ? initial : JSON.parse(s); } catch (e) { return initial; } });
+  const set = useCallback((n) => { setV(n); try { localStorage.setItem(PRO_PREFIX + key, JSON.stringify(n)); } catch (e) { /* ignore */ } }, [key]);
+  return [v, set];
+}
+
+const PRO_MOON_EMOJI = { "New Moon": "🌑", "Waxing Crescent": "🌒", "First Quarter": "🌓", "Waxing Gibbous": "🌔", "Full Moon": "🌕", "Waning Gibbous": "🌖", "Last Quarter": "🌗", "Waning Crescent": "🌘" };
+
+// One-line summary of the conditions recorded when a fish was caught.
+function proCondLine(c) {
+  if (!c) return "";
+  const trend = c.trend === "falling" ? "Falling pressure" : c.trend === "rising" ? "Rising pressure" : c.trend === "steady" ? "Steady pressure" : null;
+  return [
+    trend,
+    c.moon ? `${PRO_MOON_EMOJI[c.moon] || ""} ${c.moon}`.trim() : null,
+    typeof c.tempF === "number" ? `${fmtTemp(c.tempF)} air` : null,
+    typeof c.waterF === "number" ? `~${fmtTemp(c.waterF)} water` : null,
+    typeof c.windMph === "number" ? fmtSpeed(c.windMph) : null,
+  ].filter(Boolean).join(" · ");
+}
+
+/* ---------------- bite forecast ---------------- */
+
+function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQuickAdd, refresh, loading }) {
+  useUnits();
+  const [dayIdx, setDayIdx] = useState(0);
+  const [selT, setSelT] = useState(null);
+
+  const model = useMemo(() => {
+    if (st.status !== "ok") return null;
+    try { return proBuildDays(st.fc, st.marine, targetName); } catch (e) { return null; }
+  }, [st, targetName]);
+
+  useEffect(() => { setSelT(null); }, [dayIdx, targetName]);
+
+  if (st.status === "loading" && !model) return <CardShell title="BITE FORECAST"><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Reading the sky, moon and water…</span></CardShell>;
+  if (st.status === "error" || !model || model.days.length === 0) {
+    return (
+      <CardShell title="BITE FORECAST">
+        <p className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Couldn't load the forecast. Check your connection and try again.</p>
+        <button onClick={refresh} className="mt-2 px-3 py-1.5 rounded-full text-[13px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>Retry</button>
+      </CardShell>
+    );
+  }
+
+  const tz = st.fc.tz;
+  const day = model.days[Math.min(dayIdx, model.days.length - 1)];
+  const now = Date.now();
+  const isToday = dayIdx === 0;
+  const nowHour = isToday ? day.hours.find((h) => now >= h.t && now < h.t + 3600000) : null;
+  const bestHour = day.hours.reduce((b, h) => (!b || h.score > b.score ? h : b), null);
+  const sel = (selT != null && day.hours.find((h) => h.t === selT)) || nowHour || bestHour;
+  const headline = nowHour || bestHour;
+  const hourLabel = (ms) => proFmtTime(ms, tz, { hour: "numeric", minute: undefined });
+  const isMetricNow = isMetric();
+  const species = (() => {
+    const mine = Object.entries((catches || []).reduce((a, c) => { if (c.species) a[c.species.trim()] = (a[c.species.trim()] || 0) + 1; return a; }, {})).sort((a, b) => b[1] - a[1]).slice(0, 3).map((e) => e[0]);
+    const seen = new Set();
+    return [...mine, ...nearby.slice(0, 5).map((s) => s.name)].filter((n) => { const k = n.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+  })();
+
+  return (
+    <>
+      <CardShell title="BITE FORECAST" subtitle={`${isToday ? "right now" : "peak of the day"} · tuned for ${model.profile.id === "generic" ? "any fish" : model.profile.label.toLowerCase()}`}>
+        {st.stale && <div className="tb-mono text-[12px] mb-2" style={{ color: "var(--tb-flare)" }}>Offline — showing the forecast saved {new Date(st.at).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}.</div>}
+
+        <div className="flex gap-2 overflow-x-auto tb-scroll pb-2 -mx-1 px-1" style={{ scrollbarWidth: "none" }}>
+          <ChipButton active={model.profile.id === "generic" && !targetName} onClick={() => onTarget("")} label="Any fish" />
+          {species.map((sp) => <ChipButton key={sp} active={(targetName || "").toLowerCase() === sp.toLowerCase()} onClick={() => onTarget(sp)} label={sp} />)}
+        </div>
+
+        <div className="flex gap-1 mt-1 mb-2">
+          {model.days.map((d, i) => (
+            <button key={d.date} onClick={() => setDayIdx(i)} aria-pressed={i === dayIdx} className="flex-1 rounded-lg py-1.5 text-center" style={{ background: i === dayIdx ? "var(--tb-surface-2)" : "transparent", border: "1px solid " + (i === dayIdx ? "var(--tb-brass)" : "var(--tb-line)") }}>
+              <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>{i === 0 ? "Today" : proFmtDay(d.start, tz, { weekday: "short" })}</div>
+              <div className="text-[15px] font-bold" style={{ color: d.best >= 65 ? "var(--tb-brass)" : "var(--tb-text)" }}>{d.best}</div>
+            </button>
+          ))}
+        </div>
+
+        {headline && (
+          <div className="flex items-end justify-between my-2">
+            <div>
+              <div className="tb-stencil text-[56px] leading-[0.9]" style={{ color: headline.label === "Excellent" || headline.label === "Good" ? "var(--tb-brass)" : "var(--tb-muted)" }}>{headline.score}</div>
+              <div className="text-[17px] font-bold mt-1" style={{ color: "var(--tb-text)" }}>{headline.label} bite{nowHour ? " right now" : ` · ${hourLabel(headline.t)}`}</div>
+            </div>
+            <div className="text-right text-[13px]" style={{ color: "var(--tb-muted)" }}>
+              <div>{PRO_MOON_EMOJI[day.solunar.phase.name]} {day.solunar.phase.name}</div>
+              <div>{day.solunar.phase.illum}% lit</div>
+              <div>Water {typeof model.waterF === "number" ? fmtTemp(model.waterF) : "—"}{model.waterSource === "estimate" ? " (est.)" : ""}</div>
+            </div>
+          </div>
+        )}
+
+        {headline && headline.caution && (
+          <div className="rounded-lg px-3 py-2 mb-2 text-[14px] font-bold flex items-center gap-2" style={{ background: "rgba(255,111,94,0.14)", color: "var(--tb-flare)", border: "1px solid var(--tb-flare)" }}>
+            <AlertTriangle size={16} aria-hidden="true" /> {headline.caution}
+          </div>
+        )}
+
+        <div role="group" aria-label="Hourly bite score" className="flex items-end gap-[2px]" style={{ height: 76 }}>
+          {day.hours.map((h) => {
+            const active = sel && sel.t === h.t;
+            const isNow = nowHour && nowHour.t === h.t;
+            const night = h.t < day.sunrise || h.t > day.sunset;
+            return (
+              <button
+                key={h.t}
+                onClick={() => { haptic(); setSelT(h.t); }}
+                aria-label={`${hourLabel(h.t)}: ${h.label}, score ${h.score}`}
+                aria-pressed={!!active}
+                className="flex-1 min-w-0 rounded-sm"
+                style={{ height: Math.max(5, Math.round(h.score * 0.74)), background: BITE_COLORS[h.label], opacity: night && !active ? 0.6 : 1, outline: active ? "2px solid var(--tb-text)" : isNow ? "2px dashed var(--tb-blue)" : "none", outlineOffset: 1 }}
+              />
+            );
+          })}
+        </div>
+        <div className="flex justify-between tb-mono text-[11px] mt-1" style={{ color: "var(--tb-muted)" }}>
+          {[0, 6, 12, 18].map((i) => <span key={i}>{day.hours[i] ? hourLabel(day.hours[i].t) : ""}</span>)}
+          <span>{day.hours[23] ? hourLabel(day.hours[23].t + 3600000) : ""}</span>
+        </div>
+        <div className="tb-mono text-[12px] mt-1" style={{ color: "var(--tb-muted)" }}>
+          ☀ {proFmtTime(day.sunrise, tz)} – {proFmtTime(day.sunset, tz)} · darker bars are after dark
+        </div>
+
+        {day.windows.length > 0 && (
+          <div className="mt-3">
+            <div className="text-[14px] font-bold mb-1" style={{ color: "var(--tb-text)" }}>Best windows</div>
+            <div className="space-y-1">
+              {day.windows.map((w, i) => (
+                <button key={i} onClick={() => setSelT(w.peak.t)} className="w-full flex items-center justify-between rounded-lg px-3 py-2 text-left" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+                  <span className="tb-mono text-[14px] font-bold" style={{ color: "var(--tb-text)" }}>{proFmtTime(w.start, tz)} – {proFmtTime(w.end, tz)}</span>
+                  <span className="text-[13px] font-bold" style={{ color: BITE_COLORS[w.avg >= 80 ? "Excellent" : w.avg >= 65 ? "Good" : "Fair"] }}>{w.avg}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {sel && (
+          <div className="mt-3 rounded-xl p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{hourLabel(sel.t)} · {sel.label} ({sel.score})</div>
+              <div className="tb-mono text-[12px]" style={{ color: "var(--tb-muted)" }}>
+                {typeof sel.hour.temp === "number" ? fmtTemp(sel.hour.temp) : ""}{typeof sel.hour.wind === "number" ? ` · ${fmtSpeed(sel.hour.wind)}` : ""}
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              {sel.factors.map((f) => (
+                <div key={f.key}>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[13px] w-[78px] shrink-0 font-bold" style={{ color: "var(--tb-text)" }}>{f.label}</span>
+                    <span className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: "var(--tb-bg)" }} aria-hidden="true">
+                      <span className="block h-full rounded-full" style={{ width: `${Math.round(f.val * 100)}%`, background: f.val >= 0.7 ? "var(--tb-brass)" : f.val >= 0.45 ? "var(--tb-brass-dim)" : "var(--tb-muted)" }} />
+                    </span>
+                  </div>
+                  <div className="text-[12px] pl-[86px] leading-snug" style={{ color: "var(--tb-muted)" }}>{f.note}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <p className="text-[12px] mt-3 leading-snug" style={{ color: "var(--tb-muted)" }}>
+          A guide, not a guarantee: it blends light, moon position, pressure trend, wind, sky, {model.hasTide ? "tide flow, " : ""}and {model.waterSource === "estimate" ? "estimated" : "modelled"} water temperature. Data: Open-Meteo{model.hasTide ? " (tides: coarse global model)" : ""}.
+        </p>
+        <div className="flex justify-end -mb-1">
+          <button onClick={refresh} aria-label="Refresh forecast" className="w-8 h-8 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
+            <RefreshCw size={13} className={loading ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
+          </button>
+        </div>
+      </CardShell>
+
+      <ProLurePicks st={st} model={model} catches={catches} items={items} onQuickAdd={onQuickAdd} nowHour={nowHour || (model.days[0].hours.reduce((b, h) => (!b || h.score > b.score ? h : b), null))} />
+    </>
+  );
+}
+
+function ProLurePicks({ st, model, catches, items, onQuickAdd, nowHour }) {
+  const picks = useMemo(() => {
+    const ext = st.marine ? proTideExtrema(st.marine) : null;
+    const next = ext ? ext.find((e) => e.t > Date.now()) : null;
+    const t = Date.now();
+    const precip48h = st.fc.hours.filter((h) => h.t > t - 48 * 3600000 && h.t <= t).reduce((s, h) => s + (h.precip || 0), 0);
+    return proBuildPicks({ days: model, now: nowHour, items, catches, tideNext: next ? next.type : null, precip48h });
+  }, [st, model, catches, items, nowHour]);
+  if (!picks.length) return null;
+  return (
+    <CardShell title="WHAT TO THROW" subtitle={`for ${model.profile.id === "generic" ? "general fishing" : model.profile.label.toLowerCase()} in today's conditions`}>
+      <div>
+        {picks.map((p, idx) => (
+          <div key={p.title} style={{ borderTop: idx > 0 ? "1px solid var(--tb-line)" : "none", paddingTop: idx > 0 ? 10 : 0, marginTop: idx > 0 ? 10 : 0 }}>
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{p.title}</div>
+              <span className="text-[11px] px-2 py-0.5 rounded-full" style={{ background: "rgba(45,212,191,0.14)", color: "var(--tb-brass)" }}>{p.tag}</span>
+            </div>
+            <div className="text-[13px] mt-0.5 leading-snug" style={{ color: "var(--tb-muted)" }}>{p.why}</div>
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {p.lures.map((l) => <span key={l} className="text-[12px] px-2 py-1 rounded-full" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>{l}</span>)}
+            </div>
+            {p.matches.length > 0 ? (
+              <div className="mt-2 text-[13px]" style={{ color: "var(--tb-brass)" }}>
+                In your box: {p.matches.slice(0, 4).map((m) => m.name).join(", ")}
+              </div>
+            ) : (
+              <button onClick={() => onQuickAdd && onQuickAdd(p.keywords[0], "lures")} className="mt-2 text-[12px] px-2.5 py-1 rounded-full" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+                + nothing matching in your box — add {p.keywords[0]}
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    </CardShell>
+  );
+}
+
+/* ---------------- tides from the global model (shown when NOAA has no station) ---------------- */
+
+function ProModelTideCard({ st }) {
+  useUnits();
+  const tide = useMemo(() => (st.status === "ok" && st.marine ? proModelTide(st.marine, st.fc.tz) : null), [st]);
+  if (!tide) return null;
+  return (
+    <CardShell title="TIDES" subtitle="global ocean model — for planning, not navigation">
+      <div className="space-y-1.5">
+        {tide.predictions.map((p, i) => {
+          const high = p.type === "H";
+          return (
+            <div key={i} className="flex items-center justify-between tb-mono text-[13px]">
+              <div className="flex items-center gap-1.5" style={{ color: "var(--tb-text)" }}>
+                <ArrowUp size={12} style={{ color: high ? "var(--tb-blue)" : "var(--tb-brass)", transform: high ? "none" : "rotate(180deg)" }} />
+                {high ? "High" : "Low"}
+              </div>
+              <div style={{ color: "var(--tb-muted)" }}>{proFmtDay(p.ms, tide.tz, { month: "short", day: "numeric", weekday: undefined })} {proFmtTime(p.ms, tide.tz)}</div>
+              <div style={{ color: "var(--tb-text)" }}>{fmtHeight(Number(p.v))}</div>
+            </div>
+          );
+        })}
+      </div>
+    </CardShell>
+  );
+}
+
+/* ---------------- nearby species (worldwide, from real sightings) ---------------- */
+
+function ProNearbySpecies({ nearby, place, catches, onPick, targetName }) {
+  const caught = useMemo(() => new Set((catches || []).map((c) => proNorm(c.species))), [catches]);
+  if (nearby.status === "loading") return <CardShell title="FISH NEAR YOU"><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Looking up what's been recorded nearby…</span></CardShell>;
+  if (nearby.status !== "ok" || nearby.list.length === 0) return null;
+  const rules = proRulesUrl(place);
+  return (
+    <CardShell title="FISH NEAR YOU" subtitle="species people have actually recorded within ~60 km · tap one to tune the forecast">
+      <div className="grid grid-cols-3 gap-2">
+        {nearby.list.slice(0, 9).map((s) => {
+          const has = caught.has(proNorm(s.name)) || caught.has(proNorm(s.sci));
+          const sel = targetName && targetName.toLowerCase() === s.name.toLowerCase();
+          return (
+            <button key={s.id} onClick={() => { haptic(); onPick(s.name); }} aria-pressed={!!sel} className="rounded-xl overflow-hidden text-left" style={{ background: "var(--tb-surface-2)", border: "1px solid " + (sel ? "var(--tb-brass)" : "var(--tb-line)") }}>
+              <div className="relative w-full" style={{ aspectRatio: "1 / 1", background: "var(--tb-bg)" }}>
+                {s.photo && <img src={s.photoMed || s.photo} alt="" loading="lazy" className="w-full h-full object-cover" />}
+                {has && <span className="absolute top-1 right-1 text-[11px] font-bold px-1.5 py-0.5 rounded-full" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>✓ caught</span>}
+              </div>
+              <div className="px-2 py-1.5">
+                <div className="text-[13px] font-bold leading-tight line-clamp-2" style={{ color: "var(--tb-text)" }}>{s.name}</div>
+                <div className="text-[11px] italic truncate" style={{ color: "var(--tb-muted)" }}>{s.sci}</div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+      <div className="flex items-center justify-between mt-3 gap-3">
+        <span className="text-[11px]" style={{ color: "var(--tb-muted)" }}>Sightings & photos: iNaturalist contributors</span>
+        {rules && (
+          <a href={rules} target="_blank" rel="noopener noreferrer" className="text-[13px] font-bold inline-flex items-center gap-1 shrink-0" style={{ color: "var(--tb-blue)" }}>
+            <ExternalLink size={13} aria-hidden="true" /> Local rules{place && place.country ? ` · ${place.country}` : ""}
+          </a>
+        )}
+      </div>
+    </CardShell>
+  );
+}
+
+/* ---------------- container for the Conditions tab ---------------- */
+
+function ProConditions({ location, items, catches, onQuickAdd, noaaTideMissing }) {
+  const [st, refresh] = useProForecast(location.lat, location.lon);
+  const nearby = useProNearbySpecies(location.lat, location.lon);
+  const [target, setTarget] = proUsePersisted(PRO_TARGET_KEY, "");
+  return (
+    <>
+      <ProBiteForecast st={st} targetName={target} onTarget={setTarget} catches={catches} nearby={nearby.list} items={items} onQuickAdd={onQuickAdd} refresh={refresh} loading={st.status === "loading"} />
+      {noaaTideMissing && <ProModelTideCard st={st} />}
+      <ProNearbySpecies nearby={nearby} place={st.status === "ok" ? st.place : null} catches={catches} onPick={setTarget} targetName={target} />
+    </>
+  );
+}
+
+/* ---------------- catch-form species suggestions ---------------- */
+
+function ProSpeciesSuggest({ gps, hasPhoto, current, onPick }) {
+  const saved = useSavedLocation();
+  const lat = gps ? gps.lat : saved ? saved.lat : null;
+  const lon = gps ? gps.lon : saved ? saved.lon : null;
+  const nearby = useProNearbySpecies(lat, lon);
+  const q = (current || "").trim().toLowerCase();
+  if (nearby.status !== "ok" || !nearby.list.length) return null;
+  const list = nearby.list.filter((s) => !q || s.name.toLowerCase().includes(q) || s.sci.toLowerCase().includes(q)).slice(0, 10);
+  if (!list.length) return null;
+  return (
+    <div className="-mt-1">
+      <div className="text-[13px] mb-1.5" style={{ color: "var(--tb-muted)" }}>{hasPhoto ? "Compare your photo with fish recorded near here" : "Recorded near here — tap to choose"}</div>
+      <div className="flex gap-2 overflow-x-auto tb-scroll pb-1" style={{ scrollbarWidth: "none" }}>
+        {list.map((s) => (
+          <button key={s.id} type="button" onClick={() => { haptic(); onPick(s.name); }} className="shrink-0 w-[92px] rounded-xl overflow-hidden text-left" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+            <div className="w-full" style={{ aspectRatio: "4 / 3", background: "var(--tb-bg)" }}>{s.photo && <img src={s.photoMed || s.photo} alt="" loading="lazy" className="w-full h-full object-cover" />}</div>
+            <div className="px-1.5 py-1 text-[12px] font-bold leading-tight" style={{ color: "var(--tb-text)", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{s.name}</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- life list + personal insights (top of the Catches tab) ---------------- */
+
+function ProBars({ rows, max, labelW = 78 }) {
+  const m = max || Math.max(1, ...rows.map((r) => r.value));
+  return (
+    <div className="space-y-1.5">
+      {rows.map((r) => (
+        <div key={r.label} className="flex items-center gap-2">
+          <span className="text-[12px] shrink-0" style={{ color: "var(--tb-muted)", width: labelW }}>{r.label}</span>
+          <span className="flex-1 h-2.5 rounded-full overflow-hidden" style={{ background: "var(--tb-surface-2)" }} aria-hidden="true">
+            <span className="block h-full rounded-full" style={{ width: `${Math.round((r.value / m) * 100)}%`, background: "var(--tb-brass)" }} />
+          </span>
+          <span className="text-[12px] w-6 text-right tb-mono" style={{ color: "var(--tb-text)" }}>{r.value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ProCatchHub({ catches }) {
+  const [tab, setTab] = useState("life");
+  const [open, setOpen] = proUsePersisted("hub-open", true);
+  const saved = useSavedLocation();
+  const lastGps = useMemo(() => { const c = (catches || []).find((x) => x.gps); return c ? c.gps : null; }, [catches]);
+  const where = saved || lastGps;
+  const nearby = useProNearbySpecies(where ? where.lat : null, where ? where.lon : null);
+  const ins = useMemo(() => proInsights(catches), [catches]);
+  const life = useMemo(() => {
+    const m = {};
+    for (const c of catches || []) {
+      if (!c.species) continue;
+      const k = c.species.trim().toLowerCase();
+      if (!m[k]) m[k] = { name: c.species.trim(), n: 0, best: 0, photo: null, last: 0 };
+      m[k].n++;
+      m[k].best = Math.max(m[k].best, weightToLb(c.weight, c.weightUnit));
+      const t = new Date(c.dateTime).getTime();
+      if (t > m[k].last) m[k].last = t;
+      if (!m[k].photo && c.photo) m[k].photo = c.photo;
+    }
+    for (const s of nearby.list) {
+      for (const e of Object.values(m)) {
+        if (!e.photo && !e.ref && (proNorm(e.name) === proNorm(s.name) || proNorm(e.name) === proNorm(s.sci))) e.ref = s.photoMed || s.photo;
+      }
+    }
+    return Object.values(m).sort((a, b) => b.n - a.n);
+  }, [catches, nearby]);
+  const targets = useMemo(() => {
+    const have = new Set(life.map((l) => proNorm(l.name)));
+    return nearby.list.filter((s) => !have.has(proNorm(s.name)) && !have.has(proNorm(s.sci))).slice(0, 6);
+  }, [life, nearby]);
+
+  if (!catches || catches.length === 0) return null;
+  const binRows = PRO_TIME_BINS.map((b) => ({ label: b.label, value: ins.bins[b.id] }));
+  const topBin = [...binRows].sort((a, b) => b.value - a.value)[0];
+  const condN = ins.withCond;
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const topMonth = ins.months.indexOf(Math.max(...ins.months));
+  const trendTotal = ins.trend.falling + ins.trend.steady + ins.trend.rising;
+
+  return (
+    <CardShell title="YOUR FISHING LOG" subtitle={`${life.length} species · ${ins.total} catches`}>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex gap-2">
+          <ChipButton active={tab === "life"} onClick={() => setTab("life")} label="Life list" />
+          <ChipButton active={tab === "insights"} onClick={() => setTab("insights")} label="Insights" />
+        </div>
+        <button onClick={() => setOpen(!open)} aria-expanded={open} className="text-[13px] font-bold px-2 py-1" style={{ color: "var(--tb-muted)" }}>{open ? "Hide" : "Show"}</button>
+      </div>
+      {open && tab === "life" && (
+        <div>
+          <div className="grid grid-cols-3 gap-2">
+            {life.slice(0, 12).map((l) => (
+              <div key={l.name} className="rounded-xl overflow-hidden" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+                <div className="w-full" style={{ aspectRatio: "4 / 3", background: "var(--tb-bg)" }}>
+                  {(l.photo || l.ref) ? <img src={l.photo || l.ref} alt="" loading="lazy" className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center"><Fish size={22} style={{ color: "var(--tb-line)" }} aria-hidden="true" /></div>}
+                </div>
+                <div className="px-2 py-1.5">
+                  <div className="text-[13px] font-bold leading-tight truncate" style={{ color: "var(--tb-text)" }}>{l.name}</div>
+                  <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>×{l.n}{l.best ? ` · ${isMetric() ? (l.best / 2.20462).toFixed(1) + " kg" : l.best.toFixed(1) + " lb"}` : ""}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          {targets.length > 0 && (
+            <div className="mt-4">
+              <div className="text-[14px] font-bold mb-1.5" style={{ color: "var(--tb-text)" }}>Next to catch near you</div>
+              <div className="flex gap-2 overflow-x-auto tb-scroll pb-1" style={{ scrollbarWidth: "none" }}>
+                {targets.map((s) => (
+                  <div key={s.id} className="shrink-0 w-[92px] rounded-xl overflow-hidden" style={{ background: "var(--tb-surface-2)", border: "1px dashed var(--tb-line)" }}>
+                    <div className="w-full" style={{ aspectRatio: "4 / 3", background: "var(--tb-bg)", filter: "grayscale(0.7)" }}>{s.photo && <img src={s.photoMed || s.photo} alt="" loading="lazy" className="w-full h-full object-cover" />}</div>
+                    <div className="px-1.5 py-1 text-[12px] font-bold leading-tight" style={{ color: "var(--tb-text)", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{s.name}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {open && tab === "insights" && (
+        <div className="space-y-4">
+          {ins.total < 3 && <p className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Log a few more fish and patterns will show up here.</p>}
+          <div>
+            <div className="text-[14px] font-bold mb-1.5" style={{ color: "var(--tb-text)" }}>When you catch fish{topBin && topBin.value > 0 ? ` — mostly ${topBin.label.toLowerCase()}` : ""}</div>
+            <ProBars rows={binRows} />
+          </div>
+          {condN >= 3 && (
+            <div>
+              <div className="text-[14px] font-bold mb-1.5" style={{ color: "var(--tb-text)" }}>Barometer when they bit <span className="font-normal text-[12px]" style={{ color: "var(--tb-muted)" }}>({condN} catches with weather)</span></div>
+              <ProBars rows={[{ label: "Falling", value: ins.trend.falling }, { label: "Steady", value: ins.trend.steady }, { label: "Rising", value: ins.trend.rising }]} max={Math.max(1, trendTotal)} />
+            </div>
+          )}
+          {ins.moon.length > 0 && condN >= 3 && (
+            <div>
+              <div className="text-[14px] font-bold mb-1.5" style={{ color: "var(--tb-text)" }}>Moon phase</div>
+              <ProBars rows={ins.moon.slice(0, 4).map(([n, v]) => ({ label: `${PRO_MOON_EMOJI[n] || ""} ${n.replace("Waxing ", "Wax. ").replace("Waning ", "Wan. ")}`, value: v }))} labelW={128} />
+            </div>
+          )}
+          {ins.total >= 3 && (
+            <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>
+              Best month so far: <b style={{ color: "var(--tb-text)" }}>{MONTHS[topMonth]}</b>
+              {ins.lures[0] ? <> · Top lure: <b style={{ color: "var(--tb-text)" }}>{ins.lures[0][0]}</b> ({ins.lures[0][1]})</> : null}
+              {ins.spots[0] ? <> · Top spot: <b style={{ color: "var(--tb-text)" }}>{ins.spots[0][0]}</b></> : null}
+            </div>
+          )}
+          {condN < ins.total && ins.total >= 1 && <p className="text-[12px]" style={{ color: "var(--tb-muted)" }}>Weather is added automatically to catches that have a GPS tag or a saved Conditions location.</p>}
+        </div>
+      )}
+    </CardShell>
+  );
+}
+
+/* ---------------- community catch map: clustering, filters, safe popups ---------------- */
+
+// Pure helper: bucket projected points into pixel cells. Exported for testing.
+function proCluster(points, project, cell) {
+  const buckets = new Map();
+  for (const p of points) {
+    const pt = project(p);
+    const key = Math.floor(pt.x / cell) + ":" + Math.floor(pt.y / cell);
+    let b = buckets.get(key);
+    if (!b) { b = { items: [], sx: 0, sy: 0, lat: 0, lon: 0 }; buckets.set(key, b); }
+    b.items.push(p); b.lat += p.lat; b.lon += p.lon;
+  }
+  return [...buckets.values()].map((b) => ({ items: b.items, lat: b.lat / b.items.length, lon: b.lon / b.items.length }));
+}
+// Snap a (already fuzzed) shared coordinate to a ~1 km grid so repeat posts can't be averaged back to an exact spot.
+function proSnapShared(lat, lon) {
+  return { lat: Math.round(lat * 100) / 100, lon: Math.round(lon * 100) / 100 };
+}
+
+function proCatchPopup(c) {
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "min-width:150px;max-width:210px;font:13px/1.35 system-ui,sans-serif;color:#0b1a18";
+  const add = (txt, css) => { const d = document.createElement("div"); d.textContent = txt; if (css) d.style.cssText = css; wrap.appendChild(d); };
+  if (typeof c.photo === "string" && c.photo.startsWith("data:image/")) {
+    const img = document.createElement("img");
+    img.src = c.photo; img.alt = ""; img.style.cssText = "width:100%;max-height:120px;object-fit:cover;border-radius:8px;margin-bottom:6px";
+    wrap.appendChild(img);
+  }
+  add(c.species || "Catch", "font-weight:700;font-size:14px");
+  const size = [c.length ? `${c.length} ${c.lengthUnit || ""}`.trim() : null, c.weight ? `${c.weight} ${c.weightUnit || ""}`.trim() : null].filter(Boolean).join(" · ");
+  if (size) add(size);
+  if (c.lure) add("on " + c.lure, "color:#35514d");
+  if (c.nickname) add("by " + c.nickname, "color:#35514d");
+  if (c.dateTime) { const d = new Date(c.dateTime); if (Number.isFinite(d.getTime())) add(d.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" }), "color:#6a807c;font-size:12px"); }
+  return wrap;
+}
+
+function ProCommunityMap() {
+  const mapRef = useRef(null);
+  const mapInstance = useRef(null);
+  const layerRef = useRef(null);
+  const [all, setAll] = useState(null);
+  const [error, setError] = useState(null);
+  const [filter, setFilter] = useState("");
+  const [shown, setShown] = useState(0);
+  const leafletAvailable = typeof window !== "undefined" && !!window.L;
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const data = await window.communityAPI.listCatches(250);
+      setAll(data.filter((c) => typeof c.lat === "number" && typeof c.lon === "number" && !isBlocked(c.uid)));
+    } catch (e) {
+      setError("Couldn't load the community map right now.");
+    }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const speciesChips = useMemo(() => {
+    const m = {};
+    (all || []).forEach((c) => { if (c.species) m[c.species] = (m[c.species] || 0) + 1; });
+    return Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 8).map((e) => e[0]);
+  }, [all]);
+
+  const visible = useMemo(() => (all || []).filter((c) => !filter || c.species === filter), [all, filter]);
+
+  useEffect(() => {
+    if (!leafletAvailable || !mapRef.current || mapInstance.current) return undefined;
+    const map = window.L.map(mapRef.current, { attributionControl: true, worldCopyJump: true }).setView([30, -20], 2);
+    window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 17 }).addTo(map);
+    layerRef.current = window.L.layerGroup().addTo(map);
+    mapInstance.current = map;
+    return () => { map.remove(); mapInstance.current = null; layerRef.current = null; };
+  }, [leafletAvailable]);
+
+  const draw = useCallback(() => {
+    const map = mapInstance.current, layer = layerRef.current;
+    if (!map || !layer) return;
+    layer.clearLayers();
+    const L = window.L;
+    const clusters = proCluster(visible, (p) => map.latLngToLayerPoint([p.lat, p.lon]), 54);
+    clusters.forEach((cl) => {
+      if (cl.items.length === 1) {
+        const c = cl.items[0];
+        L.circleMarker([c.lat, c.lon], { radius: 9, color: "#040707", weight: 2, fillColor: "#2dd4bf", fillOpacity: 1 }).bindPopup(() => proCatchPopup(c)).addTo(layer);
+      } else {
+        const n = cl.items.length;
+        const size = n > 99 ? 46 : n > 9 ? 40 : 34;
+        const icon = L.divIcon({ className: "", iconSize: [size, size], html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:#2dd4bf;color:#040707;border:3px solid rgba(4,7,7,.85);display:flex;align-items:center;justify-content:center;font:700 14px system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.5)">${n}</div>` });
+        const m = L.marker([cl.lat, cl.lon], { icon, keyboard: true, title: `${n} catches — zoom in` }).addTo(layer);
+        m.on("click", () => {
+          const b = L.latLngBounds(cl.items.map((c) => [c.lat, c.lon]));
+          if (b.isValid() && b.getSouthWest().distanceTo(b.getNorthEast()) > 30) map.fitBounds(b.pad(0.3), { maxZoom: 16 });
+          else map.setView([cl.lat, cl.lon], Math.min(17, map.getZoom() + 3));
+        });
+      }
+    });
+    setShown(visible.length);
+  }, [visible]);
+
+  useEffect(() => {
+    const map = mapInstance.current;
+    if (!map) return undefined;
+    draw();
+    map.on("zoomend moveend", draw);
+    return () => { map.off("zoomend moveend", draw); };
+  }, [draw]);
+
+  useEffect(() => {
+    const map = mapInstance.current;
+    if (!map || !visible.length) return;
+    setTimeout(() => map.invalidateSize(), 50);
+    const b = window.L.latLngBounds(visible.map((c) => [c.lat, c.lon]));
+    if (b.isValid()) map.fitBounds(b.pad(0.35), { maxZoom: 10 });
+  }, [visible]);
+
+  function nearMe() {
+    if (!navigator.geolocation || !mapInstance.current) return;
+    navigator.geolocation.getCurrentPosition((pos) => mapInstance.current && mapInstance.current.setView([pos.coords.latitude, pos.coords.longitude], 9), () => {}, { timeout: 8000 });
+  }
+
+  if (!leafletAvailable) {
+    return (
+      <CardShell title="CATCH MAP">
+        <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>The map needs the installed app to load — not available in this preview.</div>
+      </CardShell>
+    );
+  }
+
+  const empty = !error && all && all.length === 0;
+  return (
+    <CardShell title="CATCH MAP" subtitle="catches anglers chose to share — locations are blurred to about a kilometre">
+      {speciesChips.length > 0 && (
+        <div className="flex gap-2 overflow-x-auto tb-scroll pb-2" style={{ scrollbarWidth: "none" }}>
+          <ChipButton active={!filter} onClick={() => setFilter("")} label="All" />
+          {speciesChips.map((s) => <ChipButton key={s} active={filter === s} onClick={() => setFilter(filter === s ? "" : s)} label={s} />)}
+        </div>
+      )}
+      {error && <div className="tb-mono text-xs mb-2" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      <div className="relative">
+        <div ref={mapRef} style={{ height: 340, borderRadius: 12, overflow: "hidden" }} />
+        {empty && (
+          <div className="absolute inset-0 flex items-center justify-center text-center px-6 rounded-xl" style={{ background: "rgba(4,7,7,0.72)", zIndex: 500 }}>
+            <span className="text-[14px]" style={{ color: "var(--tb-text)" }}>No shared catch locations yet. Tick “Also show on the community map” when you log a catch to be the first.</span>
+          </div>
+        )}
+      </div>
+      <div className="flex items-center justify-between mt-2">
+        <span className="text-[13px]" style={{ color: "var(--tb-muted)" }}>{all ? `${shown} catch${shown === 1 ? "" : "es"} shown` : "Loading…"}</span>
+        <div className="flex gap-2">
+          <button onClick={nearMe} className="px-3 py-1.5 rounded-full text-[13px] font-bold" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>Near me</button>
+          <button onClick={load} aria-label="Refresh map" className="w-8 h-8 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}><RefreshCw size={13} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+      </div>
+    </CardShell>
+  );
+}
+// <<PRO-UI-END>>
+
 export default function TackleTracker() {
   const [view, setView] = useState("tackle"); // 'tackle' | 'conditions' | 'catches'
   const [items, setItems] = useState(null);
@@ -936,6 +2198,25 @@ export default function TackleTracker() {
     })();
   }, [catches]);
 
+  // Older catches that have a GPS tag get their weather filled in a few at a time, politely.
+  const condTried = useRef(new Set());
+  useEffect(() => {
+    if (!catches) return undefined;
+    const todo = catches.filter((c) => c.gps && c.dateTime && (!c.conditions || c.condKey !== proCondKey(c)) && !condTried.current.has(c.id)).slice(0, 4);
+    if (!todo.length) return undefined;
+    let off = false;
+    (async () => {
+      for (const c of todo) {
+        condTried.current.add(c.id);
+        if (off) return;
+        await attachConditions(c);
+        await new Promise((r) => setTimeout(r, 600));
+      }
+    })();
+    return () => { off = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catches === null]);
+
   function showToast(msg) {
     setToast(msg);
     clearTimeout(toastTimer.current);
@@ -954,12 +2235,25 @@ export default function TackleTracker() {
     setFormPrefill(null);
   }
 
+  // Attach the weather/moon/pressure at the moment of the catch (powers Insights). Runs in the background.
+  async function attachConditions(rec) {
+    try {
+      const saved = rec.gps ? null : await proReadSavedLocation();
+      const snap = await proSnapshotForCatch(rec, saved);
+      if (snap) setCatches((prev) => (prev ? prev.map((c) => (c.id === rec.id ? { ...c, conditions: snap, condKey: proCondKey(c) } : c)) : prev));
+    } catch (e) { /* offline — retried next time the app opens */ }
+  }
+
   function upsertCatch(record) {
+    const prior = (catches || []).find((c) => c.id === record.id);
+    const keep = prior && prior.conditions && prior.condKey === proCondKey(record) ? { conditions: prior.conditions, condKey: prior.condKey } : {};
+    const next = { ...record, ...keep };
     setCatches((prev) => {
-      const exists = prev.some((c) => c.id === record.id);
-      if (exists) return prev.map((c) => (c.id === record.id ? record : c));
-      return [record, ...prev];
+      const exists = prev.some((c) => c.id === next.id);
+      if (exists) return prev.map((c) => (c.id === next.id ? next : c));
+      return [next, ...prev];
     });
+    if (!keep.conditions) attachConditions(next);
     showToast(editingCatch ? "Catch updated" : "Catch logged");
     setShowCatchForm(false);
     setEditingCatch(null);
@@ -1208,7 +2502,7 @@ export default function TackleTracker() {
           </>
         )}
 
-        {view === "conditions" && <ConditionsView items={items || []} onQuickAdd={openQuickAdd} />}
+        {view === "conditions" && <ConditionsView items={items || []} catches={catches || []} onQuickAdd={openQuickAdd} />}
 
         {view === "catches" && (
           <CatchesView
@@ -1738,6 +3032,7 @@ function CatchesView({ catches, items, onEdit, onDelete, onToast }) {
 
   return (
     <div className="space-y-3">
+      <ProCatchHub catches={catches} />
       <div className="grid grid-cols-3 gap-2">
         <StatTile label="Total" value={catches.length} />
         <StatTile label="Top species" value={topSpecies ? topSpecies[0] : "—"} small />
@@ -1847,6 +3142,9 @@ function CatchRow({ record, onEdit, onDelete, isBest, onToast }) {
             <div className="tb-mono text-[11px] mt-1" style={{ color: "var(--tb-blue)" }}>
               {[record.lure, record.location].filter(Boolean).join(" · ")}
             </div>
+          )}
+          {record.conditions && (
+            <div className="text-[12px] mt-1" style={{ color: "var(--tb-muted)" }}>{proCondLine(record.conditions)}</div>
           )}
           {record.tripName && (
             <div className="text-[13px] mt-1 flex items-center gap-1.5" style={{ color: "var(--tb-brass)" }}><Calendar size={13} aria-hidden="true" /> {record.tripName}</div>
@@ -1967,7 +3265,8 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
       photo,
     });
     if (shareToCommunity && communityAvailable && window.communityAPI.ready) {
-      const fuzzed = shareApproxLocation && gps ? fuzzCoordinate(gps.lat, gps.lon, 0.5) : null;
+      const fuzzedRaw = shareApproxLocation && gps ? fuzzCoordinate(gps.lat, gps.lon, 0.5) : null;
+      const fuzzed = fuzzedRaw ? proSnapShared(fuzzedRaw.lat, fuzzedRaw.lon) : null;
       window.communityAPI.addCatch({
         species: species.trim(),
         length: length === "" ? null : Number(length),
@@ -2008,6 +3307,8 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
               ))}
             </div>
           )}
+
+          <ProSpeciesSuggest gps={gps} hasPhoto={!!photo} current={species} onPick={setSpecies} />
 
           <PhotoField photo={photo} onChange={setPhoto} label="Catch photo" />
 
@@ -2118,7 +3419,7 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
                 <label className="flex items-center gap-2.5 pl-6">
                   <input type="checkbox" checked={shareApproxLocation} onChange={(e) => setShareApproxLocation(e.target.checked)} className="w-4 h-4" />
                   <span className="text-xs tb-mono" style={{ color: "var(--tb-text)" }}>
-                    Also show on the community map <span style={{ color: "var(--tb-muted)" }}>(location fuzzed ~half a mile — your exact spot stays private)</span>
+                    Also show on the community map <span style={{ color: "var(--tb-muted)" }}>(location blurred to about a kilometre — your exact spot stays private)</span>
                   </span>
                 </label>
               )}
@@ -2139,7 +3440,7 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
 
 /* ---------------- Conditions (weather / tide / radar) ---------------- */
 
-function ConditionsView({ items = [], onQuickAdd }) {
+function ConditionsView({ items = [], catches = [], onQuickAdd }) {
   const [location, setLocation] = useState(null); // {name, lat, lon}
   const [locLoading, setLocLoading] = useState(true);
   const [showLocationPicker, setShowLocationPicker] = useState(false);
@@ -2303,9 +3604,8 @@ function ConditionsView({ items = [], onQuickAdd }) {
       </div>
 
       <WeatherCard weather={weather} loading={weatherLoading} error={weatherError} waterTemp={waterTemp} />
-      <TideCard tide={tide} loading={tideLoading} error={tideError} />
-      <BestBiteCard weather={weather} />
-      <RecommendationCard weather={weather} tide={tide} items={items} onQuickAdd={onQuickAdd} />
+      {!tideError && <TideCard tide={tide} loading={tideLoading} error={null} />}
+      <ProConditions location={location} items={items} catches={catches} onQuickAdd={onQuickAdd} noaaTideMissing={!!tideError && !tideLoading} />
       <RadarCard lat={location.lat} lon={location.lon} />
 
       {showLocationPicker && <LocationPicker onPick={(loc) => { saveLocation(loc); setShowLocationPicker(false); }} onClose={() => setShowLocationPicker(false)} onUseMyLocation={useMyLocation} />}
@@ -2348,56 +3648,6 @@ function WeatherCard({ weather, loading, error, waterTemp }) {
         {typeof waterTemp === "number" && (
           <StatRow icon={Waves} label="Water" value={fmtTemp(waterTemp)} />
         )}
-      </div>
-    </CardShell>
-  );
-}
-
-function BestBiteCard({ weather }) {
-  if (!weather || !weather.daily?.sunrise?.[0]) return null;
-
-  const now = new Date();
-  const moon = getMoonPhase(now);
-  const periods = getSolunarPeriods(weather.daily.sunrise[0], weather.daily.sunset[0], moon.ageDays);
-  if (!periods) return null;
-
-  const fmt = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  const isNowIn = (p) => now >= p.start && now <= p.end;
-  const activeNow = [...periods.majors, ...periods.minors].some(isNowIn);
-
-  // Fishing is traditionally considered best near new and full moons.
-  const nearKeyPhase = moon.ageDays < 2 || moon.ageDays > 27.5 || (moon.ageDays > 13.3 && moon.ageDays < 16.3);
-  const dayRating = nearKeyPhase ? "Great day" : "Fair day";
-
-  return (
-    <CardShell title="BEST BITE TIMES" subtitle="estimated solunar windows — not exact astronomy">
-      <div className="flex items-center gap-3 mb-3">
-        <span className="text-2xl">{moon.emoji}</span>
-        <div>
-          <div className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{moon.name}</div>
-          <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>
-            {moon.illumination}% lit · {dayRating}
-            {activeNow && <span style={{ color: "var(--tb-brass)" }}> · active now</span>}
-          </div>
-        </div>
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <div>
-          <div className="text-[14px] font-bold mb-1" style={{ color: "var(--tb-brass)" }}>Major (strongest)</div>
-          {periods.majors.map((p, i) => (
-            <div key={i} className="tb-mono text-xs" style={{ color: isNowIn(p) ? "var(--tb-brass)" : "var(--tb-text)" }}>
-              {fmt(p.start)}–{fmt(p.end)}
-            </div>
-          ))}
-        </div>
-        <div>
-          <div className="text-[14px] font-bold mb-1" style={{ color: "var(--tb-blue)" }}>Minor</div>
-          {periods.minors.map((p, i) => (
-            <div key={i} className="tb-mono text-xs" style={{ color: isNowIn(p) ? "var(--tb-brass)" : "var(--tb-text)" }}>
-              {fmt(p.start)}–{fmt(p.end)}
-            </div>
-          ))}
-        </div>
       </div>
     </CardShell>
   );
@@ -2448,56 +3698,6 @@ function TideCard({ tide, loading, error }) {
           })}
         </div>
       )}
-    </CardShell>
-  );
-}
-
-function RecommendationCard({ weather, tide, items, onQuickAdd }) {
-  if (!weather || !weather.current) return null;
-  const recs = buildRecommendations(weather, tide);
-  if (recs.length === 0) return null;
-
-  return (
-    <CardShell title="TACKLE PICK FOR NOW" subtitle="based on current weather, pressure, and tide">
-      <div>
-        {recs.map((rec, idx) => {
-          const matches = items.filter((i) => itemMatchesKeywords(i, rec.keywords));
-          return (
-            <div
-              key={rec.title}
-              style={{
-                borderTop: idx > 0 ? "1px solid var(--tb-line)" : "none",
-                paddingTop: idx > 0 ? "10px" : "0",
-                marginTop: idx > 0 ? "10px" : "0",
-              }}
-            >
-              <div className="text-sm font-semibold" style={{ color: "var(--tb-text)" }}>{rec.title}</div>
-              <div className="tb-mono text-[11px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{rec.reason}</div>
-              {matches.length > 0 ? (
-                <div className="flex flex-wrap gap-1.5 mt-2">
-                  {matches.slice(0, 4).map((m) => (
-                    <span
-                      key={m.id}
-                      className="tb-mono text-[10px] px-2 py-1 rounded-full"
-                      style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
-                    >
-                      {m.name}
-                    </span>
-                  ))}
-                </div>
-              ) : (
-                <button
-                  onClick={() => onQuickAdd && onQuickAdd(rec.keywords[0], "lures")}
-                  className="mt-2 text-[11px] tb-mono px-2.5 py-1 rounded-full"
-                  style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}
-                >
-                  + nothing in your box — add {rec.keywords[0]}
-                </button>
-              )}
-            </div>
-          );
-        })}
-      </div>
     </CardShell>
   );
 }
@@ -3772,7 +4972,7 @@ function CommunityView() {
       {sub === "feed" && <CommunityFeed onOpenProfile={setProfile} />}
       {sub === "chat" && <CommunityChat onOpenProfile={setProfile} />}
       {sub === "messages" && <MessagesView target={dmTarget} onOpen={setDmTarget} />}
-      {sub === "map" && <CommunityMap />}
+      {sub === "map" && <ProCommunityMap />}
       {sub === "spots" && <CommunitySpots onOpenProfile={setProfile} />}
       {sub === "leaderboard" && <CommunityLeaderboard />}
       {profile && (
@@ -4150,94 +5350,6 @@ function CommunityChat({ onOpenProfile }) {
           Send
         </button>
       </div>
-    </CardShell>
-  );
-}
-
-function CommunityMap() {
-  const mapRef = useRef(null);
-  const mapInstance = useRef(null);
-  const markersRef = useRef([]);
-  const [catches, setCatches] = useState(null);
-  const [error, setError] = useState(null);
-  const leafletAvailable = typeof window !== "undefined" && !!window.L;
-
-  const load = useCallback(async () => {
-    setError(null);
-    try {
-      const data = await window.communityAPI.listCatches(100);
-      setCatches(data.filter((c) => typeof c.lat === "number" && typeof c.lon === "number" && !isBlocked(c.uid)));
-    } catch (e) {
-      setError("Couldn't load the community map right now.");
-    }
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
-
-  useEffect(() => {
-    if (!leafletAvailable || !mapRef.current || mapInstance.current) return;
-    mapInstance.current = window.L.map(mapRef.current, { attributionControl: true }).setView([30, -20], 2);
-    window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: "© OpenStreetMap contributors",
-      maxZoom: 17,
-    }).addTo(mapInstance.current);
-    return () => {
-      if (mapInstance.current) {
-        mapInstance.current.remove();
-        mapInstance.current = null;
-      }
-    };
-  }, [leafletAvailable]);
-
-  useEffect(() => {
-    if (!mapInstance.current || !catches) return;
-    markersRef.current.forEach((m) => mapInstance.current.removeLayer(m));
-    markersRef.current = [];
-    if (catches.length === 0) return;
-
-    catches.forEach((c) => {
-      const marker = window.L.marker([c.lat, c.lon]).addTo(mapInstance.current);
-      const label = [c.species || "Catch", c.nickname ? `by ${c.nickname}` : null, c.weight ? `${c.weight} ${c.weightUnit}` : null]
-        .filter(Boolean)
-        .join(" — ");
-      marker.bindPopup(label);
-      markersRef.current.push(marker);
-    });
-
-    const group = window.L.featureGroup(markersRef.current);
-    mapInstance.current.fitBounds(group.getBounds().pad(0.4), { maxZoom: 10 });
-  }, [catches]);
-
-  if (!leafletAvailable) {
-    return (
-      <CardShell title="CATCH MAP">
-        <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>
-          The map needs the installed app to load — not available in this preview.
-        </div>
-      </CardShell>
-    );
-  }
-
-  return (
-    <CardShell title="CATCH MAP" subtitle="only catches with an approximate shared location appear here">
-      <div className="flex justify-end mb-2">
-        <button onClick={load} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
-          <RefreshCw size={13} style={{ color: "var(--tb-muted)" }} />
-        </button>
-      </div>
-      {error && <div className="tb-mono text-xs mb-2" style={{ color: "var(--tb-flare)" }}>{error}</div>}
-      {!error && catches && catches.length === 0 && (
-        <EmptyState text="No catches with a shared location yet — check the box for it next time you post one." />
-      )}
-      <div
-        ref={mapRef}
-        style={{
-          height: "320px",
-          borderRadius: "12px",
-          overflow: "hidden",
-          display: !error && catches && catches.length > 0 ? "block" : "none",
-        }}
-      />
     </CardShell>
   );
 }
