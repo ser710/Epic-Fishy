@@ -96,6 +96,17 @@ Either works fine — just keep the folder structure intact (icons stay in an
 Once that's live, reload the app and the Community tab will connect
 automatically — same for anyone else using the same hosted link.
 
+## Epic Fishy Pro (optional one-time unlock)
+
+The app is free. Pro (a one-time Google Play purchase, product ID
+`epic_fishy_pro`) adds the 4-day bite forecast beyond today, lure & bait picks
+and catch insights. It is **off by default**: the switch is `PRO_PAYWALL_ON` in
+`tackle-tracker.jsx` (currently `false`), so nothing is locked until it is set to
+`true` and the Play product exists. It only sells inside the Android app (Digital
+Goods API); the web version shows how to unlock it. Setup order: merchant account
+in Play Console, create the one-time product, rebuild the package with Play
+Billing enabled in PWABuilder, then flip the switch.
+
 ## What works offline vs. needs a connection
 
 - **Your tackle box data and catch log** (items, quantities, categories, logged

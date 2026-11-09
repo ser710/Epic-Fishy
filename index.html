@@ -1389,6 +1389,103 @@ function proEscape(s) {
 }
 // <<PRO-DATA-END>>
 
+// <<PRO-BILLING-START>>
+/* ======================================================================
+   Epic Fishy Pro — one-time unlock sold through Google Play Billing.
+   Works only inside the installed Android app (Digital Goods API); the web
+   version cannot sell it. Everything is OFF until PRO_PAYWALL_ON is true, so
+   shipping this code locks nothing. Flip it once the Play product exists.
+   ====================================================================== */
+const PRO_PAYWALL_ON = false;
+const PRO_SKU = "epic_fishy_pro";
+const PRO_BILLING_URL = "https://play.google.com/billing";
+const PRO_ENT_KEY = "entitlement";
+
+const proEnt = { unlocked: !PRO_PAYWALL_ON, supported: false, price: null, busy: false, error: null, listeners: new Set() };
+function proEntSet(patch) { Object.assign(proEnt, patch); proEnt.listeners.forEach((f) => f()); }
+function proEntCached() {
+  try { const o = JSON.parse(localStorage.getItem(PRO_PREFIX + PRO_ENT_KEY) || "null"); return !!(o && o.sku === PRO_SKU && o.v); } catch (e) { return false; }
+}
+function proEntStore(on) { try { if (on) localStorage.setItem(PRO_PREFIX + PRO_ENT_KEY, JSON.stringify({ sku: PRO_SKU, v: 1, t: Date.now() })); else localStorage.removeItem(PRO_PREFIX + PRO_ENT_KEY); } catch (e) { /* ignore */ } }
+
+async function proBillingService() {
+  if (typeof window === "undefined" || typeof window.getDigitalGoodsService !== "function") return null;
+  try { return await window.getDigitalGoodsService(PRO_BILLING_URL); } catch (e) { return null; }
+}
+
+// Ask Google Play what this person owns. Network/billing failures never take the unlock away.
+async function proBillingRefresh() {
+  if (!PRO_PAYWALL_ON) return;
+  if (proEntCached()) proEntSet({ unlocked: true });
+  const svc = await proBillingService();
+  if (!svc) return;
+  proEntSet({ supported: true });
+  try {
+    const [details, owned] = await Promise.all([svc.getDetails([PRO_SKU]).catch(() => []), svc.listPurchases()]);
+    const d = (details || [])[0];
+    if (d && d.price) proEntSet({ price: new Intl.NumberFormat(undefined, { style: "currency", currency: d.price.currency }).format(Number(d.price.value)) });
+    const has = (owned || []).some((x) => x.itemId === PRO_SKU);
+    proEntStore(has);
+    proEntSet({ unlocked: has });
+    for (const x of owned || []) if (x.itemId === PRO_SKU) svc.acknowledge(x.purchaseToken, "onetime").catch(() => {});
+  } catch (e) { /* keep whatever we had */ }
+}
+
+async function proBillingBuy() {
+  const svc = await proBillingService();
+  if (!svc) { proEntSet({ error: "Purchases work in the Epic Fishy app from Google Play." }); return; }
+  proEntSet({ busy: true, error: null });
+  try {
+    const req = new PaymentRequest([{ supportedMethods: PRO_BILLING_URL, data: { sku: PRO_SKU } }], { total: { label: "Total", amount: { currency: "USD", value: "0" } } });
+    const resp = await req.show();
+    const token = resp.details && resp.details.purchaseToken;
+    await resp.complete("success");
+    if (token) await svc.acknowledge(token, "onetime");
+    proEntStore(true);
+    proEntSet({ unlocked: true, busy: false });
+  } catch (e) {
+    proEntSet({ busy: false, error: e && e.name === "AbortError" ? null : "The purchase didn't go through. You haven't been charged." });
+  }
+}
+
+function useProEntitlement() {
+  const [, bump] = useState(0);
+  useEffect(() => {
+    const f = () => bump((n) => n + 1);
+    proEnt.listeners.add(f);
+    return () => { proEnt.listeners.delete(f); };
+  }, []);
+  return proEnt;
+}
+
+function ProLockCard({ title, children }) {
+  return (
+    <CardShell title={title}>
+      <div className="text-[14px] leading-snug" style={{ color: "var(--tb-muted)" }}>{children}</div>
+      <ProLockBox />
+    </CardShell>
+  );
+}
+function ProLockBox() {
+  const ent = useProEntitlement();
+  return (
+      <div className="mt-3 rounded-xl p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-brass)" }}>
+        <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>Epic Fishy Pro · {ent.price || "$3.50"} once</div>
+        <div className="text-[13px] mt-0.5" style={{ color: "var(--tb-muted)" }}>4-day bite forecast, lure picks and catch insights. Pay once, keep it.</div>
+        {ent.supported ? (
+          <div className="flex items-center gap-3 mt-2.5">
+            <button onClick={() => { haptic(); proBillingBuy(); }} disabled={ent.busy} className="px-4 py-2 rounded-xl text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)", opacity: ent.busy ? 0.6 : 1 }}>{ent.busy ? "Working…" : "Unlock Pro"}</button>
+            <button onClick={() => proBillingRefresh()} className="text-[13px] font-bold" style={{ color: "var(--tb-blue)" }}>Restore purchase</button>
+          </div>
+        ) : (
+          <div className="text-[13px] mt-2" style={{ color: "var(--tb-muted)" }}>Pro can be unlocked in the Epic Fishy app from Google Play.</div>
+        )}
+        {ent.error && <div className="text-[13px] mt-2" style={{ color: "var(--tb-flare)" }} role="alert">{ent.error}</div>}
+      </div>
+  );
+}
+// <<PRO-BILLING-END>>
+
 // <<PRO-UI-START>>
 /* ======================================================================
    Epic Fishy 2.2 — screens built on the live data layer
@@ -1491,6 +1588,7 @@ function proCondLine(c) {
 
 function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQuickAdd, refresh, loading }) {
   useUnits();
+  const ent = useProEntitlement();
   const [dayIdx, setDayIdx] = useState(0);
   const [selT, setSelT] = useState(null);
 
@@ -1512,9 +1610,10 @@ function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQ
   }
 
   const tz = st.fc.tz;
-  const day = model.days[Math.min(dayIdx, model.days.length - 1)];
+  const locked = dayIdx > 0 && !ent.unlocked;
+  const day = model.days[locked ? 0 : Math.min(dayIdx, model.days.length - 1)];
   const now = Date.now();
-  const isToday = dayIdx === 0;
+  const isToday = day === model.days[0];
   const nowHour = isToday ? day.hours.find((h) => now >= h.t && now < h.t + 3600000) : null;
   const bestHour = day.hours.reduce((b, h) => (!b || h.score > b.score ? h : b), null);
   const sel = (selT != null && day.hours.find((h) => h.t === selT)) || nowHour || bestHour;
@@ -1539,13 +1638,14 @@ function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQ
 
         <div className="flex gap-1 mt-1 mb-2">
           {model.days.map((d, i) => (
-            <button key={d.date} onClick={() => setDayIdx(i)} aria-pressed={i === dayIdx} className="flex-1 rounded-lg py-1.5 text-center" style={{ background: i === dayIdx ? "var(--tb-surface-2)" : "transparent", border: "1px solid " + (i === dayIdx ? "var(--tb-brass)" : "var(--tb-line)") }}>
+            <button key={d.date} onClick={() => setDayIdx(i)} aria-pressed={i === dayIdx} aria-label={i > 0 && !ent.unlocked ? `${proFmtDay(d.start, tz, { weekday: "long" })}, Pro` : undefined} className="flex-1 rounded-lg py-1.5 text-center" style={{ background: i === dayIdx ? "var(--tb-surface-2)" : "transparent", border: "1px solid " + (i === dayIdx ? "var(--tb-brass)" : "var(--tb-line)") }}>
               <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>{i === 0 ? "Today" : proFmtDay(d.start, tz, { weekday: "short" })}</div>
-              <div className="text-[15px] font-bold" style={{ color: d.best >= 65 ? "var(--tb-brass)" : "var(--tb-text)" }}>{d.best}</div>
+              <div className="text-[15px] font-bold" style={{ color: d.best >= 65 && (i === 0 || ent.unlocked) ? "var(--tb-brass)" : "var(--tb-text)" }}>{i > 0 && !ent.unlocked ? "🔒" : d.best}</div>
             </button>
           ))}
         </div>
 
+        {locked && <div className="rounded-lg px-3 py-2 mb-2 text-[14px]" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-brass)", color: "var(--tb-text)" }}>Days 2–4 are part of Epic Fishy Pro. Showing today.<ProLockBox /></div>}
         {headline && (
           <div className="flex items-end justify-between my-2">
             <div>
@@ -1652,7 +1752,9 @@ function ProLurePicks({ st, model, catches, items, onQuickAdd, nowHour }) {
     const precip48h = st.fc.hours.filter((h) => h.t > t - 48 * 3600000 && h.t <= t).reduce((s, h) => s + (h.precip || 0), 0);
     return proBuildPicks({ days: model, now: nowHour, items, catches, tideNext: next ? next.type : null, precip48h });
   }, [st, model, catches, items, nowHour]);
+  const ent = useProEntitlement();
   if (!picks.length) return null;
+  if (!ent.unlocked) return <ProLockCard title="WHAT TO THROW">Lure and bait picks matched to today's conditions, your tackle box and your own catch history.</ProLockCard>;
   return (
     <CardShell title="WHAT TO THROW" subtitle={`for ${model.profile.id === "generic" ? "general fishing" : model.profile.label.toLowerCase()} in today's conditions`}>
       <div>
@@ -1809,6 +1911,7 @@ function ProBars({ rows, max, labelW = 78 }) {
 }
 
 function ProCatchHub({ catches }) {
+  const ent = useProEntitlement();
   const [tab, setTab] = useState("life");
   const [open, setOpen] = proUsePersisted("hub-open", true);
   const saved = useSavedLocation();
@@ -1887,7 +1990,12 @@ function ProCatchHub({ catches }) {
           )}
         </div>
       )}
-      {open && tab === "insights" && (
+      {open && tab === "insights" && !ent.unlocked && (
+        <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Insights show when you catch fish, which barometer and moon phases work for you, and your best months.
+          <ProLockBox />
+        </div>
+      )}
+      {open && tab === "insights" && ent.unlocked && (
         <div className="space-y-4">
           {ins.total < 3 && <p className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Log a few more fish and patterns will show up here.</p>}
           <div>
@@ -2197,6 +2305,8 @@ export default function TackleTracker() {
       }
     })();
   }, [catches]);
+
+  useEffect(() => { proBillingRefresh(); }, []);
 
   // Older catches that have a GPS tag get their weather filled in a few at a time, politely.
   const condTried = useRef(new Set());
