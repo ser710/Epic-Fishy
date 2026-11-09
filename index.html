@@ -1471,7 +1471,7 @@ function ProLockBox() {
   return (
       <div className="mt-3 rounded-xl p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-brass)" }}>
         <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>Epic Fishy Pro · {ent.price || "$3.50"} once</div>
-        <div className="text-[13px] mt-0.5" style={{ color: "var(--tb-muted)" }}>Rank all your spots for today and tomorrow, every lure pick, and your full catch insights. Pay once, keep it.</div>
+        <div className="text-[13px] mt-0.5" style={{ color: "var(--tb-muted)" }}>Satellite, nautical-chart, sea-temperature and depth map layers, spot ranking for today and tomorrow, every lure pick, full catch insights, calendar reminders for your best windows, and GPX export. Pay once, keep it.</div>
         {ent.supported ? (
           <div className="flex items-center gap-3 mt-2.5">
             <button onClick={() => { haptic(); proBillingBuy(); }} disabled={ent.busy} className="px-4 py-2 rounded-xl text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)", opacity: ent.busy ? 0.6 : 1 }}>{ent.busy ? "Working…" : "Unlock Pro"}</button>
@@ -1485,6 +1485,53 @@ function ProLockBox() {
   );
 }
 // <<PRO-BILLING-END>>
+
+// <<PRO-EXTRAS-START>>
+/* ---------------- Pro extras: map layers, calendar reminders, GPX export ---------------- */
+
+function proDownload(filename, mime, text) {
+  try {
+    const url = URL.createObjectURL(new Blob([text], { type: mime }));
+    const a = document.createElement("a");
+    a.href = url; a.download = filename; a.rel = "noopener";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    return true;
+  } catch (e) { return false; }
+}
+const proXml = (v) => String(v == null ? "" : v).replace(/[<>&"']/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;" }[c]));
+
+function proGpx(points) {
+  const wpts = points.filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon)).map((p) =>
+    `  <wpt lat="${p.lat.toFixed(6)}" lon="${p.lon.toFixed(6)}"><name>${proXml(p.label)}</name><sym>${p.kind === "catch" ? "Fishing Area" : "Flag, Blue"}</sym></wpt>`);
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="Epic Fishy" xmlns="http://www.topografix.com/GPX/1/1">\n${wpts.join("\n")}\n</gpx>\n`;
+}
+
+// A calendar event (with a 30-minute alert) for one bite window. Opens in any calendar app.
+function proIcs(win, { title, place, score }) {
+  const z = (ms) => new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const esc = (t) => String(t).replace(/\\/g, "\\\\").replace(/;/g, "\;").replace(/,/g, "\\,").replace(/\n/g, "\\n");
+  return [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Epic Fishy//Bite window//EN", "CALSCALE:GREGORIAN", "BEGIN:VEVENT",
+    `UID:${win.start}-${Math.round(win.avg)}@epicfishy`, `DTSTAMP:${z(Date.now())}`, `DTSTART:${z(win.start)}`, `DTEND:${z(win.end)}`,
+    `SUMMARY:${esc(`Prime bite window${title ? " · " + title : ""} (${score})`)}`,
+    `DESCRIPTION:${esc("Predicted by Epic Fishy from light, moon, pressure, wind, sky, tide and water temperature. A guide, not a guarantee. " + APP_URL)}`,
+    place ? `LOCATION:${esc(place)}` : null,
+    "BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:Bite window starts in 30 minutes", "TRIGGER:-PT30M", "END:VALARM",
+    "END:VEVENT", "END:VCALENDAR",
+  ].filter(Boolean).join("\r\n") + "\r\n";
+}
+
+// Free, government/open map sources — each one checked to serve tiles.
+function proGibsDate() { return new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10); } // satellite products lag 1–2 days
+const PRO_MAP_LAYERS = [
+  { id: "sat", label: "Satellite", base: true, note: "US only · USGS imagery", make: (L) => L.tileLayer("https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}", { maxNativeZoom: 16, maxZoom: 18, attribution: "Imagery: USGS The National Map" }) },
+  { id: "chart", label: "Nautical chart", note: "US waters · NOAA · not for navigation", make: (L) => L.tileLayer.wms("https://gis.charttools.noaa.gov/arcgis/rest/services/MCS/NOAAChartDisplay/MapServer/exts/MaritimeChartService/WMSServer", { layers: "0,1,2,3,4,5,6,7", format: "image/png", transparent: true, version: "1.1.1", maxZoom: 18, attribution: "Charts: NOAA Chart Display Service" }) },
+  { id: "sst", label: "Sea temp", note: "worldwide · NASA satellite · 1–2 days old", make: (L) => L.tileLayer(`https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/GHRSST_L4_MUR_Sea_Surface_Temperature/default/${proGibsDate()}/GoogleMapsCompatible_Level7/{z}/{y}/{x}.png`, { maxNativeZoom: 7, maxZoom: 18, opacity: 0.7, attribution: "Sea temperature: NASA GIBS / GHRSST MUR" }) },
+  { id: "depth", label: "Ocean depth", note: "worldwide · coarse (~450 m) · not for navigation", make: (L) => L.tileLayer.wms("https://wms.gebco.net/mapserv?", { layers: "GEBCO_LATEST", format: "image/png", transparent: true, version: "1.1.1", opacity: 0.7, maxZoom: 18, attribution: "Depth: GEBCO" }) },
+  { id: "seamarks", label: "Seamarks", note: "buoys, lights, marinas · OpenSeaMap", make: (L) => L.tileLayer("https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png", { maxZoom: 18, attribution: "Seamarks: © OpenSeaMap contributors" }) },
+];
+// <<PRO-EXTRAS-END>>
 
 // <<PRO-UI-START>>
 /* ======================================================================
@@ -1586,8 +1633,10 @@ function proCondLine(c) {
 
 /* ---------------- bite forecast ---------------- */
 
-function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQuickAdd, refresh, loading }) {
+function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQuickAdd, refresh, loading, placeName }) {
   useUnits();
+  const ent = useProEntitlement();
+  const [remindLock, setRemindLock] = useState(false);
   const [dayIdx, setDayIdx] = useState(0);
   const [selT, setSelT] = useState(null);
 
@@ -1693,11 +1742,20 @@ function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQ
             <div className="text-[14px] font-bold mb-1" style={{ color: "var(--tb-text)" }}>Best windows</div>
             <div className="space-y-1">
               {day.windows.map((w, i) => (
-                <button key={i} onClick={() => setSelT(w.peak.t)} className="w-full flex items-center justify-between rounded-lg px-3 py-2 text-left" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
-                  <span className="tb-mono text-[14px] font-bold" style={{ color: "var(--tb-text)" }}>{proFmtTime(w.start, tz)} – {proFmtTime(w.end, tz)}</span>
-                  <span className="text-[13px] font-bold" style={{ color: BITE_COLORS[w.avg >= 80 ? "Excellent" : w.avg >= 65 ? "Good" : "Fair"] }}>{w.avg}</span>
-                </button>
+                <div key={i} className="flex items-stretch gap-1.5">
+                  <button onClick={() => setSelT(w.peak.t)} className="flex-1 min-w-0 flex items-center justify-between rounded-lg px-3 py-2 text-left" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>
+                    <span className="tb-mono text-[14px] font-bold" style={{ color: "var(--tb-text)" }}>{proFmtTime(w.start, tz)} – {proFmtTime(w.end, tz)}</span>
+                    <span className="text-[13px] font-bold" style={{ color: BITE_COLORS[w.avg >= 80 ? "Excellent" : w.avg >= 65 ? "Good" : "Fair"] }}>{w.avg}</span>
+                  </button>
+                  <button
+                    onClick={() => { haptic(); if (!ent.unlocked) { setRemindLock(true); return; } proDownload("epic-fishy-bite-window.ics", "text/calendar", proIcs(w, { title: model.profile.id === "generic" ? "" : model.profile.label, place: placeName, score: w.avg })); }}
+                    aria-label={`Add the ${proFmtTime(w.start, tz)} window to your calendar`}
+                    className="shrink-0 w-11 rounded-lg flex items-center justify-center text-[16px]"
+                    style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}
+                  >{ent.unlocked ? "🔔" : "🔒"}</button>
+                </div>
               ))}
+              {remindLock && !ent.unlocked && <div className="pt-1"><div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Calendar reminders for your best windows are part of Epic Fishy Pro.</div><ProLockBox /></div>}
             </div>
           </div>
         )}
@@ -1947,7 +2005,7 @@ function ProConditions({ location, items, catches, onQuickAdd, noaaTideMissing }
   const [target, setTarget] = proUsePersisted(PRO_TARGET_KEY, "");
   return (
     <>
-      <ProBiteForecast st={st} targetName={target} onTarget={setTarget} catches={catches} nearby={nearby.list} items={items} onQuickAdd={onQuickAdd} refresh={refresh} loading={st.status === "loading"} />
+      <ProBiteForecast placeName={location.name} st={st} targetName={target} onTarget={setTarget} catches={catches} nearby={nearby.list} items={items} onQuickAdd={onQuickAdd} refresh={refresh} loading={st.status === "loading"} />
       <ProSpotRanker catches={catches} targetName={target} />
       {noaaTideMissing && <ProModelTideCard st={st} />}
       <ProNearbySpecies nearby={nearby} place={st.status === "ok" ? st.place : null} catches={catches} onPick={setTarget} targetName={target} />
@@ -4195,11 +4253,16 @@ function WaypointsCard() {
 }
 
 function MyMapCard({ catches }) {
+  const ent = useProEntitlement();
   const mapRef = useRef(null);
   const mapInstance = useRef(null);
   const layerRef = useRef(null);
+  const osmRef = useRef(null);
+  const extraRef = useRef({});
   const [points, setPoints] = useState([]);
   const [filter, setFilter] = useState("all"); // all | catches | waypoints
+  const [active, setActive] = useState([]); // ids of Pro layers that are on
+  const [showLock, setShowLock] = useState(false);
   const leafletAvailable = typeof window !== "undefined" && !!window.L;
 
   useEffect(() => {
@@ -4227,11 +4290,41 @@ function MyMapCard({ catches }) {
   useEffect(() => {
     if (!leafletAvailable || !mapRef.current || mapInstance.current) return undefined;
     const map = window.L.map(mapRef.current, { attributionControl: true, zoomControl: false }).setView([39, -96], 3);
-    window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 18 }).addTo(map);
+    osmRef.current = window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 18 }).addTo(map);
     window.L.control.zoom({ position: "bottomright" }).addTo(map);
     mapInstance.current = map;
-    return () => { map.remove(); mapInstance.current = null; };
+    return () => { map.remove(); mapInstance.current = null; extraRef.current = {}; };
   }, [leafletAvailable]);
+
+  // Pro layers: satellite replaces the street map; the others draw on top.
+  useEffect(() => {
+    const map = mapInstance.current;
+    if (!map || !window.L) return;
+    const want = ent.unlocked ? active : [];
+    PRO_MAP_LAYERS.forEach((def, i) => {
+      const on = want.includes(def.id);
+      const have = extraRef.current[def.id];
+      if (on && !have) { const l = def.make(window.L); if (l.setZIndex) l.setZIndex(def.base ? 1 : 2 + i); l.addTo(map); extraRef.current[def.id] = l; }
+      if (!on && have) { map.removeLayer(have); delete extraRef.current[def.id]; }
+    });
+    const sat = want.includes("sat");
+    if (osmRef.current) { if (sat && map.hasLayer(osmRef.current)) map.removeLayer(osmRef.current); if (!sat && !map.hasLayer(osmRef.current)) osmRef.current.addTo(map); }
+    if (layerRef.current && layerRef.current.bringToFront) layerRef.current.bringToFront();
+  }, [active, ent.unlocked, leafletAvailable]);
+
+  function toggleLayer(id) {
+    haptic();
+    if (!ent.unlocked) { setShowLock(true); return; }
+    setActive((a) => (a.includes(id) ? a.filter((x) => x !== id) : [...a, id]));
+  }
+  function exportGpx() {
+    haptic();
+    if (!ent.unlocked) { setShowLock(true); return; }
+    const all = [];
+    for (const c of catches || []) if (c.gps && typeof c.gps.lat === "number") all.push({ kind: "catch", lat: c.gps.lat, lon: c.gps.lon, label: [c.species || "Catch", c.location || null].filter(Boolean).join(" · ") });
+    for (const w of points) all.push({ kind: "waypoint", lat: w.lat, lon: w.lon, label: w.name || "Waypoint" });
+    proDownload("epic-fishy-spots.gpx", "application/gpx+xml", proGpx(all));
+  }
 
   useEffect(() => {
     const map = mapInstance.current;
@@ -4250,6 +4343,7 @@ function MyMapCard({ catches }) {
     setTimeout(() => map.invalidateSize(), 50);
   }, [pins.length, filter, leafletAvailable]);
 
+
   const catchCount = (catches || []).filter((c) => c.gps).length;
   if (!leafletAvailable) return null;
 
@@ -4260,17 +4354,31 @@ function MyMapCard({ catches }) {
         <ChipButton active={filter === "catches"} onClick={() => setFilter("catches")} label={`Catches (${catchCount})`} />
         <ChipButton active={filter === "waypoints"} onClick={() => setFilter("waypoints")} label={`Waypoints (${points.length})`} />
       </div>
-      {pins.length === 0 ? (
-        <div className="px-4 pb-4">
-          <EmptyState text="Nothing to show yet. Log a catch with GPS or tap Log my location and it will appear here." />
+      <div className="px-4 pb-2 flex items-center gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }} role="group" aria-label="Map layers">
+        {PRO_MAP_LAYERS.map((d) => <ChipButton key={d.id} active={ent.unlocked && active.includes(d.id)} onClick={() => toggleLayer(d.id)} label={(ent.unlocked ? "" : "🔒 ") + d.label} />)}
+      </div>
+      {ent.unlocked && active.length > 0 && (
+        <div className="px-4 pb-2 text-[12px]" style={{ color: "var(--tb-muted)" }}>
+          {PRO_MAP_LAYERS.filter((d) => active.includes(d.id)).map((d) => `${d.label}: ${d.note}`).join(" · ")}
         </div>
-      ) : (
-        <div ref={mapRef} style={{ height: "300px" }} />
       )}
+      {ent.unlocked && active.includes("sst") && (
+        <div className="px-4 pb-2 flex items-center gap-2 text-[12px]" style={{ color: "var(--tb-muted)" }}>
+          <span>Colder</span><span className="flex-1 h-2 rounded-full" style={{ background: "linear-gradient(90deg,#2b3fb5,#2aa6d8,#3fc27a,#f0e04a,#f08a2a,#d6261c)" }} aria-hidden="true" /><span>Warmer</span>
+        </div>
+      )}
+      {showLock && !ent.unlocked && (
+        <div className="px-4 pb-3"><div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Satellite, NOAA nautical charts, sea-surface temperature, ocean depth and seamarks are part of Epic Fishy Pro.</div><ProLockBox /></div>
+      )}
+      {pins.length === 0 && (
+        <div className="px-4 pb-2 text-[13px]" style={{ color: "var(--tb-muted)" }}>Log a catch with GPS or tap Log my location and it will appear on the map.</div>
+      )}
+      <div ref={mapRef} style={{ height: "300px" }} />
       <div className="flex gap-4 px-4 py-2.5 text-[12px]" style={{ color: "var(--tb-muted)", borderTop: "1px solid var(--tb-line)" }}>
         <span className="flex items-center gap-1.5"><span className="inline-block w-3 h-3 rounded-full" style={{ background: "#2dd4bf" }} /> Catch</span>
         <span className="flex items-center gap-1.5"><span className="inline-block w-3 h-3 rounded-full" style={{ background: "#ff6f5e" }} /> Waypoint</span>
-        <span className="ml-auto">Private to this device</span>
+        <button onClick={exportGpx} className="ml-auto font-bold" style={{ color: "var(--tb-blue)" }}>{ent.unlocked ? "" : "🔒 "}Export GPX</button>
+        <span>Private to this device</span>
       </div>
     </CardShell>
   );
