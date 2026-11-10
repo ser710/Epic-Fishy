@@ -107,6 +107,13 @@ On the Tackle tab, tap **Scan** and take or pick a photo. Two ways to identify w
 
 Results are shown as a checklist; tap **Add** and items are merged into your box (quantities add up).
 
+## Identify a fish from a photo
+
+In **Log a catch**, add or take a photo and tap **Identify my photo**. With your own AI key you get up to three
+likely species, the visible features behind each guess, look-alikes and how to tell them apart, and a handling
+tip. Without a key, the free on-device model gives a rough guess from common species plus fish recorded near
+you. Tap **Use** and the species is filled in. It is a best guess, never a legal ruling; always check local rules.
+
 ## Smarter lure picks
 
 The picks score ~30 lure and bait styles against live conditions, the target species and your own catch
