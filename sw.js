@@ -1,4 +1,4 @@
-const CACHE_NAME = "tackle-box-v45";
+const CACHE_NAME = "tackle-box-v46";
 const TILE_CACHE = "epic-fishy-tiles-2"; // saved + recently viewed map tiles; never deleted on update
 const TILE_MAX = 1200;
 const PREFS_CACHE = "epic-fishy-prefs"; // small settings shared with the page (alert prefs); never deleted on update
