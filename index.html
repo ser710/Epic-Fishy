@@ -1894,10 +1894,13 @@ const NESSIE_FONTS = [
 const NESSIE_COLORS = [
   { id: "teal", label: "Teal", hex: "#2dd4bf" }, { id: "green", label: "Green", hex: "#4ade80" }, { id: "purple", label: "Purple", hex: "#a78bfa" },
   { id: "pink", label: "Pink", hex: "#f472b6" }, { id: "orange", label: "Orange", hex: "#fb923c" }, { id: "yellow", label: "Yellow", hex: "#facc15" },
+  { id: "red", label: "Red", hex: "#f87171" }, { id: "blue", label: "Blue", hex: "#38bdf8" }, { id: "lime", label: "Lime", hex: "#a3e635" },
+  { id: "magenta", label: "Magenta", hex: "#e879f9" }, { id: "indigo", label: "Indigo", hex: "#818cf8" }, { id: "white", label: "White", hex: "#f1f5f9" },
 ];
 const NESSIE_BUBBLES = [
   { id: "cream", label: "Cream", hex: "#fffdf2" }, { id: "yellow", label: "Yellow", hex: "#fde68a" }, { id: "pink", label: "Pink", hex: "#fbcfe8" },
   { id: "blue", label: "Blue", hex: "#bae6fd" }, { id: "mint", label: "Mint", hex: "#bbf7d0" },
+  { id: "lavender", label: "Lavender", hex: "#ddd6fe" }, { id: "peach", label: "Peach", hex: "#fed7aa" }, { id: "white", label: "White", hex: "#ffffff" },
 ];
 function nessieClean(o) {
   const p = Object.assign({}, NESSIE_DEFAULT, o && typeof o === "object" ? o : {});
@@ -3901,7 +3904,7 @@ export default function TackleTracker() {
         .tb-scroll::-webkit-scrollbar-thumb { background: var(--tb-line); border-radius: 4px; }
         .tb-waterline {
           height: 10px; opacity: 0.5; background-repeat: repeat-x; background-position: left center;
-          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='10' viewBox='0 0 40 10'%3E%3Cpath d='M0 5 Q10 0 20 5 T40 5' fill='none' stroke='%232dd4bf' stroke-width='1.5'/%3E%3C/svg%3E");
+          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='10' viewBox='0 0 40 10'%3E%3Cpath d='M0 5 Q10 0 20 5 T40 5' fill='none' stroke='%23${appLook.brass.slice(1)}' stroke-width='1.5'/%3E%3C/svg%3E");
         }
         input:focus, textarea:focus, select:focus { border-color: var(--tb-brass) !important; }
         button:focus-visible, a:focus-visible { outline: 2px solid var(--tb-blue); outline-offset: 2px; border-radius: 8px; }
@@ -7805,7 +7808,7 @@ function SettingsPanel({ onClose }) {
 
 // ---- Appearance (Settings → Appearance): theme, accent colour, text size and which tab opens first. Saved on this device. ----
 const APP_PREFS_KEY = "efapp:v1";
-const APP_PREFS_DEFAULT = { theme: "deep", accent: "teal", size: "normal", start: "tackle" };
+const APP_PREFS_DEFAULT = { theme: "deep", accent: "teal", custom: "#2dd4bf", size: "normal", start: "tackle" };
 const APP_THEMES = [
   { id: "deep", label: "Deep water", bg: "#040707", surface: "#0e1514", surface2: "#172321", line: "#234440", text: "#f6fbfa", muted: "#9db6b2" },
   { id: "midnight", label: "Midnight", bg: "#05070d", surface: "#0d1220", surface2: "#171e33", line: "#2a3558", text: "#f5f7fd", muted: "#a3add0" },
@@ -7821,14 +7824,39 @@ const APP_ACCENTS = [
   { id: "orange", label: "Orange", hex: "#fb923c", soft: "#fdba74", deep: "#c2410c" },
   { id: "pink", label: "Pink", hex: "#f472b6", soft: "#f9a8d4", deep: "#be185d" },
   { id: "purple", label: "Purple", hex: "#a78bfa", soft: "#c4b5fd", deep: "#6d28d9" },
+  { id: "red", label: "Red", hex: "#f87171", soft: "#fca5a5", deep: "#b91c1c" },
+  { id: "coral", label: "Coral", hex: "#ff8a7a", soft: "#ffb4a8", deep: "#c2412d" },
+  { id: "gold", label: "Gold", hex: "#e8b923", soft: "#f3d671", deep: "#8a6a00" },
+  { id: "lime", label: "Lime", hex: "#a3e635", soft: "#bef264", deep: "#4d7c0f" },
+  { id: "mint", label: "Mint", hex: "#6ee7b7", soft: "#a7f3d0", deep: "#047857" },
+  { id: "cyan", label: "Cyan", hex: "#22d3ee", soft: "#67e8f9", deep: "#0e7490" },
+  { id: "sky", label: "Sky", hex: "#7cc4ff", soft: "#b3dcff", deep: "#1d5fa8" },
+  { id: "indigo", label: "Indigo", hex: "#818cf8", soft: "#a5b4fc", deep: "#4338ca" },
+  { id: "magenta", label: "Magenta", hex: "#e879f9", soft: "#f0abfc", deep: "#a21caf" },
+  { id: "rose", label: "Rose", hex: "#fb7185", soft: "#fda4af", deep: "#be123c" },
+  { id: "silver", label: "Silver", hex: "#cbd5e1", soft: "#e2e8f0", deep: "#475569" },
 ];
+// Any colour at all: mixes toward white/black to get the link tint and the dark variant the light theme needs.
+function appMix(hex, to, amt) {
+  const n = parseInt(hex.slice(1), 16), t = parseInt(to.slice(1), 16);
+  const ch = (sh) => Math.round(((n >> sh) & 255) * (1 - amt) + ((t >> sh) & 255) * amt);
+  return "#" + [16, 8, 0].map((sh) => ch(sh).toString(16).padStart(2, "0")).join("");
+}
+function appLuma(hex) { const n = parseInt(hex.slice(1), 16); return (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255; }
+function appCustomAccent(hex) {
+  const src = /^#[0-9a-f]{6}$/i.test(hex || "") ? hex.toLowerCase() : "#2dd4bf";
+  let h = src; for (let i = 0; i < 8 && appLuma(h) < 0.3; i++) h = appMix(h, "#ffffff", 0.15); // too dark to read on the dark themes: lift it
+  let deep = src; for (let i = 0; i < 12 && appLuma(deep) > 0.33; i++) deep = appMix(deep, "#000000", 0.1);
+  return { id: "custom", label: "Custom", hex: h, soft: appMix(h, "#ffffff", 0.35), deep };
+}
 const APP_SIZES = [{ id: "normal", label: "Normal", zoom: 1 }, { id: "large", label: "Large", zoom: 1.12 }, { id: "xl", label: "Extra large", zoom: 1.25 }];
 const APP_STARTS = ["tackle", "conditions", "catches", "spots", "community"];
 function appPrefsClean(o) {
   const p = Object.assign({}, APP_PREFS_DEFAULT, o && typeof o === "object" ? o : {});
   return {
     theme: APP_THEMES.some((t) => t.id === p.theme) ? p.theme : "deep",
-    accent: APP_ACCENTS.some((t) => t.id === p.accent) ? p.accent : "teal",
+    accent: p.accent === "custom" || APP_ACCENTS.some((t) => t.id === p.accent) ? p.accent : "teal",
+    custom: /^#[0-9a-f]{6}$/i.test(p.custom || "") ? p.custom.toLowerCase() : "#2dd4bf",
     size: APP_SIZES.some((t) => t.id === p.size) ? p.size : "normal",
     start: APP_STARTS.includes(p.start) ? p.start : "tackle",
   };
@@ -7848,10 +7876,10 @@ function useAppPrefs() {
 const appHexRgb = (hex) => { const n = parseInt(hex.slice(1), 16); return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`; };
 function appThemeVars(p) {
   const t = APP_THEMES.find((x) => x.id === p.theme) || APP_THEMES[0];
-  const a = APP_ACCENTS.find((x) => x.id === p.accent) || APP_ACCENTS[0];
+  const a = p.accent === "custom" ? appCustomAccent(p.custom) : APP_ACCENTS.find((x) => x.id === p.accent) || APP_ACCENTS[0];
   const brass = t.light ? a.deep : a.hex;
   return {
-    theme: t, accent: a, zoom: (APP_SIZES.find((x) => x.id === p.size) || APP_SIZES[0]).zoom,
+    theme: t, accent: a, brass, zoom: (APP_SIZES.find((x) => x.id === p.size) || APP_SIZES[0]).zoom,
     css: `--tb-bg:${t.bg};--tb-bg-rgb:${appHexRgb(t.bg)};--tb-surface:${t.surface};--tb-surface-2:${t.surface2};--tb-line:${t.line};--tb-brass:${brass};--tb-accent-rgb:${appHexRgb(brass)};--tb-brass-dim:${a.deep};--tb-flare:${t.light ? "#c2331f" : "#ff6f5e"};--tb-text:${t.text};--tb-muted:${t.muted};--tb-blue:${t.light ? a.deep : a.soft};`,
   };
 }
@@ -7877,7 +7905,12 @@ function AppearanceCard() {
             {p.accent === c.id && <span style={{ color: "#0b1413", fontWeight: 900, fontSize: 16 }}>✓</span>}
           </button>
         ))}
+        <label title="Pick any color" className="relative w-10 h-10 rounded-full flex items-center justify-center overflow-hidden" style={{ background: p.accent === "custom" ? p.custom : "conic-gradient(#f87171,#facc15,#4ade80,#22d3ee,#818cf8,#e879f9,#f87171)", border: "3px solid " + (p.accent === "custom" ? "var(--tb-text)" : "transparent"), boxShadow: "0 0 0 1px var(--tb-line)" }}>
+          <span aria-hidden="true" style={{ color: "#0b1413", fontWeight: 900, fontSize: 18, lineHeight: 1 }}>{p.accent === "custom" ? "✓" : "+"}</span>
+          <input type="color" aria-label="Pick any accent color" value={p.custom} onChange={(e) => appPrefsSet({ accent: "custom", custom: e.target.value })} onClick={() => appPrefsSet({ accent: "custom" })} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }} />
+        </label>
       </div>
+      <div className="text-[12px] mt-1.5" style={{ color: "var(--tb-muted)" }}>Tap the rainbow circle to pick any color you like.</div>
       <Label>Text size</Label>
       <div className="flex gap-2">
         {APP_SIZES.map((z) => <button key={z.id} onClick={() => { haptic(); appPrefsSet({ size: z.id }); }} aria-pressed={p.size === z.id} className="flex-1 rounded-xl px-2 py-2.5 font-bold" style={{ ...pill(p.size === z.id), fontSize: 13 * z.zoom }}>{z.label}</button>)}
