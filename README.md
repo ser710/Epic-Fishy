@@ -123,6 +123,15 @@ you. Tap **Use** and the species is filled in. It is a best guess, never a legal
   many catches fell in the best third of their day (chance is about 33%). Needs 5+ catches to show a result; small samples are noisy.
 - **Offline maps** (Spots tab, My map): "Save this view for offline" stores up to 150 map tiles for the area and two zoom levels closer. Tiles you view are also kept (up to 1,200) so the map still works with no signal.
 
+## Add to home screen (iPhone and Android)
+
+Opened in a browser, the app shows a "Get app" button in the header and a
+one-time banner. On Android Chrome it triggers the browser's own install
+prompt. On iPhone it opens a step-by-step sheet (Share, Add to Home Screen,
+Add), with separate wording for Chrome on iOS and for in-app browsers such
+as Instagram that can't add icons. Both are hidden once the app runs from
+the home screen or from the Play Store version.
+
 ## Today's call and Explore nearby
 
 - **Today's call** (top of Conditions) turns the bite forecast into one
