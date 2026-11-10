@@ -2350,7 +2350,6 @@ export default function TackleTracker() {
   const [saveError, setSaveError] = useState(false);
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
-  const touchStart = useRef(null);
   const safety = useSafetyAlerts();
   const [updateReady, setUpdateReady] = useState(false);
 
@@ -2372,35 +2371,6 @@ export default function TackleTracker() {
     }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
-
-  function handleTouchStart(e) {
-    const overlayOpen = showForm || showCatchForm || showSettings || activeCategory;
-    if (overlayOpen) {
-      touchStart.current = null;
-      return;
-    }
-    const t = e.touches[0];
-    touchStart.current = { x: t.clientX, y: t.clientY };
-  }
-
-  function handleTouchEnd(e) {
-    if (!touchStart.current) return;
-    const t = e.changedTouches[0];
-    const dx = t.clientX - touchStart.current.x;
-    const dy = t.clientY - touchStart.current.y;
-    touchStart.current = null;
-
-    // Mostly-horizontal, deliberate swipes only — ignore scrolls and taps.
-    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
-
-    const idx = MAIN_VIEWS.indexOf(view);
-    if (idx === -1) return;
-    if (dx < 0 && idx < MAIN_VIEWS.length - 1) {
-      setView(MAIN_VIEWS[idx + 1]);
-    } else if (dx > 0 && idx > 0) {
-      setView(MAIN_VIEWS[idx - 1]);
-    }
-  }
 
   const [catches, setCatches] = useState(null);
   const [showCatchForm, setShowCatchForm] = useState(false);
@@ -2660,8 +2630,6 @@ export default function TackleTracker() {
       <main
         className="flex-1 min-h-0 overflow-y-auto tb-scroll px-4 pt-5"
         style={{ paddingBottom: "calc(112px + env(safe-area-inset-bottom, 0px))", overscrollBehaviorY: "contain" }}
-        onTouchStart={handleTouchStart}
-        onTouchEnd={handleTouchEnd}
       >
         <div className="mb-5">
           <h1 className="tb-stencil text-[44px] leading-[0.95]" style={{ color: "var(--tb-text)" }}>{meta.title}</h1>
