@@ -96,6 +96,29 @@ Either works fine — just keep the folder structure intact (icons stay in an
 Once that's live, reload the app and the Community tab will connect
 automatically — same for anyone else using the same hosted link.
 
+## Scan tackle with your camera
+
+On the Tackle tab, tap **Scan** and take or pick a photo. Two ways to identify what's in it:
+
+- **Your own AI** (best): paste an API key from Anthropic, OpenAI or Google in Settings. The photo goes
+  straight from the phone to that provider; there is no Epic Fishy server and the key never leaves the device.
+  You pay the provider's normal usage cost (a few cents per photo at most).
+- **On-device (free)**: a small open image model runs in the browser (downloaded once). Less detailed.
+
+Results are shown as a checklist; tap **Add** and items are merged into your box (quantities add up).
+
+## Smarter lure picks
+
+The picks score ~30 lure and bait styles against live conditions, the target species and your own catch
+history, then map them onto what's in your box and list what to buy (hooks, weights, trailers) with colours,
+depth, retrieve, rod and line for each pick.
+
+## Maps and data sources
+
+Base map: CARTO Voyager, with automatic fallback to OpenStreetMap tiles. Water temperature uses the nearest
+NOAA CO-OPS sensor station within 25 miles when available (labelled "measured"), else the Open-Meteo ocean
+model, else an air-temperature estimate (labelled "est.").
+
 ## Epic Fishy Pro (optional one-time unlock)
 
 The app is free, including the full 4-day bite forecast, the first lure pick,

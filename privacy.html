@@ -23,7 +23,7 @@
 <body>
 <main>
   <h1>Epic Fishy — Privacy Policy</h1>
-  <div class="meta">Last updated: November 8, 2026 · Epic Fishy is made by Epic Stuff, Things &amp; Co</div>
+  <div class="meta">Last updated: November 10, 2026 · Epic Fishy is made by Epic Stuff, Things &amp; Co</div>
 
   <p>Epic Fishy is a fishing app that helps you organize tackle, check conditions, log catches, and (optionally) share with other anglers. This policy explains what information the app handles and why. We do not sell your data, show ads, or use analytics or tracking tools.</p>
 
@@ -48,11 +48,14 @@
   <table>
     <tr><th>Service</th><th>Used for</th></tr>
     <tr><td>Open-Meteo</td><td>Weather, bite forecast, water temperature, tide model, and the weather on the day of a past catch (the time and coordinates of a GPS-tagged catch are sent to look it up)</td></tr>
-    <tr><td>NOAA Tides &amp; Currents</td><td>Tide predictions (U.S.)</td></tr>
+    <tr><td>NOAA Tides &amp; Currents</td><td>Tide predictions and measured water temperature from the nearest sensor station (U.S.)</td></tr>
     <tr><td>iNaturalist</td><td>Fish species recorded near you, with photos. Your location is rounded to roughly 10 km before it is sent.</td></tr>
     <tr><td>BigDataCloud</td><td>Country and region name for the "local rules" link (location rounded to roughly 1 km)</td></tr>
-    <tr><td>OpenStreetMap (Overpass API and map tiles)</td><td>Nearby waters, marinas, and the Community map</td></tr>
+    <tr><td>OpenStreetMap (Overpass API and map tiles)</td><td>Nearby waters and marinas, and a backup source of map tiles</td></tr>
+    <tr><td>CARTO</td><td>The base street map on My map and the Community map. Your device requests map tiles for the area on screen.</td></tr>
     <tr><td>USGS, NOAA, NASA GIBS, GEBCO, OpenSeaMap</td><td>Optional Pro map layers (satellite, nautical charts, sea temperature, ocean depth, seamarks). Your device requests map tiles for the area on screen, so the visible map area is sent to these services when you turn a layer on.</td></tr>
+    <tr><td>Your own AI provider (Anthropic, OpenAI or Google) &mdash; optional</td><td>Only if you turn on tackle scanning and paste in your own API key. The photo you choose to scan is sent straight from your device to the provider you picked, using your key, and is covered by that provider's terms. Epic Fishy has no server in between and never sees your key or the photo. The key is stored only on your device.</td></tr>
+    <tr><td>jsDelivr and Hugging Face</td><td>Only if you use the free on-device scan option: the app downloads an open image-recognition model once. Your photo is analysed on your device and is not uploaded.</td></tr>
     <tr><td>RainViewer</td><td>Weather radar</td></tr>
     <tr><td>National Weather Service (weather.gov)</td><td>Severe-weather alerts for your saved location (U.S.)</td></tr>
     <tr><td>Google Play Billing</td><td>The optional one-time Epic Fishy Pro purchase in the Android app. Google handles payment; the app only learns whether Pro is owned and never sees your card or payment details.</td></tr>
