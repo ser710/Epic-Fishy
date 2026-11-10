@@ -1868,7 +1868,7 @@ function AiScanCard() {
   }
   function remove() { proAiSet(null); setKey(""); setMsg({ ok: true, t: "Key removed from this device." }); }
   return (
-    <CardShell title="TACKLE SCAN: YOUR OWN AI" subtitle="Photograph tackle and have your own AI name it and log it">
+    <CardShell title="YOUR OWN AI: TACKLE SCAN & FISH ID" subtitle="Photograph tackle or a fish and have your own AI name it">
       <div className="space-y-3">
         <Field label="AI provider">
           <select value={provider} onChange={(e) => pick(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle}>
@@ -2010,6 +2010,159 @@ function ScanTackleSheet({ onClose, onAdd, onOpenSettings }) {
   );
 }
 // <<PRO-SCAN-END>>
+
+// <<PRO-FISHID-START>>
+/* ---------------- Fish ID: photo of a fish -> likely species -> the catch form ----------------
+   Same two engines as the tackle scan: your own AI key (best, explains why and names look-alikes) or the free
+   on-device model (a rough guess from a list of common species plus what's been recorded near you). */
+const PRO_FISH_BASE = [
+  "Largemouth bass", "Smallmouth bass", "Spotted bass", "White bass", "Striped bass", "Black crappie", "White crappie", "Bluegill",
+  "Redear sunfish", "Green sunfish", "Pumpkinseed", "Warmouth", "Yellow perch", "Walleye", "Northern pike", "Muskellunge", "Chain pickerel",
+  "Channel catfish", "Blue catfish", "Flathead catfish", "Bullhead catfish", "Common carp", "Grass carp", "Longnose gar", "Bowfin",
+  "Rainbow trout", "Brown trout", "Brook trout", "Lake trout", "Cutthroat trout", "Chinook salmon", "Coho salmon", "Atlantic salmon",
+  "Redfish (red drum)", "Spotted seatrout", "Snook", "Tarpon", "Southern flounder", "Black drum", "Sheepshead", "Mangrove snapper", "Red snapper",
+  "Gag grouper", "Mahi-mahi", "Bonefish", "Permit", "Jack crevalle", "Spanish mackerel", "King mackerel", "Bluefish", "Florida pompano", "Cobia",
+];
+const PRO_FISH_PROMPT = (nearby) => `You are helping an angler identify a fish from a photo so they can log the catch.
+Look at body shape, mouth, fins, scales, colour pattern, markings and any visible spots or bars.
+${nearby && nearby.length ? `Fish recorded near the angler (use as a hint only, not a limit): ${nearby.slice(0, 25).join(", ")}.` : ""}
+Give up to 3 candidate species, most likely first. For each:
+- "name": common name
+- "scientific": scientific name
+- "confidence": 0 to 1, honest (use 0.5 or lower when the photo is unclear or the fish is partly hidden)
+- "features": one sentence naming the specific visible features that support this species
+- "lookalikes": up to 2 similar species and one short phrase on how to tell them apart
+- "tip": one short handling or measuring tip for this species (for example spiny fins, sharp gill plates, how to hold it)
+If the photo does not show a fish, return an empty list and say why in "note". Do not state regulations, size limits or whether the fish is legal to keep. Tell the angler to check local rules in "note" only when the species is commonly regulated or easily confused with a protected one.
+Reply with ONLY JSON, no other text: {"fish":[...],"note":"one short sentence"}`;
+function proParseFish(text) {
+  let t = String(text || "").trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a < 0 || b <= a) throw new Error("no json");
+  const j = JSON.parse(t.slice(a, b + 1));
+  const clean = (v, n) => String(v == null ? "" : v).replace(/\s+/g, " ").trim().slice(0, n);
+  const fish = (Array.isArray(j.fish) ? j.fish : []).slice(0, 3).map((f) => ({
+    name: clean(f.name, 60), scientific: clean(f.scientific, 70), features: clean(f.features, 220), tip: clean(f.tip, 160),
+    confidence: typeof f.confidence === "number" ? Math.max(0, Math.min(1, f.confidence)) : null,
+    lookalikes: (Array.isArray(f.lookalikes) ? f.lookalikes : []).slice(0, 2).map((l) => clean(typeof l === "string" ? l : (l && (l.name ? l.name + (l.difference ? ": " + l.difference : "") : "")) || "", 140)).filter(Boolean),
+  })).filter((f) => f.name);
+  return { fish, note: clean(j.note, 200) };
+}
+async function proFishOnDevice(dataUrl, nearby, onProgress) {
+  if (!proClipPromise) {
+    proClipPromise = (async () => {
+      const tf = await proDynImport("https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2");
+      tf.env.allowLocalModels = false;
+      return tf.pipeline("zero-shot-image-classification", "Xenova/clip-vit-base-patch32", { progress_callback: onProgress });
+    })().catch((e) => { proClipPromise = null; throw e; });
+  }
+  const clf = await proClipPromise;
+  const names = [...new Set([...(nearby || []).slice(0, 25), ...PRO_FISH_BASE])].slice(0, 70);
+  const out = await clf(dataUrl, names.map((n) => `a photo of a ${n}, a fish`));
+  const top = out.slice().sort((a, b) => b.score - a.score).slice(0, 3);
+  return {
+    fish: top.map((o) => ({ name: names[out.findIndex((x) => x.label === o.label)] || o.label, scientific: "", features: "On-device guess from the overall look. Add your own AI key in Settings for a reasoned answer.", tip: "", lookalikes: [], confidence: o.score })),
+    note: "",
+  };
+}
+
+function FishIdPanel({ photo, nearbyNames, onPhoto, onPick }) {
+  const ent = useProEntitlement();
+  const cfg = proAiGet();
+  const [engine, setEngine] = useState(cfg ? "ai" : "device");
+  const [stage, setStage] = useState("idle"); // idle | busy | done
+  const [busyMsg, setBusyMsg] = useState("");
+  const [error, setError] = useState(null);
+  const [res, setRes] = useState(null);
+  const camRef = useRef(null);
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+
+  async function run(dataUrl) {
+    setError(null); setStage("busy"); setRes(null);
+    try {
+      let r;
+      if (engine === "ai" && cfg) {
+        setBusyMsg(`Asking ${AI_PROVIDERS[cfg.provider].label.split(" ")[0]}...`);
+        const text = await proAiCall(cfg, { prompt: PRO_FISH_PROMPT(nearbyNames), imageDataUrl: dataUrl, maxTokens: 900 });
+        try { r = proParseFish(text); } catch (x) { throw Object.assign(new Error("parse"), { parse: true }); }
+      } else {
+        setBusyMsg("Loading the on-device model (first time only, about 90 MB)...");
+        r = await proFishOnDevice(dataUrl, nearbyNames, (p) => { if (p && p.status === "progress" && typeof p.progress === "number") setBusyMsg(`Downloading the on-device model... ${Math.round(p.progress)}%`); });
+      }
+      if (!r.fish.length) { setError(r.note || "I couldn't see a fish in that photo. Try a clear side-on shot with the whole fish in frame."); setStage("idle"); return; }
+      setRes(r); setStage("done");
+    } catch (x) {
+      setError(x && x.parse ? "The AI's answer wasn't readable. Try again." : engine === "ai" && cfg ? proAiErrorText(x, cfg) : "Couldn't load the on-device model. Check your connection (it downloads once, then works offline).");
+      setStage("idle");
+    }
+  }
+  async function onFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setStage("busy"); setBusyMsg("Preparing photo...");
+    try {
+      const big = await compressImage(file, 1280, 0.82);
+      const thumb = await compressImage(file, 640, 0.62);
+      if (onPhoto) onPhoto(thumb);
+      await run(big);
+    } catch (x) { setError("Couldn't read that photo. Try another."); setStage("idle"); }
+  }
+  if (!ent.unlocked) {
+    return (
+      <div className="rounded-xl p-3" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+        <div className="text-[14px] font-bold" style={{ color: "var(--tb-text)" }}>Identify fish from a photo</div>
+        <div className="text-[13px] mt-0.5" style={{ color: "var(--tb-muted)" }}>Part of Epic Fishy Pro.</div>
+        <ProLockBox />
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-xl p-3" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+      <input ref={camRef} type="file" accept="image/*" capture="environment" onChange={onFile} className="hidden" />
+      <div className="flex items-center gap-2 mb-2">
+        <Fish size={16} style={{ color: "var(--tb-brass)" }} />
+        <div className="text-[14px] font-bold" style={{ color: "var(--tb-text)" }}>Identify this fish</div>
+      </div>
+      <div className="flex gap-2 mb-2" role="group" aria-label="Recognition engine">
+        <ChipButton active={engine === "ai"} onClick={() => { if (cfg) { setEngine("ai"); setError(null); } else setError("To use your own AI, save a key first: close this form, open Settings (gear icon) and find \"Your own AI\". Your free on-device option works now."); }} label={cfg ? `${AI_PROVIDERS[cfg.provider].label.split(" ")[0]} (best)` : "Your AI (set up)"} />
+        <ChipButton active={engine === "device"} onClick={() => { setEngine("device"); setError(null); }} label="On-device (free)" />
+      </div>
+      {stage === "busy" ? (
+        <div className="flex items-center gap-2 text-sm rounded-lg py-3 px-3" style={inputStyle}><RefreshCw size={15} className="tb-spin" style={{ color: "var(--tb-muted)" }} /><span style={{ color: "var(--tb-muted)" }}>{busyMsg}</span></div>
+      ) : (
+        <div className="grid grid-cols-2 gap-2">
+          <button type="button" onClick={() => photo && run(photo)} disabled={!photo} className="py-2.5 rounded-xl text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)", opacity: photo ? 1 : 0.45 }}>Identify my photo</button>
+          <button type="button" onClick={() => camRef.current && camRef.current.click()} className="py-2.5 rounded-xl text-[14px] font-bold flex items-center justify-center gap-2" style={{ ...inputStyle, color: "var(--tb-text)" }}><Camera size={16} /> Take new photo</button>
+        </div>
+      )}
+      {!photo && stage !== "busy" && <div className="text-[12px] mt-2" style={{ color: "var(--tb-muted)" }}>Add a catch photo below, or take one here. A clear side-on shot of the whole fish works best.</div>}
+      {error && <div role="alert" className="mt-2 text-[13px]" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      {res && stage === "done" && (
+        <div className="mt-3 space-y-2">
+          {res.fish.map((f, i) => (
+            <div key={f.name + i} className="rounded-lg p-2.5" style={{ background: "var(--tb-bg)", border: `1px solid ${i === 0 ? "var(--tb-brass)" : "var(--tb-line)"}` }}>
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{f.name}</div>
+                  {f.scientific && <div className="text-[12px] italic" style={{ color: "var(--tb-muted)" }}>{f.scientific}</div>}
+                </div>
+                {typeof f.confidence === "number" && <div className="text-[12px] tb-mono shrink-0" style={{ color: f.confidence >= 0.7 ? "var(--tb-brass)" : "var(--tb-muted)" }}>{Math.round(f.confidence * 100)}% sure</div>}
+              </div>
+              {f.features && <div className="text-[13px] mt-1" style={{ color: "var(--tb-muted)" }}>{f.features}</div>}
+              {f.lookalikes.length > 0 && <div className="text-[12px] mt-1" style={{ color: "var(--tb-muted)" }}><strong style={{ color: "var(--tb-text)" }}>Easily mixed up with:</strong> {f.lookalikes.join(" · ")}</div>}
+              {f.tip && <div className="text-[12px] mt-1" style={{ color: "var(--tb-muted)" }}><strong style={{ color: "var(--tb-text)" }}>Handling:</strong> {f.tip}</div>}
+              <button type="button" onClick={() => { haptic(); onPick(f.name); setStage("idle"); setRes(null); }} className="mt-2 px-3 py-1.5 rounded-lg text-[13px] font-bold" style={{ background: i === 0 ? "var(--tb-brass)" : "var(--tb-surface-2)", color: i === 0 ? "var(--tb-bg)" : "var(--tb-text)" }}>Use {f.name}</button>
+            </div>
+          ))}
+          {res.note && <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>{res.note}</div>}
+          <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>A best guess from a photo, not a guarantee. Check local rules before keeping a fish you aren't sure about.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+// <<PRO-FISHID-END>>
 
 // <<PRO-EXTRAS-START>>
 /* ---------------- Pro extras: map layers, calendar reminders, GPX export ---------------- */
@@ -4057,6 +4210,9 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
   const [shareToCommunity, setShareToCommunity] = useState(false);
   const [shareApproxLocation, setShareApproxLocation] = useState(false);
   const communityAvailable = typeof window !== "undefined" && window.communityAPI && window.communityAPI.configured;
+  const savedLoc = useSavedLocation();
+  const nearbyForId = useProNearbySpecies(gps ? gps.lat : savedLoc ? savedLoc.lat : null, gps ? gps.lon : savedLoc ? savedLoc.lon : null);
+  const fishNearby = useMemo(() => (nearbyForId.list || []).map((x) => x.name), [nearbyForId.list]);
 
   const captureGps = useCallback(() => {
     if (!navigator.geolocation) {
@@ -4144,6 +4300,8 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
           <ProSpeciesSuggest gps={gps} hasPhoto={!!photo} current={species} onPick={setSpecies} />
 
           <PhotoField photo={photo} onChange={setPhoto} label="Catch photo" />
+
+          <FishIdPanel photo={photo} nearbyNames={fishNearby} onPhoto={setPhoto} onPick={setSpecies} />
 
           <div className="grid grid-cols-2 gap-3">
             <Field label="Length">
