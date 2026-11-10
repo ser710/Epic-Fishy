@@ -123,6 +123,18 @@ you. Tap **Use** and the species is filled in. It is a best guess, never a legal
   many catches fell in the best third of their day (chance is about 33%). Needs 5+ catches to show a result; small samples are noisy.
 - **Offline maps** (Spots tab, My map): "Save this view for offline" stores up to 150 map tiles for the area and two zoom levels closer. Tiles you view are also kept (up to 1,200) so the map still works with no signal.
 
+## Today's call and Explore nearby
+
+- **Today's call** (top of Conditions) turns the bite forecast into one
+  verdict: go now, or the next window with a countdown, whether the bite is
+  building or fading, the top lure, and warnings for thunderstorms, strong
+  gusts, heat, cold or an approaching front in the next few hours.
+- **Explore nearby** (top of Spots) shows named lakes and rivers, fishing
+  spots and piers, boat ramps, bait and tackle shops and marinas from
+  OpenStreetMap on a map and in a filterable list, with directions and
+  one-tap "save as waypoint". It asks several public Overpass mirrors and
+  keeps results on the device for a week.
+
 ## Smarter lure picks
 
 The picks score ~30 lure and bait styles against live conditions, the target species and your own catch
