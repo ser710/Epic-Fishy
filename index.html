@@ -723,6 +723,52 @@ async function proCached(key, maxAgeMs, loader) {
   }
 }
 
+// Overpass (OpenStreetMap query service) is volunteer-run and often slow or rate-limited, so we
+// ask several public mirrors, staggered, and take the first good answer. Nearby waters and
+// marinas barely change, so results are cached for a week (and shown stale if every mirror is down).
+const PRO_OVERPASS_MIRRORS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://lz4.overpass-api.de/api/interpreter",
+];
+function proOverpassFetch(query, timeoutMs = 20000, staggerMs = 2500) {
+  return new Promise((resolve, reject) => {
+    const ctls = [];
+    const timers = [];
+    let done = false, failed = 0;
+    const finish = (fn, v) => {
+      if (done) return;
+      done = true;
+      timers.forEach(clearTimeout);
+      ctls.forEach((c) => { try { c.abort(); } catch (e) { /* ignore */ } });
+      fn(v);
+    };
+    const oneFailed = (e) => { failed += 1; if (failed >= PRO_OVERPASS_MIRRORS.length) finish(reject, e || new Error("overpass unavailable")); };
+    PRO_OVERPASS_MIRRORS.forEach((url, i) => {
+      timers.push(setTimeout(async () => {
+        if (done) return;
+        const ctl = new AbortController();
+        ctls.push(ctl);
+        const killer = setTimeout(() => ctl.abort(), timeoutMs);
+        try {
+          const res = await fetch(url, { method: "POST", body: query, signal: ctl.signal });
+          if (!res.ok) throw new Error("overpass " + res.status);
+          const data = await res.json();
+          if (!data || !Array.isArray(data.elements)) throw new Error("overpass bad reply");
+          if (data.elements.length === 0 && data.remark) throw new Error("overpass runtime error");
+          finish(resolve, data);
+        } catch (e) {
+          oneFailed(e);
+        } finally { clearTimeout(killer); }
+      }, i * staggerMs));
+    });
+  });
+}
+function proLoadOverpass(kind, lat, lon, query) {
+  return proCached(`op:${kind}:${lat.toFixed(2)},${lon.toFixed(2)}`, 7 * 86400000, () => proOverpassFetch(query));
+}
+
 // "2026-11-08T14:00" in the SPOT's local time → real UTC milliseconds.
 function proLocalToMs(iso, offSec) {
   const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso || "");
@@ -3926,7 +3972,7 @@ function BottomNav({ view, onChange }) {
             key={id}
             onClick={() => onChange(id)}
             aria-current={active ? "page" : undefined}
-            className="flex-1 relative flex flex-col items-center justify-center gap-1 pt-2.5 pb-2 min-h-[64px] active:opacity-60"
+            className="flex-1 min-w-0 relative flex flex-col items-center justify-center gap-1 pt-2.5 pb-2 px-0.5 min-h-[64px] active:opacity-60"
           >
             {active && (
               <span
@@ -3935,7 +3981,7 @@ function BottomNav({ view, onChange }) {
               />
             )}
             <Icon size={24} strokeWidth={active ? 2.4 : 1.8} style={{ color: active ? "var(--tb-brass)" : "var(--tb-muted)" }} />
-            <span className="text-[12px] font-bold leading-none whitespace-nowrap" style={{ color: active ? "var(--tb-text)" : "var(--tb-muted)" }}>{label}</span>
+            <span className="text-[11px] font-bold leading-none whitespace-nowrap max-w-full truncate" style={{ color: active ? "var(--tb-text)" : "var(--tb-muted)" }}>{label}</span>
           </button>
         );
       })}
@@ -5471,12 +5517,7 @@ function SpotsView({ catches }) {
     setNearbyError(null);
     try {
       const query = `[out:json][timeout:25];(node["leisure"="fishing"](around:24000,${lat},${lon});way["leisure"="fishing"](around:24000,${lat},${lon});way["natural"="water"](around:24000,${lat},${lon});way["waterway"="river"](around:24000,${lat},${lon}););out center 60;`;
-      const res = await fetch("https://overpass-api.de/api/interpreter", {
-        method: "POST",
-        body: query,
-      });
-      if (!res.ok) throw new Error("overpass request failed");
-      const data = await res.json();
+      const { data } = await proLoadOverpass("n", lat, lon, query);
       const seen = new Set();
       const spots = [];
       for (const el of data.elements || []) {
@@ -5491,7 +5532,7 @@ function SpotsView({ catches }) {
       spots.sort((a, b) => a.distance - b.distance);
       setNearby(spots.slice(0, 10));
     } catch (e) {
-      setNearbyError("Couldn't reach map data right now — try again in a bit.");
+      setNearbyError("The OpenStreetMap servers are busy right now — tap the refresh arrow to try again in a minute.");
     } finally {
       setNearbyLoading(false);
     }
@@ -5506,12 +5547,7 @@ function SpotsView({ catches }) {
     setMarinasError(null);
     try {
       const query = `[out:json][timeout:25];(node["leisure"="marina"](around:40000,${lat},${lon});way["leisure"="marina"](around:40000,${lat},${lon}););out center 20;`;
-      const res = await fetch("https://overpass-api.de/api/interpreter", {
-        method: "POST",
-        body: query,
-      });
-      if (!res.ok) throw new Error("overpass request failed");
-      const data = await res.json();
+      const { data } = await proLoadOverpass("m", lat, lon, query);
       const seen = new Set();
       const found = [];
       for (const el of data.elements || []) {
@@ -5543,7 +5579,7 @@ function SpotsView({ catches }) {
       );
       setMarinas(withTemps);
     } catch (e) {
-      setMarinasError("Couldn't reach map data right now — try again in a bit.");
+      setMarinasError("The OpenStreetMap servers are busy right now — tap the refresh arrow to try again in a minute.");
     } finally {
       setMarinasLoading(false);
     }
