@@ -1387,6 +1387,116 @@ function proBuildDays(fc, marine, targetName, measured) {
   return { days, profile, waterF, waterSource, waterStation, hasTide: !!tides };
 }
 
+// "Today's call": one plain-English verdict built from the scored hours — go now, or when to go,
+// whether the bite is building or fading, and anything in the next few hours that should change plans.
+function proTodayCall(model, nowMs) {
+  if (!model || !model.days || !model.days.length) return null;
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const all = [];
+  model.days.forEach((d, di) => d.hours.forEach((h) => all.push({ ...h, di })));
+  const cur = all.find((h) => now >= h.t && now < h.t + 3600000) || null;
+  const ahead = all.filter((h) => h.t > now).slice(0, 3);
+  let trend = null;
+  if (cur && ahead.length >= 2) {
+    const nxt = (ahead[0].score + ahead[1].score) / 2;
+    trend = nxt - cur.score >= 5 ? "building" : nxt - cur.score <= -5 ? "fading" : "holding";
+  }
+  // windows still to come (today first, then tomorrow), soonest first
+  const wins = [];
+  model.days.slice(0, 2).forEach((d, di) => d.windows.forEach((w) => { if (w.end > now + 15 * 60000) wins.push({ ...w, di }); }));
+  wins.sort((a, b) => a.start - b.start);
+  const inWin = wins.find((w) => now >= w.start && now < w.end) || null;
+  const next = wins.find((w) => w.start > now) || null;
+  let verdict, tone;
+  if (cur && (inWin || cur.score >= 72)) { verdict = "go"; tone = "good"; }
+  else if (next && next.di === 0) { verdict = "wait"; tone = next.avg >= 65 ? "good" : "mid"; }
+  else if (next) { verdict = "tomorrow"; tone = "mid"; }
+  else { verdict = "slow"; tone = "low"; }
+  // hazards in the next 8 hours
+  const soon = all.filter((h) => h.t + 3600000 > now && h.t < now + 8 * 3600000);
+  const hazards = [];
+  const storm = soon.find((h) => h.hour && [95, 96, 99].includes(h.hour.code));
+  if (storm) hazards.push({ id: "storm", level: "high", t: storm.t, text: "Thunderstorms possible" });
+  const gustH = soon.reduce((b, h) => (h.hour && typeof h.hour.gust === "number" && (!b || h.hour.gust > b.hour.gust) ? h : b), null);
+  if (gustH && gustH.hour.gust >= 25) hazards.push({ id: "gust", level: gustH.hour.gust >= 35 ? "high" : "mid", t: gustH.t, gust: gustH.hour.gust, text: "Strong gusts" });
+  if (!storm) { const rain = soon.find((h) => h.hour && typeof h.hour.pop === "number" && h.hour.pop >= 60); if (rain) hazards.push({ id: "rain", level: "low", t: rain.t, pop: rain.hour.pop, text: "Rain likely" }); }
+  const hot = soon.find((h) => h.hour && typeof h.hour.temp === "number" && h.hour.temp >= 95);
+  if (hot) hazards.push({ id: "heat", level: "mid", t: hot.t, text: "Dangerous heat" });
+  const cold = soon.find((h) => h.hour && typeof h.hour.temp === "number" && h.hour.temp <= 34);
+  if (cold) hazards.push({ id: "cold", level: "mid", t: cold.t, text: "Near freezing" });
+  // a front: pressure that has been falling turns and climbs fast in the next 18 h
+  const later = all.filter((h) => h.t > now && h.t < now + 18 * 3600000);
+  const fallingNow = cur && typeof cur.pd === "number" && cur.pd <= -0.6;
+  const front = later.find((h) => typeof h.pd === "number" && h.pd >= 1.5);
+  const frontInfo = front && (fallingNow || later.some((h) => h.t < front.t && typeof h.pd === "number" && h.pd <= -0.8)) ? { t: front.t } : null;
+  // best day of the outlook
+  let bestDay = null;
+  model.days.forEach((d, di) => { const top = d.windows[0]; const v = top ? top.avg : d.best; if (!bestDay || v > bestDay.score + 3) bestDay = { di, start: d.start, score: v, window: top || null }; });
+  return { now: cur, trend, verdict, tone, inWin, next, hazards, front: frontInfo, bestDay };
+}
+function proCountdown(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60), r = m % 60;
+  return r >= 5 ? `${h} h ${r} min` : `${h} h`;
+}
+
+/* ---------------- nearby places (OpenStreetMap) ---------------- */
+const PRO_NEARBY_KINDS = [
+  { id: "water", label: "Lakes & rivers", color: "#38bdf8" },
+  { id: "fishing", label: "Fishing spots", color: "#2dd4bf" },
+  { id: "ramp", label: "Boat ramps", color: "#fbbf24" },
+  { id: "bait", label: "Bait & tackle", color: "#f472b6" },
+  { id: "marina", label: "Marinas", color: "#a78bfa" },
+];
+function proNearbyQuery(lat, lon) {
+  const a = `(around:24000,${lat},${lon})`, w = `(around:12000,${lat},${lon})`, m = `(around:40000,${lat},${lon})`;
+  return `[out:json][timeout:25];` +
+    `(nwr["leisure"="fishing"]${a};nwr["man_made"="pier"]["fishing"="yes"]${a};nwr["leisure"="slipway"]${a};nwr["shop"="fishing"]${a};nwr["leisure"="marina"]${m};);out tags center 400;` +
+    `(way["natural"="water"]["name"]${w};relation["natural"="water"]["name"]${w};);out tags center 400;` +
+    `(way["waterway"="river"]["name"]${a};);out tags center 120;`;
+}
+function proParseNearby(data, lat, lon) {
+  const best = new Map();
+  for (const el of (data && data.elements) || []) {
+    const la = el.lat != null ? el.lat : el.center && el.center.lat;
+    const lo = el.lon != null ? el.lon : el.center && el.center.lon;
+    const t = el.tags || {};
+    if (la == null || lo == null) continue;
+    if (t.access === "private" || t.access === "no") continue;
+    let kind, type;
+    if (t.shop === "fishing") { kind = "bait"; type = "Bait & tackle shop"; }
+    else if (t.leisure === "marina") { kind = "marina"; type = "Marina"; }
+    else if (t.leisure === "slipway") { kind = "ramp"; type = "Boat ramp"; }
+    else if (t.man_made === "pier") { kind = "fishing"; type = "Fishing pier"; }
+    else if (t.leisure === "fishing") { kind = "fishing"; type = "Fishing spot"; }
+    else if (t.waterway === "river") { kind = "water"; type = "River"; }
+    else if (t.natural === "water") { kind = "water"; type = t.water === "pond" ? "Pond" : t.water === "reservoir" ? "Reservoir" : t.water === "river" ? "River" : t.water === "lagoon" ? "Lagoon" : "Lake"; }
+    else continue;
+    const name = typeof t.name === "string" && t.name.trim() ? t.name.trim().slice(0, 80) : null;
+    if (!name && (kind === "water" || kind === "marina" || kind === "bait")) continue;
+    const distance = haversineMiles(lat, lon, la, lo);
+    const key = name ? `${kind}|${name.toLowerCase()}` : `${kind}|${la.toFixed(3)},${lo.toFixed(3)}`;
+    const prev = best.get(key);
+    if (prev && prev.distance <= distance) continue;
+    const it = { key, kind, type, name, lat: +la.toFixed(5), lon: +lo.toFixed(5), distance: Math.round(distance * 100) / 100 };
+    if (t.fee === "yes") it.fee = "fee"; else if (t.fee === "no") it.fee = "free";
+    if (typeof t.opening_hours === "string" && t.opening_hours.length <= 40) it.hours = t.opening_hours;
+    const web = t.website || t["contact:website"];
+    if (typeof web === "string" && /^https?:\/\//i.test(web) && web.length < 200) it.web = web;
+    best.set(key, it);
+  }
+  const out = [];
+  for (const k of PRO_NEARBY_KINDS) {
+    out.push(...[...best.values()].filter((x) => x.kind === k.id).sort((a, b) => a.distance - b.distance).slice(0, k.id === "water" ? 40 : 25));
+  }
+  return out.sort((a, b) => a.distance - b.distance);
+}
+function proLoadNearbyPlaces(lat, lon, force) {
+  // force = the refresh button: go to the network even if the saved copy is fresh, but keep the saved copy if that fails.
+  return proCached(`nb2:${lat.toFixed(2)},${lon.toFixed(2)}`, force ? -1 : 7 * 86400000, async () => proParseNearby(await proOverpassFetch(proNearbyQuery(lat, lon), 25000), lat, lon));
+}
+
 /* ---------------- lure / bait picks ---------------- */
 function proTrendOf(pd) { return typeof pd !== "number" ? null : pd <= -0.6 ? "falling" : pd >= 0.6 ? "rising" : "steady"; }
 
@@ -3001,12 +3111,109 @@ function ProNearbySpecies({ nearby, place, catches, onPick, targetName }) {
 
 /* ---------------- container for the Conditions tab ---------------- */
 
+function ProTodayCall({ st, targetName, items, catches }) {
+  useUnits();
+  const [, setTick] = useState(0);
+  useEffect(() => { const id = setInterval(() => setTick((t) => t + 1), 60000); return () => clearInterval(id); }, []);
+  const model = useMemo(() => {
+    if (st.status !== "ok") return null;
+    try { return proBuildDays(st.fc, st.marine, targetName, st.measured); } catch (e) { return null; }
+  }, [st, targetName]);
+  if (st.status === "loading" && !model) return <div className="tb-skeleton" style={{ height: 172, order: -1 }} aria-label="Loading today's call" />;
+  if (!model) return null;
+  const now = Date.now();
+  const call = proTodayCall(model, now);
+  if (!call) return null;
+  const tz = st.fc.tz;
+  const hr = (ms) => proFmtTime(ms, tz, { hour: "numeric", minute: undefined });
+  const span = (w) => `${hr(w.start)} – ${hr(w.end)}`;
+  const score = call.now ? call.now.score : call.next ? call.next.avg : model.days[0].best;
+  const col = call.tone === "good" ? "var(--tb-brass)" : call.tone === "mid" ? "#fbbf24" : "var(--tb-muted)";
+  let title, line;
+  if (call.verdict === "go") {
+    title = "Go now";
+    line = call.inWin ? `The bite is on until about ${hr(call.inWin.end)}.` : `${call.now.label} bite right now.${call.next && call.next.di === 0 && call.next.avg > call.now.score + 4 ? ` Even better ${span(call.next)} (${call.next.avg}).` : ""}`;
+  } else if (call.verdict === "wait") {
+    title = `Best shot ${span(call.next)}`;
+    line = `Starts in ${proCountdown(call.next.start - now)} · expect a ${call.next.peak.label.toLowerCase()} bite (${call.next.avg}).`;
+  } else if (call.verdict === "tomorrow") {
+    title = "Today's best is behind you";
+    line = `Next good window: tomorrow ${span(call.next)} (${call.next.avg}).`;
+  } else {
+    title = "Slow going";
+    line = "No strong window in the next two days. Fish slow and deep, or pick another day.";
+  }
+  const trendWord = call.trend === "building" ? "Building" : call.trend === "fading" ? "Fading" : call.trend === "holding" ? "Holding steady" : null;
+  const TrendI = call.trend === "building" ? TrendingUp : call.trend === "fading" ? TrendingDown : null;
+  let lure = null;
+  try {
+    const ext = st.marine ? proTideExtrema(st.marine) : null;
+    const nx = ext ? ext.find((e) => e.t > now) : null;
+    const top = proBuildPlan({ days: model, now: call.now, items, catches, tideNext: nx ? nx.type : null, precip48h: 0 }).top;
+    lure = top && top[0] ? top[0].title : null;
+  } catch (e) { lure = null; }
+  const hazText = (h) => h.id === "storm" ? `Thunderstorms possible around ${hr(h.t)}. Be off the water before then.`
+    : h.id === "gust" ? `Gusts to ${fmtSpeed(h.gust)} around ${hr(h.t)}. Rough for kayaks and small boats.`
+    : h.id === "rain" ? `Rain likely from ${hr(h.t)} (${Math.round(h.pop)}%).`
+    : h.id === "heat" ? `Dangerous heat by ${hr(h.t)}. Bring more water than you think you need.`
+    : `Near freezing around ${hr(h.t)}. Dress for it.`;
+  const C = 2 * Math.PI * 34;
+  const waterNote = model.waterSource === "measured" ? "measured" : model.waterSource === "model" ? "sea model" : "estimated from air temps";
+  const best = call.bestDay;
+  return (
+    <section className="rounded-2xl overflow-hidden relative" style={{ order: -1, background: "linear-gradient(145deg, rgba(45,212,191,0.16), var(--tb-surface) 55%)", border: "1px solid var(--tb-line)" }} aria-label="Today's call">
+      <div className="p-4 flex items-center gap-4">
+        <div className="relative shrink-0" style={{ width: 84, height: 84 }}>
+          <svg width="84" height="84" viewBox="0 0 84 84" aria-hidden="true">
+            <circle cx="42" cy="42" r="34" fill="none" stroke="var(--tb-surface-2)" strokeWidth="8" />
+            <circle cx="42" cy="42" r="34" fill="none" stroke={col} strokeWidth="8" strokeLinecap="round" strokeDasharray={`${(C * Math.max(4, score)) / 100} ${C}`} transform="rotate(-90 42 42)" style={{ transition: "stroke-dasharray .6s ease" }} />
+          </svg>
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <div className="tb-stencil text-[28px] leading-none" style={{ color: "var(--tb-text)" }}>{score}</div>
+            <div className="text-[10px] font-bold mt-0.5" style={{ color: "var(--tb-muted)" }}>{call.now ? "NOW" : "PEAK"}</div>
+          </div>
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-[12px] font-bold tracking-wide" style={{ color: col }}>TODAY'S CALL{model.profile.id !== "generic" ? ` · ${model.profile.label.toUpperCase()}` : ""}</div>
+          <div className="text-[21px] font-bold leading-tight mt-0.5" style={{ color: "var(--tb-text)" }}>{title}</div>
+          <div className="text-[14px] leading-snug mt-1" style={{ color: "var(--tb-muted)" }}>{line}</div>
+        </div>
+      </div>
+      <div className="px-4 pb-3 flex flex-wrap gap-x-4 gap-y-1.5 text-[13px]" style={{ color: "var(--tb-text)" }}>
+        {trendWord && <span className="inline-flex items-center gap-1">{TrendI && <TrendI size={14} style={{ color: col }} />}{trendWord}</span>}
+        {lure && <span className="inline-flex items-center gap-1"><Fish size={14} style={{ color: "var(--tb-brass)" }} />Throw: {lure}</span>}
+        {typeof model.waterF === "number" && <span className="inline-flex items-center gap-1"><Waves size={14} style={{ color: "var(--tb-brass)" }} />Water {fmtTemp(model.waterF)} <span style={{ color: "var(--tb-muted)" }}>({waterNote})</span></span>}
+      </div>
+      {(call.hazards.length > 0 || call.front) && (
+        <div className="px-4 pb-3 space-y-1.5">
+          {call.hazards.map((h) => (
+            <div key={h.id} className="flex items-start gap-2 rounded-lg px-3 py-2 text-[13px] leading-snug" style={{ background: h.level === "high" ? "rgba(255,111,94,0.14)" : "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+              <AlertTriangle size={15} className="shrink-0 mt-0.5" style={{ color: h.level === "low" ? "var(--tb-muted)" : "var(--tb-flare)" }} /><span>{hazText(h)}</span>
+            </div>
+          ))}
+          {call.front && (
+            <div className="flex items-start gap-2 rounded-lg px-3 py-2 text-[13px] leading-snug" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+              <Gauge size={15} className="shrink-0 mt-0.5" style={{ color: "var(--tb-brass)" }} /><span>A front passes around {hr(call.front.t)}. Fish ahead of it; the bite usually drops off for a day after.</span>
+            </div>
+          )}
+        </div>
+      )}
+      {best && best.di > 0 && best.window && (
+        <div className="px-4 py-2.5 text-[13px]" style={{ borderTop: "1px solid var(--tb-line)", color: "var(--tb-muted)" }}>
+          Best day ahead: <strong style={{ color: "var(--tb-text)" }}>{best.di === 1 ? "tomorrow" : proFmtDay(best.start, tz, { weekday: "long", month: undefined, day: undefined })}</strong>, {span(best.window)} ({best.score})
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ProConditions({ location, items, catches, onQuickAdd, noaaTideMissing }) {
   const [st, refresh] = useProForecast(location.lat, location.lon);
   const nearby = useProNearbySpecies(location.lat, location.lon);
   const [target, setTarget] = proUsePersisted(PRO_TARGET_KEY, "");
   return (
     <>
+      <ProTodayCall st={st} targetName={target} items={items} catches={catches} />
       <ProBiteForecast placeName={location.name} st={st} targetName={target} onTarget={setTarget} catches={catches} nearby={nearby.list} items={items} onQuickAdd={onQuickAdd} refresh={refresh} loading={st.status === "loading"} />
       <ProSpotRanker catches={catches} targetName={target} />
       {noaaTideMissing && <ProModelTideCard st={st} />}
@@ -3654,6 +3861,8 @@ export default function TackleTracker() {
         @keyframes tb-fade-in { from { opacity: 0; } to { opacity: 1; } }
         @keyframes tb-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes tb-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+        @keyframes tb-view-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .tb-view { animation: tb-view-in 0.26s cubic-bezier(.2,.8,.3,1); }
         .tb-tray { animation: tb-slide-up 0.28s cubic-bezier(.2,.8,.3,1); }
         .tb-overlay { animation: tb-fade-in 0.2s ease; }
         .tb-toast { animation: tb-fade-in 0.15s ease; }
@@ -3664,7 +3873,7 @@ export default function TackleTracker() {
           background-size: 200% 100%; animation: tb-shimmer 1.6s linear infinite;
         }
         @media (prefers-reduced-motion: reduce) {
-          .tb-tray, .tb-overlay, .tb-toast, .tb-skeleton { animation: none !important; }
+          .tb-tray, .tb-overlay, .tb-toast, .tb-skeleton, .tb-view { animation: none !important; }
           .tb-spin { animation-duration: 3s; }
         }
       `}</style>
@@ -3693,6 +3902,7 @@ export default function TackleTracker() {
         className="flex-1 min-h-0 overflow-y-auto tb-scroll px-4 pt-5"
         style={{ paddingBottom: "calc(112px + env(safe-area-inset-bottom, 0px))", overscrollBehaviorY: "contain" }}
       >
+        <div key={view} className="tb-view">
         <div className="mb-5">
           <h1 className="tb-stencil text-[44px] leading-[0.95]" style={{ color: "var(--tb-text)" }}>{meta.title}</h1>
           <p className="text-[15px] mt-1.5 min-h-[22px]" style={{ color: "var(--tb-muted)" }}>{meta.note}</p>
@@ -3814,6 +4024,7 @@ export default function TackleTracker() {
         {view === "spots" && <SpotsView catches={catches || []} />}
 
         {view === "community" && <CommunityView />}
+        </div>
 
       </main>
 
@@ -4918,8 +5129,8 @@ function ConditionsView({ items = [], catches = [], onQuickAdd }) {
   }
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between" style={{ order: -2 }}>
         <button onClick={() => setShowLocationPicker(true)} className="flex items-center gap-1.5 text-sm font-semibold" style={{ color: "var(--tb-text)" }}>
           <MapPin size={15} style={{ color: "var(--tb-brass)" }} />
           {location.name}
@@ -4972,7 +5183,7 @@ function WeatherCard({ weather, loading, error, waterTemp, waterSrc }) {
         <StatRow icon={Sunrise} label="Sunrise" value={fmtTime(sunrise)} />
         <StatRow icon={Sunset} label="Sunset" value={fmtTime(sunset)} />
         {typeof waterTemp === "number" && (
-          <StatRow icon={Waves} label="Water" value={fmtTemp(waterTemp)} sub={waterSrc && waterSrc.kind === "measured" ? `measured · ${waterSrc.name}${waterSrc.miles ? `, ${isMetric() ? Math.round(waterSrc.miles * 1.609) + " km" : waterSrc.miles + " mi"}` : ""}` : "ocean model"} />
+          <StatRow icon={Waves} label="Water" value={fmtTemp(waterTemp)} sub={waterSrc && waterSrc.kind === "measured" ? `measured · ${waterSrc.name}${waterSrc.miles ? `, ${isMetric() ? Math.round(waterSrc.miles * 1.609) + " km" : waterSrc.miles + " mi"}` : ""}` : "nearest sea surface (model)"} />
         )}
       </div>
     </CardShell>
@@ -5153,6 +5364,9 @@ function WaypointsCard() {
         setPoints([]);
       }
     })();
+    const on = (e) => { if (Array.isArray(e.detail)) setPoints(e.detail); };
+    window.addEventListener("tackle-waypoints-changed", on);
+    return () => window.removeEventListener("tackle-waypoints-changed", on);
   }, []);
 
   async function persist(next) {
@@ -5294,7 +5508,7 @@ function WaypointsCard() {
               </div>
             )}
             <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>
-              {new Date(wp.time).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+              {wp.time && Number.isFinite(new Date(wp.time).getTime()) ? new Date(wp.time).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "Saved spot"}
               {" · "}
               {wp.lat.toFixed(5)}, {wp.lon.toFixed(5)}
               {typeof wp.accuracyFt === "number" ? ` · ±${fmtShort(wp.accuracyFt)}` : ""}
@@ -5476,19 +5690,193 @@ function MyMapCard({ catches }) {
   );
 }
 
+function NearbyExplorer({ location, onPickLocation, onUseMyLocation }) {
+  useUnits();
+  const [st, setSt] = useState({ status: "idle", list: [], stale: false, at: 0 });
+  const [kind, setKind] = useState("all");
+  const [sel, setSel] = useState(null);
+  const [more, setMore] = useState(false);
+  const [temps, setTemps] = useState({});
+  const [saved, setSaved] = useState({});
+  const mapEl = useRef(null);
+  const mapRef = useRef(null);
+  const groupRef = useRef(null);
+  const markersRef = useRef({});
+  const leaflet = typeof window !== "undefined" && !!window.L;
+  const lat = location ? location.lat : null, lon = location ? location.lon : null;
+
+  const load = useCallback(async (la, lo, force) => {
+    setSt((s) => ({ ...s, status: "loading" }));
+    try {
+      const r = await proLoadNearbyPlaces(la, lo, force);
+      setSt({ status: "ok", list: r.data || [], stale: r.stale, at: r.at });
+    } catch (e) {
+      setSt({ status: "error", list: [], stale: false, at: 0 });
+    }
+  }, []);
+  useEffect(() => { setSel(null); setMore(false); setTemps({}); if (lat != null) load(lat, lon, false); }, [lat, lon, load]);
+
+  // sea-surface temperature at the closest marinas (quietly skipped where there's no data)
+  useEffect(() => {
+    if (st.status !== "ok") return undefined;
+    let off = false;
+    st.list.filter((x) => x.kind === "marina").slice(0, 6).forEach(async (m) => {
+      try {
+        const d = await proFetchJson(`https://marine-api.open-meteo.com/v1/marine?latitude=${m.lat}&longitude=${m.lon}&current=sea_surface_temperature&temperature_unit=fahrenheit&timezone=auto`, 9000);
+        const t = d && d.current ? d.current.sea_surface_temperature : null;
+        if (!off && typeof t === "number") setTemps((p) => ({ ...p, [m.key]: t }));
+      } catch (e) { /* no reading */ }
+    });
+    return () => { off = true; };
+  }, [st.status, st.at]);
+
+  const counts = {};
+  for (const x of st.list) counts[x.kind] = (counts[x.kind] || 0) + 1;
+  const shown = kind === "all" ? st.list : st.list.filter((x) => x.kind === kind);
+  const colorOf = (k) => (PRO_NEARBY_KINDS.find((d) => d.id === k) || {}).color || "#2dd4bf";
+  const titleOf = (x) => x.name || x.type;
+  const subOf = (x) => [x.name ? x.type : null, x.fee === "free" ? "Free" : x.fee === "fee" ? "Fee" : null, x.hours || null, typeof temps[x.key] === "number" ? `Water ${fmtTemp(temps[x.key])}` : null].filter(Boolean).join(" · ");
+
+  useEffect(() => {
+    if (!leaflet || !mapEl.current || mapRef.current) return undefined;
+    const map = window.L.map(mapEl.current, { attributionControl: true, zoomControl: false }).setView([39, -96], 3);
+    proBaseMap(window.L, map, 18);
+    window.L.control.zoom({ position: "bottomright" }).addTo(map);
+    mapRef.current = map;
+    return () => { map.remove(); mapRef.current = null; groupRef.current = null; markersRef.current = {}; };
+  }, [leaflet, lat == null]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || lat == null) return;
+    if (groupRef.current) map.removeLayer(groupRef.current);
+    const g = window.L.featureGroup();
+    markersRef.current = {};
+    window.L.circleMarker([lat, lon], { radius: 7, color: "#ffffff", weight: 3, fillColor: "#0b1413", fillOpacity: 1 }).bindPopup("<strong>Search centre</strong>").addTo(g);
+    for (const x of shown.slice(0, 80)) {
+      const mk = window.L.circleMarker([x.lat, x.lon], { radius: 7, color: "#040707", weight: 2, fillColor: colorOf(x.kind), fillOpacity: 0.95 })
+        .bindPopup(`<strong>${proEscape(titleOf(x))}</strong><br>${proEscape(x.type)} · ${proEscape(fmtDist(x.distance))}<br><a href="https://www.google.com/maps/dir/?api=1&destination=${x.lat},${x.lon}" target="_blank" rel="noopener noreferrer">Directions</a>`);
+      mk.on("click", () => setSel(x.key));
+      mk.addTo(g);
+      markersRef.current[x.key] = mk;
+    }
+    g.addTo(map);
+    groupRef.current = g;
+    const near = shown.slice(0, 12);
+    if (near.length) map.fitBounds(window.L.latLngBounds([[lat, lon], ...near.map((x) => [x.lat, x.lon])]).pad(0.2), { maxZoom: 14 });
+    else map.setView([lat, lon], 11);
+    setTimeout(() => { try { map.invalidateSize(); } catch (e) { /* unmounted */ } }, 60);
+  }, [st.at, st.status, kind, lat, lon, leaflet]);
+
+  function focus(x) {
+    haptic();
+    setSel((cur) => (cur === x.key ? null : x.key));
+    const map = mapRef.current, mk = markersRef.current[x.key];
+    if (map && mk) { map.setView([x.lat, x.lon], Math.max(map.getZoom(), 14)); if (mk.openPopup) mk.openPopup(); }
+  }
+  async function saveWaypoint(x) {
+    haptic("success");
+    try {
+      const r = await window.storage.get(WAYPOINT_KEY, false);
+      const cur = r && r.value ? JSON.parse(r.value) : [];
+      const next = [{ id: uid(), lat: x.lat, lon: x.lon, time: new Date().toISOString(), name: titleOf(x) }, ...cur];
+      await window.storage.set(WAYPOINT_KEY, JSON.stringify(next), false);
+      window.dispatchEvent(new CustomEvent("tackle-waypoints-changed", { detail: next }));
+      setSaved((p) => ({ ...p, [x.key]: true }));
+    } catch (e) { /* storage unavailable */ }
+  }
+
+  const list = more ? shown : shown.slice(0, 8);
+  const linkStyle = { color: "var(--tb-blue)" };
+  return (
+    <CardShell title="Explore nearby" subtitle="Waters, ramps, piers, bait shops and marinas around you" noPad>
+      <div className="px-4 pt-3 pb-2 flex items-center justify-between gap-2">
+        <button onClick={onPickLocation} className="flex items-center gap-1.5 text-[14px] font-bold min-w-0" style={{ color: "var(--tb-text)" }}>
+          <MapPin size={15} className="shrink-0" style={{ color: "var(--tb-brass)" }} />
+          <span className="truncate">{location ? location.name : "Set a search location"}</span>
+          <span className="text-[12px] font-normal shrink-0" style={{ color: "var(--tb-blue)" }}>Change</span>
+        </button>
+        {location && (
+          <button onClick={() => load(lat, lon, true)} aria-label="Refresh nearby places" className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{ background: "var(--tb-surface-2)" }}>
+            <RefreshCw size={15} className={st.status === "loading" ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
+          </button>
+        )}
+      </div>
+
+      {!location && (
+        <div className="px-4 pb-4">
+          <button onClick={onUseMyLocation} className="w-full py-3 rounded-xl text-[15px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>Use my current location</button>
+        </div>
+      )}
+
+      {location && st.status === "ok" && st.list.length > 0 && (
+        <div className="px-4 pb-2 flex items-center gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }} role="group" aria-label="Filter places">
+          <ChipButton active={kind === "all"} onClick={() => { setKind("all"); setMore(false); }} label={`All (${st.list.length})`} />
+          {PRO_NEARBY_KINDS.filter((k) => counts[k.id]).map((k) => (
+            <ChipButton key={k.id} active={kind === k.id} onClick={() => { setKind(k.id); setMore(false); }} label={<span className="inline-flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: k.color }} />{k.label} ({counts[k.id]})</span>} />
+          ))}
+        </div>
+      )}
+
+      {location && leaflet && <div ref={mapEl} style={{ height: st.status === "ok" && st.list.length ? "250px" : "0px" }} />}
+
+      {location && (
+        <div className="px-4 pt-3 pb-3">
+          {st.status === "loading" && st.list.length === 0 && (
+            <div className="space-y-2" aria-label="Searching nearby">
+              {[0, 1, 2, 3].map((i) => <div key={i} className="tb-skeleton" style={{ height: 54, borderRadius: 12 }} />)}
+              <div className="text-[13px]" style={{ color: "var(--tb-muted)" }}>Searching the map around you. This can take up to half a minute.</div>
+            </div>
+          )}
+          {st.status === "error" && (
+            <div>
+              <p className="text-[14px] leading-snug" style={{ color: "var(--tb-muted)" }}>The free OpenStreetMap servers are busy right now. It usually clears up within a few minutes.</p>
+              <button onClick={() => load(lat, lon, true)} className="mt-2 px-4 py-2 rounded-full text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>Try again</button>
+            </div>
+          )}
+          {st.status === "ok" && st.list.length === 0 && <p className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Nothing mapped within about 15 miles. Try a different search location.</p>}
+          {st.status === "ok" && st.stale && <div className="text-[12px] mb-2" style={{ color: "var(--tb-flare)" }}>Map servers are busy. Showing results saved {new Date(st.at).toLocaleDateString([], { month: "short", day: "numeric" })}.</div>}
+          {st.list.length > 0 && (
+            <div className="space-y-1.5">
+              {list.map((x) => {
+                const open = sel === x.key;
+                return (
+                  <div key={x.key} className="rounded-xl overflow-hidden" style={{ background: "var(--tb-surface-2)", border: "1px solid " + (open ? "var(--tb-brass)" : "var(--tb-line)") }}>
+                    <button onClick={() => focus(x)} aria-expanded={open} className="w-full flex items-center gap-3 py-2.5 px-3 text-left active:opacity-70">
+                      <span className="inline-block w-3 h-3 rounded-full shrink-0" style={{ background: colorOf(x.kind) }} aria-hidden="true" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-[15px] font-bold truncate" style={{ color: "var(--tb-text)" }}>{titleOf(x)}</span>
+                        {subOf(x) && <span className="block text-[12px] truncate" style={{ color: "var(--tb-muted)" }}>{subOf(x)}</span>}
+                      </span>
+                      <span className="text-[13px] font-bold shrink-0" style={{ color: "var(--tb-blue)" }}>{fmtDist(x.distance)}</span>
+                    </button>
+                    {open && (
+                      <div className="px-3 pb-2.5 flex flex-wrap gap-x-4 gap-y-1 text-[13px] font-bold">
+                        <a href={`https://www.google.com/maps/dir/?api=1&destination=${x.lat},${x.lon}`} target="_blank" rel="noopener noreferrer" style={linkStyle}>Directions</a>
+                        <button onClick={() => saveWaypoint(x)} disabled={!!saved[x.key]} style={{ color: saved[x.key] ? "var(--tb-muted)" : "var(--tb-blue)" }}>{saved[x.key] ? "Saved to waypoints ✓" : "Save as waypoint"}</button>
+                        {x.web && <a href={x.web} target="_blank" rel="noopener noreferrer" style={linkStyle}>Website</a>}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {shown.length > 8 && (
+            <button onClick={() => setMore((m) => !m)} className="mt-2 w-full py-2 rounded-xl text-[14px] font-bold" style={{ background: "transparent", color: "var(--tb-blue)", border: "1px solid var(--tb-line)" }}>{more ? "Show fewer" : `Show all ${shown.length}`}</button>
+          )}
+          <div className="text-[11px] mt-2" style={{ color: "var(--tb-muted)" }}>Map data © OpenStreetMap contributors. Check access and rules before you fish.</div>
+        </div>
+      )}
+    </CardShell>
+  );
+}
+
 function SpotsView({ catches }) {
   useUnits();
   const [location, setLocation] = useState(null);
   const [locLoading, setLocLoading] = useState(true);
   const [showLocationPicker, setShowLocationPicker] = useState(false);
-
-  const [nearby, setNearby] = useState(null);
-  const [nearbyLoading, setNearbyLoading] = useState(false);
-  const [nearbyError, setNearbyError] = useState(null);
-
-  const [marinas, setMarinas] = useState(null);
-  const [marinasLoading, setMarinasLoading] = useState(false);
-  const [marinasError, setMarinasError] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -5511,83 +5899,6 @@ function SpotsView({ catches }) {
       // ignore, just won't persist
     }
   }, []);
-
-  const loadNearby = useCallback(async (lat, lon) => {
-    setNearbyLoading(true);
-    setNearbyError(null);
-    try {
-      const query = `[out:json][timeout:25];(node["leisure"="fishing"](around:24000,${lat},${lon});way["leisure"="fishing"](around:24000,${lat},${lon});way["natural"="water"](around:24000,${lat},${lon});way["waterway"="river"](around:24000,${lat},${lon}););out center 60;`;
-      const { data } = await proLoadOverpass("n", lat, lon, query);
-      const seen = new Set();
-      const spots = [];
-      for (const el of data.elements || []) {
-        const elLat = el.lat ?? el.center?.lat;
-        const elLon = el.lon ?? el.center?.lon;
-        const name = el.tags?.name;
-        if (elLat == null || elLon == null || !name || seen.has(name)) continue;
-        seen.add(name);
-        const type = el.tags?.leisure === "fishing" ? "Fishing spot" : el.tags?.waterway === "river" ? "River" : "Lake / pond";
-        spots.push({ name, type, lat: elLat, lon: elLon, distance: haversineMiles(lat, lon, elLat, elLon) });
-      }
-      spots.sort((a, b) => a.distance - b.distance);
-      setNearby(spots.slice(0, 10));
-    } catch (e) {
-      setNearbyError("The OpenStreetMap servers are busy right now — tap the refresh arrow to try again in a minute.");
-    } finally {
-      setNearbyLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (location) loadNearby(location.lat, location.lon);
-  }, [location, loadNearby]);
-
-  const loadMarinas = useCallback(async (lat, lon) => {
-    setMarinasLoading(true);
-    setMarinasError(null);
-    try {
-      const query = `[out:json][timeout:25];(node["leisure"="marina"](around:40000,${lat},${lon});way["leisure"="marina"](around:40000,${lat},${lon}););out center 20;`;
-      const { data } = await proLoadOverpass("m", lat, lon, query);
-      const seen = new Set();
-      const found = [];
-      for (const el of data.elements || []) {
-        const elLat = el.lat ?? el.center?.lat;
-        const elLon = el.lon ?? el.center?.lon;
-        const name = el.tags?.name;
-        if (elLat == null || elLon == null || !name || seen.has(name)) continue;
-        seen.add(name);
-        found.push({ name, lat: elLat, lon: elLon, distance: haversineMiles(lat, lon, elLat, elLon) });
-      }
-      found.sort((a, b) => a.distance - b.distance);
-      const nearest = found.slice(0, 6);
-
-      // Fetch water temp for each nearby marina in parallel; missing data (common for
-      // small/inland marinas) just shows as unavailable rather than failing the whole list.
-      const withTemps = await Promise.all(
-        nearest.map(async (m) => {
-          try {
-            const wres = await fetch(
-              `https://marine-api.open-meteo.com/v1/marine?latitude=${m.lat}&longitude=${m.lon}&current=sea_surface_temperature&temperature_unit=fahrenheit&timezone=auto`
-            );
-            const wdata = await wres.json();
-            const temp = wdata.current?.sea_surface_temperature;
-            return { ...m, waterTemp: typeof temp === "number" ? temp : null };
-          } catch (e) {
-            return { ...m, waterTemp: null };
-          }
-        })
-      );
-      setMarinas(withTemps);
-    } catch (e) {
-      setMarinasError("The OpenStreetMap servers are busy right now — tap the refresh arrow to try again in a minute.");
-    } finally {
-      setMarinasLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (location) loadMarinas(location.lat, location.lon);
-  }, [location, loadMarinas]);
 
   function useMyLocation() {
     setLocLoading(true);
@@ -5612,11 +5923,13 @@ function SpotsView({ catches }) {
   const clusters = clusterCatchesByLocation(catches);
 
   if (locLoading) {
-    return <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>Loading spots...</div>;
+    return <div className="space-y-3"><div className="tb-skeleton" style={{ height: 150 }} /><div className="tb-skeleton" style={{ height: 300 }} /></div>;
   }
 
   return (
     <div className="space-y-3">
+      <NearbyExplorer location={location} onPickLocation={() => setShowLocationPicker(true)} onUseMyLocation={useMyLocation} />
+
       <WaypointsCard />
 
       <MyMapCard catches={catches} />
@@ -5655,101 +5968,6 @@ function SpotsView({ catches }) {
               </div>
             ))}
           </div>
-        )}
-      </CardShell>
-
-      <CardShell title="NEARBY WATERS TO TRY" subtitle="pulled live from open map data">
-        <div className="flex items-center justify-between mb-2">
-          <button onClick={() => setShowLocationPicker(true)} className="flex items-center gap-1.5 text-xs tb-mono" style={{ color: "var(--tb-text)" }}>
-            <MapPin size={13} style={{ color: "var(--tb-brass)" }} />
-            {location ? location.name : "Set a search location"}
-          </button>
-          {location && (
-            <button onClick={() => loadNearby(location.lat, location.lon)} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
-              <RefreshCw size={13} className={nearbyLoading ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
-            </button>
-          )}
-        </div>
-
-        {!location && (
-          <button onClick={useMyLocation} className="w-full py-2 rounded-lg text-xs tb-mono" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>
-            Use my current location
-          </button>
-        )}
-
-        {location && nearbyLoading && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Searching nearby waters...</div>}
-        {location && nearbyError && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{nearbyError}</div>}
-        {location && !nearbyLoading && !nearbyError && nearby && nearby.length === 0 && (
-          <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No named waters found nearby — try a different spot.</div>
-        )}
-        {location && !nearbyLoading && nearby && nearby.length > 0 && (
-          <div className="space-y-1.5">
-            {nearby.map((s, idx) => (
-              <a
-                key={idx}
-                href={`https://www.google.com/maps?q=${s.lat},${s.lon}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center justify-between rounded-lg py-2 px-3"
-                style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}
-              >
-                <div className="min-w-0">
-                  <div className="text-xs font-semibold truncate" style={{ color: "var(--tb-text)" }}>{s.name}</div>
-                  <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{s.type}</div>
-                </div>
-                <div className="tb-mono text-[11px] shrink-0" style={{ color: "var(--tb-blue)" }}>{fmtDist(s.distance)}</div>
-              </a>
-            ))}
-          </div>
-        )}
-        <div className="tb-mono text-[9px] mt-2" style={{ color: "var(--tb-muted)" }}>
-          Map data © OpenStreetMap contributors
-        </div>
-      </CardShell>
-
-      <CardShell title="NEARBY MARINAS" subtitle="water temperature at each, where available">
-        {!location && (
-          <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Set a location above to see nearby marinas.</div>
-        )}
-        {location && (
-          <>
-            <div className="flex justify-end mb-2">
-              <button onClick={() => loadMarinas(location.lat, location.lon)} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
-                <RefreshCw size={13} className={marinasLoading ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
-              </button>
-            </div>
-            {marinasLoading && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Finding nearby marinas...</div>}
-            {marinasError && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{marinasError}</div>}
-            {!marinasLoading && !marinasError && marinas && marinas.length === 0 && (
-              <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No named marinas found within about 25 miles.</div>
-            )}
-            {!marinasLoading && marinas && marinas.length > 0 && (
-              <div className="space-y-1.5">
-                {marinas.map((m, idx) => (
-                  <a
-                    key={idx}
-                    href={`https://www.google.com/maps?q=${m.lat},${m.lon}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center justify-between rounded-lg py-2 px-3"
-                    style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}
-                  >
-                    <div className="min-w-0">
-                      <div className="text-xs font-semibold truncate" style={{ color: "var(--tb-text)" }}>{m.name}</div>
-                      <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{fmtDist(m.distance)} away</div>
-                    </div>
-                    <div className="tb-mono text-xs shrink-0 flex items-center gap-1" style={{ color: typeof m.waterTemp === "number" ? "var(--tb-brass)" : "var(--tb-muted)" }}>
-                      <Waves size={12} />
-                      {typeof m.waterTemp === "number" ? fmtTemp(m.waterTemp) : "no data"}
-                    </div>
-                  </a>
-                ))}
-              </div>
-            )}
-            <div className="tb-mono text-[9px] mt-2" style={{ color: "var(--tb-muted)" }}>
-              Map data © OpenStreetMap contributors · water temps from Open-Meteo
-            </div>
-          </>
         )}
       </CardShell>
 
