@@ -844,6 +844,63 @@ function proMarineSstNow(marine) {
   } catch (e) { return null; }
 }
 
+// Base street map: CARTO "Voyager" (clean, readable, free, no key). If its tiles keep failing
+// (blocked network, outage) it quietly swaps itself for the plain OpenStreetMap tiles.
+function proBaseMap(L, map, maxZoom) {
+  const osm = () => L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: Math.min(maxZoom, 19) });
+  const carto = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+    subdomains: "abcd", maxZoom, maxNativeZoom: 19, detectRetina: false,
+    attribution: "© OpenStreetMap contributors © CARTO",
+  });
+  let layer = carto, errs = 0, okTiles = 0;
+  carto.on("tileload", () => { okTiles++; });
+  carto.on("tileerror", () => {
+    errs++;
+    if (layer === carto && errs >= 4 && okTiles === 0) {
+      layer = osm();
+      try { map.removeLayer(carto); layer.addTo(map); layer.bringToBack(); } catch (e) { /* map already gone */ }
+    }
+  });
+  carto.addTo(map);
+  return { get: () => layer };
+}
+
+// MEASURED water temperature from the nearest NOAA CO-OPS station (US coasts, bays, Great Lakes).
+// Real sensor readings beat the ocean model and the air-temperature estimate, so they win when a station is close.
+const PRO_WT_MAX_MILES = 25;
+function proLoadWaterStations() {
+  return proCached("wtst", 30 * 86400000, async () => {
+    const raw = await proFetchJson("https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=watertemp", 20000);
+    return (raw.stations || []).filter((s) => typeof s.lat === "number" && typeof s.lng === "number")
+      .map((s) => ({ id: s.id, name: s.name, lat: s.lat, lng: s.lng }));
+  });
+}
+async function proFetchStationWater(id) {
+  const raw = await proFetchJson(`https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=water_temperature&application=epicfishy&station=${encodeURIComponent(id)}&date=latest&units=english&time_zone=gmt&format=json`);
+  const d = raw && raw.data && raw.data[0];
+  const v = d ? parseFloat(d.v) : NaN;
+  const m = d && /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(d.t || "");
+  if (!Number.isFinite(v) || !m) throw new Error("no reading");
+  const at = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+  if (Date.now() - at > 3 * 3600000) throw new Error("stale reading");
+  if (v < 28 || v > 100) throw new Error("implausible reading");
+  return { tempF: v, at };
+}
+function proLoadMeasuredWater(lat, lon) {
+  return proCached(`mw:${lat.toFixed(2)},${lon.toFixed(2)}`, 15 * 60000, async () => {
+    const st = (await proLoadWaterStations()).data;
+    const near = st.map((s) => ({ ...s, miles: haversineMiles(lat, lon, s.lat, s.lng) }))
+      .filter((s) => s.miles <= PRO_WT_MAX_MILES).sort((a, b) => a.miles - b.miles).slice(0, 3);
+    for (const s of near) {
+      try {
+        const r = await proFetchStationWater(s.id);
+        return { tempF: r.tempF, at: r.at, id: s.id, name: s.name, miles: Math.round(s.miles) };
+      } catch (e) { /* try the next-nearest station */ }
+    }
+    throw new Error("no nearby water station");
+  });
+}
+
 // Tide highs/lows from the global ocean model (sea_level_height_msl, hourly, parabola-refined).
 // Coarse model: good for planning (±30–60 min), not for navigation. Returns null where there is no real tide.
 function proTideExtrema(marine) {
@@ -1208,13 +1265,15 @@ function proFindWindows(hrs) {
 }
 
 // Four-day hourly forecast, scored for a target species. `fc` is normalised forecast, `marine` raw marine payload.
-function proBuildDays(fc, marine, targetName) {
+function proBuildDays(fc, marine, targetName, measured) {
   const profile = proSpeciesProfile(targetName);
   const tides = marine ? proTideExtrema(marine) : null;
   const sst = marine ? proMarineSstNow(marine) : null;
   const waterEst = proEstimateWaterF(fc);
-  const waterF = typeof sst === "number" ? sst : waterEst;
-  const waterSource = typeof sst === "number" ? "model" : "estimate";
+  const hasMeasured = measured && typeof measured.tempF === "number";
+  const waterF = hasMeasured ? measured.tempF : typeof sst === "number" ? sst : waterEst;
+  const waterSource = hasMeasured ? "measured" : typeof sst === "number" ? "model" : "estimate";
+  const waterStation = hasMeasured ? { name: measured.name, miles: measured.miles } : null;
   const lat = fc.lat, lon = fc.lon;
   const todayStr = proYmdIn(Date.now(), fc.tz);
   let startIdx = fc.days.findIndex((d) => d.date === todayStr);
@@ -1233,7 +1292,7 @@ function proBuildDays(fc, marine, targetName) {
     });
     days.push({ date: d.date, start: d.start, sunrise: d.sunrise, sunset: d.sunset, solunar, hours: hrs, windows: proFindWindows(hrs), best: hrs.length ? Math.max(...hrs.map((h) => h.score)) : 0 });
   }
-  return { days, profile, waterF, waterSource, hasTide: !!tides };
+  return { days, profile, waterF, waterSource, waterStation, hasTide: !!tides };
 }
 
 /* ---------------- lure / bait picks ---------------- */
@@ -1251,50 +1310,168 @@ function proHistoryLures(catches, profileId) {
   return Object.entries(counts).sort((a, b) => b[1] - a[1]);
 }
 
-function proBuildPicks({ days, now, items, catches, tideNext, precip48h }) {
+/* ---------------- tackle recommendation engine ----------------
+   Scores ~30 lure/bait styles against the live conditions (water temp, light, wind, pressure trend,
+   water clarity, tide), the target species' profile and YOUR own catch history, then maps the winners
+   onto what is actually in your box and what is missing. Every point of score carries a plain-English reason. */
+const proLen = (ft) => (isMetric() ? `${Math.round(ft * 0.3048 * 10) / 10} m` : `${ft} ft`);
+function proL(id, label, o) { return { id, label, tags: [], fit: [], w: "both", light: "any", wind: "any", trend: "any", clear: "any", ...o }; }
+const PRO_KB_FRESH_BASS = ["bass", "smallmouth"];
+const PRO_LURE_KB = [
+  proL("walker", "Walking topwater", { kind: "Surface", kw: /walk|spook|zara|topwater|top water|walking/i, tags: ["topwater", "walking", "surface"], t: [16, 30, 24], light: "low", wind: "calm", fit: ["bass", "smallmouth", "striped", "redfish", "snook", "seatrout", "euro-seabass", "pike", "musky", "tarpon"], retrieve: "Walk-the-dog: rod tip down, twitch–twitch–pause. Slow the cadence in clear water, speed up in chop.", size: "3.5–5 in (9–13 cm)", rod: "6'10\"–7' medium, fast", line: "15–20 lb braid, 15–20 lb fluoro leader", colors: { clear: ["Bone / white", "Natural shad", "Ghost"], stained: ["Chartreuse / white", "Black", "Bright bone"], low: ["Black", "Dark bone", "Black/chartreuse"] } }),
+  proL("popper", "Popper / chugger", { kind: "Surface", kw: /popper|chugger|pencil|cork|pop-?r/i, tags: ["topwater", "popper", "surface"], t: [16, 31, 25], light: "low", wind: "calm", fit: ["seatrout", "redfish", "snook", "striped", "bass", "bluegill", "euro-seabass", "mahi", "smallmouth"], retrieve: "Short, sharp pops with long pauses. Most bites come on the pause.", size: "2–3.5 in (5–9 cm)", rod: "7' medium-light to medium, fast", line: "10–15 lb braid, 15–20 lb fluoro leader", colors: { clear: ["White / silver", "Natural baitfish"], stained: ["Chartreuse", "Hot pink / white"], low: ["Black", "Dark / purple"] } }),
+  proL("prop", "Buzzbait / prop bait", { kind: "Surface", kw: /buzz|prop ?bait|prop|whopper plopper|plopper/i, tags: ["topwater", "buzzbait", "prop", "surface"], t: [18, 31, 25], light: "low", wind: "any", clear: "stained", w: "fresh", fit: ["bass", "pike", "musky", "smallmouth"], retrieve: "Cast past cover and burn it just fast enough to stay on top. Stop it over holes, then restart.", size: "3/8–1/2 oz (10–14 g)", rod: "7'3\" medium-heavy, fast", line: "50 lb braid or 17 lb mono", colors: { clear: ["White", "Shad"], stained: ["Black", "White / chartreuse"], low: ["Black", "Dark blue"] } }),
+  proL("frog", "Hollow-body frog", { kind: "Surface", kw: /frog|toad|scum/i, tags: ["frog", "topwater", "surface"], t: [20, 33, 27], light: "bright", wind: "any", w: "fresh", fit: ["bass", "pike", "musky"], retrieve: "Walk it across mats, lily pads and shoreline weeds; pause in every hole and wait a beat before setting the hook.", size: "2.5–3 in (6–8 cm)", rod: "7'3\"–7'6\" heavy, fast", line: "50–65 lb braid", colors: { clear: ["Natural green / brown", "White belly"], stained: ["Black", "Chartreuse belly"], low: ["Black", "Dark green"] } }),
+  proL("spinnerbait", "Spinnerbait", { kind: "Reaction", kw: /spinner ?bait|spinner-bait/i, tags: ["spinnerbait", "spinner", "reaction"], t: [10, 27, 19], wind: "windy", trend: "falling", clear: "stained", w: "fresh", fit: ["bass", "pike", "musky", "crappie", "smallmouth"], retrieve: "Slow-roll along cover or burn just under the surface. Use the wind: cast with it pushing the bait toward the bank.", size: "3/8–3/4 oz (10–21 g)", rod: "7' medium-heavy, moderate-fast", line: "15–17 lb fluorocarbon or 17 lb mono", colors: { clear: ["White / silver", "Shad"], stained: ["White / chartreuse", "Gold blades"], low: ["Black / blue", "Dark chartreuse"] } }),
+  proL("bladed", "Bladed jig (ChatterBait style)", { kind: "Reaction", kw: /chatter|bladed|vibrating jig|vib jig|blade/i, tags: ["chatterbait", "bladed", "reaction"], t: [12, 27, 20], clear: "stained", w: "fresh", fit: ["bass"], retrieve: "Steady retrieve that ticks cover; rip it free when it hangs, a trailer swimbait adds thump.", size: "3/8–1/2 oz (10–14 g)", rod: "7'3\" medium-heavy, fast", line: "15–20 lb fluorocarbon", colors: { clear: ["Green pumpkin / white", "Natural shad"], stained: ["White / chartreuse", "Black / blue"], low: ["Black / blue", "Dark green pumpkin"] }, needs: [{ kw: /trailer|swimbait|paddle/i, name: "Paddle-tail trailers", category: "lures" }] }),
+  proL("lipless", "Lipless crankbait", { kind: "Reaction", kw: /lipless|rat-?l|red ?eye|rattl|trap/i, tags: ["lipless", "crankbait", "reaction"], t: [6, 23, 14], trend: "falling", wind: "windy", w: "fresh", fit: ["bass", "striped", "walleye", "smallmouth"], retrieve: "Yo-yo it off the bottom, or burn it over grass and rip it free; ticks of grass trigger bites.", size: "1/2–3/4 oz (14–21 g)", rod: "7' medium-heavy, moderate", line: "12–17 lb fluorocarbon", colors: { clear: ["Chrome / blue", "Natural shad"], stained: ["Red craw", "Chartreuse / orange"], low: ["Black / gold", "Dark craw"] } }),
+  proL("squarebill", "Squarebill crankbait", { kind: "Reaction", kw: /square ?bill|sq\.? ?bill|bandit|shallow crank/i, tags: ["crankbait", "squarebill", "reaction"], t: [12, 27, 19], clear: "stained", w: "fresh", fit: ["bass", "smallmouth"], retrieve: "Cast tight to wood and rock and deflect off cover; pause after contact.", size: "2–2.5 in", rod: "7' medium, moderate", line: "12–15 lb fluorocarbon", colors: { clear: ["Sexy shad", "Natural craw"], stained: ["Chartreuse / blue", "Red craw"], low: ["Black / blue", "Dark craw"] } }),
+  proL("deepcrank", "Deep-diving crankbait", { kind: "Search", kw: /deep|dd ?\d|diving|crankbait|crank|magnum|dt ?\d/i, not: /square|lipless|rat-?l|trap|shallow|sq\.? ?bill/i, tags: ["crankbait", "deep", "search"], t: [10, 29, 21], light: "bright", w: "both", fit: ["bass", "walleye", "striped", "smallmouth", "pike"], retrieve: "Cast long and dig bottom, bump rock and stumps, then pause and let it float up.", size: "2.5–3.5 in; 10–20 ft diver", rod: "7'6\"–8' medium, parabolic", line: "10–14 lb fluorocarbon", colors: { clear: ["Natural shad", "Sexy shad"], stained: ["Chartreuse / blue", "Firetiger"], low: ["Black / silver", "Dark craw"] } }),
+  proL("jerkbait", "Suspending jerkbait", { kind: "Finesse", kw: /jerk|suspending|rogue|x-?rap|rapala|minnow|stickbait|mirrolure|mirrodine|plug/i, tags: ["jerkbait", "minnow", "plug", "suspending"], t: [3, 17, 9], clear: "clear", wind: "calm", fit: ["bass", "smallmouth", "trout", "striped", "euro-seabass", "pike", "walleye", "seatrout", "redfish"], retrieve: "Rip–rip–pause. Cold water means long pauses (5–15 s); warm water, shorter ones.", size: "3.5–5 in (9–13 cm)", rod: "6'10\"–7' medium, fast", line: "8–12 lb fluorocarbon", colors: { clear: ["Ghost minnow", "Silver / chrome", "Natural shad"], stained: ["Chartreuse / pearl", "Gold / orange belly"], low: ["Dark back / gold", "Black / silver"] } }),
+  proL("swimbait", "Paddle-tail swimbait", { kind: "Search", kw: /swimbait|paddle|shad|boot ?tail|swim ?shad|keitech|zman|z-man|slim swim|gulp/i, tags: ["swimbait", "paddle", "shad", "soft plastic"], t: [8, 31, 21], fit: ["bass", "striped", "redfish", "seatrout", "snook", "walleye", "pike", "euro-seabass", "smallmouth", "flatfish", "snapper"], retrieve: "Steady swim just above cover or the bottom. Add a twitch and pause to trigger followers.", size: "3–5 in (8–13 cm) on a 1/4–1/2 oz head", rod: "7' medium, fast", line: "10–15 lb braid, 12–20 lb fluoro leader", colors: { clear: ["Natural shad", "Pearl / white", "Smoke"], stained: ["Chartreuse", "White / chartreuse tail", "Motor oil"], low: ["Black / blue", "Dark / purple"] }, needs: [{ kw: /jig ?head|swimbait head|bullet/i, name: "1/4–1/2 oz swimbait jig heads", category: "lures" }] }),
+  proL("texas", "Texas-rigged worm / craw", { kind: "Bottom", kw: /worm|texas|trick|craw|creature|brush hog|beaver|flipping/i, tags: ["soft plastic", "worm", "texas", "bottom"], t: [12, 31, 23], light: "bright", wind: "calm", w: "fresh", fit: ["bass"], retrieve: "Cast to cover, let it fall on slack line, hop it once or twice, and let it fall again — most bites come on the fall.", size: "6–10 in worm or 3.5–4 in craw", rod: "7'–7'3\" medium-heavy, fast", line: "15–20 lb fluorocarbon", colors: { clear: ["Green pumpkin", "Watermelon red", "Natural craw"], stained: ["Black / blue", "June bug", "Junebug"], low: ["Black / blue", "Dark june bug"] }, needs: [{ kw: /ewg|offset|worm hook|extra wide/i, name: "3/0 EWG offset worm hooks", category: "hooks" }, { kw: /bullet|tungsten|worm weight/i, name: "1/8–3/8 oz bullet weights", category: "weights" }] }),
+  proL("wacky", "Wacky / stick worm", { kind: "Finesse", kw: /senko|stick ?(bait|worm)|wacky|yamamoto|gary|yum dinger|dinger/i, tags: ["soft plastic", "wacky", "senko", "finesse", "worm"], t: [12, 30, 23], wind: "calm", trend: "rising", clear: "clear", w: "fresh", fit: ["bass", "smallmouth", "bluegill"], retrieve: "Cast past targets and let it sink untouched; twitch only when it hits bottom. A slow fall does the work.", size: "5 in", rod: "6'10\"–7' medium, fast", line: "10–15 lb braid, 10–12 lb fluoro leader", colors: { clear: ["Green pumpkin", "Watermelon", "Natural"], stained: ["Black / blue flake", "June bug"], low: ["Black", "Dark junebug"] }, needs: [{ kw: /wacky|circle|octopus|finesse hook/i, name: "Wacky / finesse hooks", category: "hooks" }] }),
+  proL("ned", "Ned rig / finesse jig", { kind: "Finesse", kw: /ned|finesse|shaky|mushroom|tiny ?worm|small ?worm/i, tags: ["finesse", "ned", "soft plastic", "worm"], t: [3, 26, 13], trend: "rising", clear: "clear", fit: ["bass", "smallmouth", "perch", "walleye", "crappie", "bluegill", "trout"], retrieve: "Drag it slowly along the bottom with long pauses; hop it a few inches and stop. Let it stand on its head.", size: "2.5–3 in (6–8 cm) on 1/10–1/6 oz head", rod: "7' medium-light, fast", line: "6–10 lb braid, 6–8 lb fluoro leader", colors: { clear: ["Green pumpkin", "Natural craw", "Smoke"], stained: ["Black / blue", "Chartreuse"], low: ["Black / blue", "Dark pumpkin"] } }),
+  proL("dropshot", "Drop shot", { kind: "Finesse", kw: /drop ?shot|dropshot|d\/s/i, tags: ["finesse", "drop shot", "soft plastic", "worm"], t: [3, 24, 12], trend: "rising", clear: "clear", fit: ["bass", "smallmouth", "walleye", "perch", "crappie"], retrieve: "Lower to the bottom, then shake the rod tip without moving the weight so the bait quivers in place.", size: "3–4.5 in bait, 1/4–3/8 oz weight", rod: "7' medium-light, extra-fast", line: "8–12 lb braid, 6–8 lb fluoro leader", colors: { clear: ["Natural minnow", "Green pumpkin", "Watermelon"], stained: ["Chartreuse", "Black / blue"], low: ["Black / blue", "Dark pumpkin"] }, needs: [{ kw: /drop ?shot|dropshot/i, name: "Drop-shot hooks and weights", category: "hooks" }] }),
+  proL("jigcraw", "Jig & craw (football / flipping)", { kind: "Bottom", kw: /football|flipping|casting jig|skirted|jig(?!\s?head)|arky/i, tags: ["jig", "bottom", "craw"], t: [3, 24, 12], light: "bright", trend: "rising", w: "fresh", fit: ["bass", "smallmouth", "walleye"], retrieve: "Crawl or hop along rock, wood and drop-offs; deadstick it after contact. Slow beats fast in cold water.", size: "3/8–3/4 oz (10–21 g)", rod: "7'3\" heavy, fast", line: "15–20 lb fluorocarbon", colors: { clear: ["Green pumpkin / brown", "Natural craw"], stained: ["Black / blue", "Black / red"], low: ["Black / blue"] } }),
+  proL("tube", "Tube jig", { kind: "Finesse", kw: /tube/i, tags: ["tube", "finesse", "soft plastic"], t: [8, 26, 16], clear: "clear", fit: ["smallmouth", "bass", "crappie", "perch", "trout"], retrieve: "Hop and glide it down over sand and rock so it spirals; hold it on the bottom between hops.", size: "3–4 in (8–10 cm)", rod: "7' medium, fast", line: "8–10 lb fluoro or 10 lb braid + 8 lb leader", colors: { clear: ["Green pumpkin", "Smoke / pearl", "Goby"], stained: ["Chartreuse", "Black / blue"], low: ["Black / blue"] } }),
+  proL("castspoon", "Casting spoon", { kind: "Search", kw: /spoon|kastmaster|krocodile|dardevle|acme|casting spoon/i, tags: ["spoon", "casting"], t: [3, 22, 12], wind: "windy", fit: ["trout", "salmon", "pike", "redfish", "seatrout", "striped", "euro-seabass", "mahi", "bass", "musky"], retrieve: "Cast out, let it flutter down, then retrieve with lifts and pauses. A steady wobble works in current and chop.", size: "1/4–1 oz (7–28 g)", rod: "7' medium, fast", line: "10–20 lb braid, 15–20 lb fluoro leader", colors: { clear: ["Silver", "Nickel / blue"], stained: ["Gold", "Chartreuse / silver", "Copper"], low: ["Gold", "Black / gold"] } }),
+  proL("inline", "Inline spinner", { kind: "Search", kw: /inline|mepps|panther|rooster|aglia|blue fox|vibrax|spinner(?!\s?bait)/i, tags: ["spinner", "inline"], t: [3, 20, 12], clear: "stained", fit: ["trout", "smallmouth", "pike", "perch", "salmon", "bass", "crappie", "bluegill"], retrieve: "Cast across or upstream and retrieve just fast enough for the blade to turn, swinging through pools and seams.", size: "#2–#4 (1/8–1/4 oz)", rod: "6'6\" light–medium, fast", line: "4–8 lb mono or fluoro", colors: { clear: ["Silver", "Silver / black dots"], stained: ["Gold", "Chartreuse", "Fire tiger"], low: ["Black / gold", "Gold"] } }),
+  proL("jigspoon", "Jigging spoon / blade", { kind: "Vertical", kw: /jigging|slab|vertical|flutter|speed ?jig|blade bait|tail ?spin|sonar|silver buddy/i, tags: ["jigging", "spoon", "vertical", "deep"], t: [3, 18, 9], light: "bright", fit: ["striped", "crappie", "walleye", "snapper", "mahi", "bass", "perch"], retrieve: "Drop to the fish, rip up 2–3 ft and let it flutter back on a semi-tight line; bites come on the fall.", size: "1/2–2 oz (14–56 g)", rod: "6'6\"–7' medium, fast", line: "10–20 lb braid, 12–20 lb fluoro leader", colors: { clear: ["Chrome", "Silver / blue"], stained: ["Gold", "Chartreuse"], low: ["Glow", "Silver"] } }),
+  proL("bucktail", "Bucktail / hair jig", { kind: "Bottom", kw: /bucktail|hair ?jig|marabou|buck ?tail|jig ?head/i, tags: ["jig", "bucktail", "bottom"], t: [4, 24, 14], fit: ["striped", "walleye", "flatfish", "euro-seabass", "crappie", "seatrout", "snapper", "redfish"], retrieve: "Hop it along the bottom with a slow lift–drop, or swim it just above structure. Tip it with a strip of bait if the bite is slow.", size: "1/4–1 oz (7–28 g)", rod: "7' medium, fast", line: "10–20 lb braid, 15–20 lb fluoro leader", colors: { clear: ["White", "Natural baitfish"], stained: ["Chartreuse", "Chartreuse / white"], low: ["Black", "Purple / black"] } }),
+  proL("jigsoft", "Jig head + soft plastic (inshore)", { kind: "Search", kw: /jig ?head|gulp|z-?man|diezel|shrimp ?imitation|soft ?plastic|doa|vudu/i, tags: ["soft plastic", "jig", "paddle", "shad"], t: [12, 32, 24], w: "salt", fit: ["seatrout", "redfish", "snook", "flatfish", "snapper", "euro-seabass", "tarpon"], retrieve: "Hop it along the bottom or swim it slowly over grass and oysters. On a moving tide, cast up-current and let it drift.", size: "3–4 in on 1/8–1/4 oz head", rod: "7' medium, fast", line: "10–15 lb braid, 20 lb fluoro leader", colors: { clear: ["Natural shrimp / pearl", "Pearl / white", "Clear / glitter"], stained: ["Chartreuse / pink", "Chartreuse / white", "New penny"], low: ["Black / chartreuse", "Dark / purple"] } }),
+  proL("shrimp", "Live shrimp / popping cork", { kind: "Live bait", kw: /shrimp|popping ?cork|cork|live ?bait|pilchard|pinfish|greenback/i, tags: ["live", "shrimp", "cork", "bait"], t: [14, 33, 25], w: "salt", fit: ["seatrout", "redfish", "snook", "flatfish", "snapper", "tarpon"], retrieve: "Hang it under a popping cork 2–4 ft down over grass and oysters; pop twice, pause. Free-line it along mangroves on the tide.", size: "Live shrimp, 2–3 in", rod: "7' medium, fast", line: "10–15 lb braid, 20–25 lb fluoro leader", colors: { clear: ["Live shrimp"], stained: ["Live shrimp"], low: ["Live shrimp"] }, needs: [{ kw: /circle|kahle|live bait hook/i, name: "1/0–2/0 circle / kahle hooks", category: "hooks" }] }),
+  proL("minnow", "Live minnow / shiner under a float", { kind: "Live bait", kw: /minnow|shiner|live ?bait|float|bobber|slip/i, tags: ["live", "minnow", "bait"], t: [3, 26, 14], fit: ["crappie", "walleye", "bass", "pike", "trout", "perch", "bluegill", "catfish"], retrieve: "Suspend it at the depth you see fish on the sonar, or just above weed tops. Let it swim naturally and watch the float.", size: "2–4 in minnow", rod: "6'–7' light–medium", line: "6–10 lb mono", colors: { clear: ["Live minnow"], stained: ["Live minnow"], low: ["Live minnow"] }, needs: [{ kw: /bobber|float|slip/i, name: "Slip bobbers / floats", category: "other" }] }),
+  proL("crawler", "Nightcrawler / worm bait", { kind: "Live bait", kw: /night ?crawler|crawler|earthworm|worm bait|red ?worm/i, tags: ["live", "worm", "bait"], t: [5, 29, 18], fit: ["bluegill", "trout", "catfish", "carp", "perch", "crappie", "bass"], retrieve: "Thread it on a light hook with a small split shot, or fish it under a float. Cast near cover and let it sit.", size: "Whole or half crawler", rod: "6'–7' light", line: "4–8 lb mono", colors: { clear: ["Live worm"], stained: ["Live worm"], low: ["Live worm"] } }),
+  proL("cutbait", "Cut bait / stink bait", { kind: "Bottom bait", kw: /cut ?bait|stink|liver|chicken|dip ?bait|shad|mullet|bream/i, tags: ["bait", "cut", "live"], t: [12, 34, 25], light: "low", fit: ["catfish", "carp", "redfish", "flatfish"], retrieve: "Fish it on the bottom on a slip-sinker or Carolina rig near holes and channel edges, and wait. Night and dusk are best.", size: "Palm-size chunk of fresh baitfish", rod: "7'–8' medium-heavy", line: "20–30 lb mono or braid", colors: { clear: ["Fresh cut shad"], stained: ["Fresh cut shad", "Stink bait"], low: ["Fresh cut shad"] }, needs: [{ kw: /circle|catfish|treble/i, name: "Circle hooks 4/0–7/0", category: "hooks" }, { kw: /sinker|egg|bank|slip/i, name: "2–4 oz sinkers", category: "weights" }] }),
+  proL("carpbait", "Boilies / corn / pack bait", { kind: "Bottom bait", kw: /boilie|corn|bread|pack ?bait|pellet|method feeder|hair rig|particle/i, tags: ["bait", "boilie", "carp"], t: [8, 28, 20], fit: ["carp"], retrieve: "Present it on a hair rig over a bed of free offerings; leave it for 30–60 minutes before re-casting.", size: "12–18 mm boilies or 2–3 kernels corn", rod: "12' carp rod (2.75–3.5 lb TC)", line: "10–15 lb mono", colors: { clear: ["Natural / yellow corn"], stained: ["Bright pop-up"], low: ["Bright pop-up"] } }),
+  proL("crappiejig", "Marabou / tube crappie jig", { kind: "Finesse", kw: /crappie|marabou|1\/16|1\/32|mini ?jig|roadrunner|beetle/i, tags: ["crappie", "jig", "finesse", "tube", "marabou"], t: [6, 25, 16], fit: ["crappie", "bluegill", "perch"], retrieve: "Cast to brush and docks, let it sink to the depth you want and swim it slowly, or vertical-jig it above fish you mark.", size: "1/32–1/16 oz, 1.5–2 in", rod: "7'–10' ultralight", line: "4–6 lb mono", colors: { clear: ["White / chartreuse", "Natural minnow"], stained: ["Chartreuse", "Pink / white"], low: ["Chartreuse / black", "Glow"] } }),
+  proL("fly", "Flies (streamer / nymph / dry)", { kind: "Fly", kw: /fly|flies|nymph|streamer|wooly|woolly|dry fly|clouser|gotcha/i, tags: ["fly", "streamer", "nymph", "dry"], t: [4, 20, 12], fit: ["trout", "bluegill", "salmon", "bonefish", "smallmouth", "bass"], retrieve: "Match what is hatching: dries on a slow drift at the surface, nymphs dead-drifted near the bottom, streamers stripped across current.", size: "#10–#16 nymph / dry, #4–#8 streamer", rod: "9' 5–6 wt fly rod", line: "WF floating, 4X–5X tippet", colors: { clear: ["Natural olive / brown"], stained: ["White / chartreuse streamer"], low: ["Black / purple streamer"] } }),
+  proL("crabjig", "Crab / shrimp fly or jig (flats)", { kind: "Flats", kw: /crab|gotcha|bonefish|merkin|spoon fly|flats/i, tags: ["crab", "shrimp", "flats"], t: [20, 35, 28], light: "bright", wind: "calm", w: "salt", fit: ["bonefish", "flatfish", "redfish", "snook"], retrieve: "Spot the fish, lead them by a few feet and let it land softly; one short strip, then stop and let it sink.", size: "#2–#6 hook, 1/8 oz", rod: "9' 8 wt or 7' medium spin", line: "8–12 lb braid, 12–16 lb fluoro leader", colors: { clear: ["Tan / sand", "Natural crab"], stained: ["Pink / orange"], low: ["Tan"] } }),
+  proL("trolled", "Trolled skirt / ballyhoo / big plug", { kind: "Trolling", kw: /troll|ballyhoo|skirt|daisy|cedar plug|chugger head|dorado|mahi/i, tags: ["trolling", "skirt", "ballyhoo"], t: [22, 32, 27], fit: ["mahi", "tarpon", "snook"], retrieve: "Troll at 6–8 knots along weedlines, color breaks and debris; slow down at the first bite and keep the boat moving.", size: "4–8 in skirt or rigged ballyhoo", rod: "6'6\" trolling rod, 30–50 lb reel", line: "30–50 lb mono + 80 lb leader", colors: { clear: ["Blue / white", "Pink / white"], stained: ["Chartreuse / yellow"], low: ["Dark / purple"] } }),
+];
+
+function proLureMatchItems(arch, items) {
+  const have = [], out = [];
+  for (const i of items || []) {
+    if (/rods|line|weights|tools/.test(i.category || "")) continue;
+    const hay = `${i.name || ""} ${i.spec || ""} ${i.notes || ""}`;
+    if (!arch.kw.test(hay) || (arch.not && arch.not.test(hay))) continue;
+    (Number(i.quantity) > 0 ? have : out).push(i);
+  }
+  return { have, out };
+}
+
+function proCatchSimilar(c, ctx) {
+  const k = c.conditions || {};
+  let s = 0;
+  if (k.trend && ctx.trend && k.trend === ctx.trend) s += 1;
+  if (typeof k.waterF === "number" && ctx.waterC != null && Math.abs((k.waterF - 32) / 1.8 - ctx.waterC) <= 4) s += 1;
+  const d = new Date(c.dateTime);
+  if (Number.isFinite(d.getTime()) && ctx.timeBin && proTimeBin(d).id === ctx.timeBin) s += 1;
+  return s;
+}
+
+function proDepthText(waterC, light, kind) {
+  if (/Surface/.test(kind)) return "Surface";
+  if (kind === "Live bait" || kind === "Bottom bait") return "Near bottom or at the depth fish are holding";
+  if (waterC == null) return `${proLen(3)}–${proLen(12)} near cover and edges`;
+  if (waterC < 10) return `Deep and slow: ${proLen(10)}–${proLen(25)} near drop-offs and channels`;
+  if (waterC < 16) return `Transitions: ${proLen(5)}–${proLen(14)} on points, humps and creek bends`;
+  if (waterC < 25) return light === "low" ? `Shallow: ${proLen(1)}–${proLen(6)} along edges and cover` : `${proLen(4)}–${proLen(12)}; shallow cover early and late`;
+  return light === "low" ? `Shallow: ${proLen(1)}–${proLen(5)} in shade and around cover` : `Deeper: ${proLen(10)}–${proLen(22)} or shaded structure through midday`;
+}
+
+function proBuildPlan({ days, now, items, catches, tideNext, precip48h }) {
   const profile = days.profile;
   const waterC = typeof days.waterF === "number" ? (days.waterF - 32) / 1.8 : null;
-  const picks = [];
-  const hr = now || null; // the scored "now" hour, or best hour
-  const wf = days.waterF;
+  const hr = now || null;
+  const h = hr ? hr.hour : {};
+  const trend = hr ? proTrendOf(hr.pd) : null;
+  const windMph = typeof h.wind === "number" ? h.wind : null;
+  const d0 = days.days[0];
+  const nearSun = hr && d0 ? Math.min(Math.abs(hr.t - d0.sunrise), Math.abs(hr.t - d0.sunset)) / 60000 : 999;
+  const isNight = hr && d0 ? hr.t < d0.sunrise - 30 * 60000 || hr.t > d0.sunset + 30 * 60000 : false;
+  const light = isNight ? "low" : nearSun < 90 || (h.cloud ?? 50) > 80 ? "low" : (h.cloud ?? 50) < 25 && nearSun > 150 ? "bright" : "mid";
+  const stained = typeof precip48h === "number" && precip48h > 0.6;
+  const clarity = stained ? "stained" : "clear";
+  const salt = !!profile.salt || (profile.id === "generic" && !!days.hasTide);
+  const timeBin = hr ? proTimeBin(new Date(hr.t)).id : null;
+  const band = waterC != null && profile.bands ? (profile.bands.find((b) => waterC <= b.maxC) || profile.bands[profile.bands.length - 1]) : null;
+  const bandKw = band ? band.keywords.map((k) => k.toLowerCase()) : [];
+  const ctx = { trend, waterC, timeBin };
 
-  if (waterC !== null) {
-    const band = profile.bands.find((b) => waterC <= b.maxC) || profile.bands[profile.bands.length - 1];
-    picks.push({
-      title: band.title,
-      why: `${band.why} Water ≈ ${fmtTemp(wf)}${days.waterSource === "estimate" ? " (estimated)" : ""}.`,
-      lures: band.lures, keywords: band.keywords, tag: profile.id === "generic" ? "General" : profile.label,
-    });
-  }
-  if (hr) {
-    const h = hr.hour;
-    const trend = proTrendOf(hr.pd);
-    const sunrise = days.days[0] ? days.days[0].sunrise : 0, sunset = days.days[0] ? days.days[0].sunset : 0;
-    const nearSun = Math.min(Math.abs(hr.t - sunrise), Math.abs(hr.t - sunset)) / 60000;
-    if (profile.surface && nearSun < 75 && (h.wind ?? 0) < 14 && (waterC === null || waterC > 12)) {
-      picks.push({ title: "Low-light surface window", why: `Light wind (${fmtSpeed(h.wind ?? 0)}) at the edge of the day — fish push shallow and hit the surface.`, lures: ["Walking topwater", "Popper", "Buzzbait / prop bait"], keywords: ["topwater", "popper", "walking", "buzzbait", "frog", "prop"], tag: "Conditions" });
+  const scored = [];
+  for (const a of PRO_LURE_KB) {
+    // Skip styles that make no sense for this water type.
+    if (a.w === "salt" && profile.id !== "generic" && !profile.salt) continue;
+    if (a.w === "salt" && profile.id === "generic" && !salt) continue;
+    if (a.w === "fresh" && profile.salt && !/striped|euro-seabass|snook/.test(profile.id)) continue;
+    if (profile.id !== "generic" && a.fit.length && !a.fit.includes(profile.id) && !bandKw.some((k) => a.tags.some((t) => t.includes(k) || k.includes(t)))) continue;
+    let s = 50; const why = [];
+    if (waterC != null) {
+      const [lo, hi, peak] = a.t;
+      if (waterC >= lo && waterC <= hi) { s += 16; if (Math.abs(waterC - peak) <= 3) { s += 9; why.push(`Water at ${fmtTemp(days.waterF)} is right in this bait's sweet spot`); } else why.push(`${fmtTemp(days.waterF)} water suits it`); }
+      else if (waterC >= lo - 4 && waterC <= hi + 4) { s -= 2; }
+      else { s -= 24; }
     }
-    if (trend === "falling") picks.push({ title: "Reaction baits before the front", why: "Falling pressure usually turns fish on before a system arrives — fast, flashy baits get eaten.", lures: ["Spinnerbait", "Lipless crankbait", "Swimbait", "Spoon"], keywords: ["spinnerbait", "chatterbait", "crankbait", "swim", "lipless", "spoon"], tag: "Conditions" });
-    else if (trend === "rising") picks.push({ title: "Slow down and downsize", why: "Pressure rising after a front makes fish finicky — smaller, slower, closer to cover.", lures: ["Ned rig", "Drop shot", "Small soft plastic", "Light jig"], keywords: ["ned rig", "drop shot", "finesse", "jig", "soft plastic", "worm"], tag: "Conditions" });
-    if (typeof precip48h === "number" && precip48h > 0.6) picks.push({ title: "Stained water: add vibration and flash", why: `About ${isMetric() ? Math.round(precip48h * 25.4) + " mm" : precip48h.toFixed(1) + " in"} of rain in the last 2 days — water is likely stained, so fish find baits by vibration.`, lures: ["Spinnerbait", "Chatterbait", "Rattling crankbait", "Dark-colour plastics"], keywords: ["spinnerbait", "chatterbait", "rattle", "crankbait", "dark", "spoon"], tag: "Conditions" });
-    else if ((h.cloud ?? 50) < 25 && hr.t > sunrise && hr.t < sunset && nearSun > 150) picks.push({ title: "Bright and clear: go natural", why: "Bluebird skies push fish tight to cover or deeper — natural colours, subtle baits, lighter line.", lures: ["Natural-colour soft plastic", "Finesse jig", "Drop shot"], keywords: ["finesse", "natural", "soft plastic", "drop shot", "shad"], tag: "Conditions" });
-    if ((h.wind ?? 0) > 15) picks.push({ title: "Wind-driven feed", why: `${fmtSpeed(h.wind)} wind pushes baitfish — search baits cover water fast.`, lures: ["Crankbait", "Spinnerbait", "Swimbait"], keywords: ["crankbait", "spinnerbait", "swimbait"], tag: "Conditions" });
+    if (a.light === "low") { if (light === "low") { s += 13; why.push(isNight ? "Night and dim light favour a bait fish can find by sound and silhouette" : "Low light brings fish up shallow where this shines"); } else if (light === "bright") s -= 11; }
+    if (a.light === "bright") { if (light === "bright") { s += 10; why.push("Bright sun pushes fish to cover, where this style gets bites"); } else if (light === "low") s -= 5; }
+    if (windMph != null) {
+      if (a.wind === "calm") { if (windMph < 8) { s += 8; why.push("Calm surface lets this bait work as designed"); } else if (windMph > 15) s -= 12; }
+      if (a.wind === "windy") { if (windMph > 12) { s += 12; why.push(`${fmtSpeed(windMph)} wind pushes bait and hides your line`); } else if (windMph < 5) s -= 6; }
+    }
+    if (a.trend === "falling" && trend === "falling") { s += 11; why.push("Falling pressure turns fish aggressive before the front"); }
+    if (a.trend === "rising" && trend === "rising") { s += 11; why.push("Rising pressure after a front calls for something slower and subtler"); }
+    if (a.trend === "falling" && trend === "rising") s -= 7;
+    if (a.trend === "rising" && trend === "falling") s -= 5;
+    if (a.clear === "stained") { if (stained) { s += 9; why.push("Recent rain stained the water, so flash and vibration help"); } else s -= 3; }
+    if (a.clear === "clear") { if (!stained) { s += 8; why.push("Clear water rewards natural, finesse presentations"); } else s -= 9; }
+    if (profile.id !== "generic" && a.fit.includes(profile.id)) { s += 12; why.push(`A proven choice for ${profile.label.toLowerCase()}`); }
+    const tagHit = bandKw.some((k) => a.tags.some((t) => t.includes(k) || k.includes(t)));
+    if (tagHit) { s += 13; if (band) why.push(`Fits the "${band.title.toLowerCase()}" pattern for this water temperature`); }
+    if (salt && tideNext && /Live|Search|Bottom/.test(a.kind)) { s += 4; if (tideNext === "H") why.push("Incoming tide pulls bait onto the flats"); else why.push("Outgoing tide flushes bait past ambush points"); }
+    // Your own history with this style
+    let own = 0, ownSim = 0;
+    for (const c of catches || []) {
+      if (!c.lure) continue;
+      if (profile.id !== "generic" && proSpeciesProfile(c.species).id !== profile.id) continue;
+      if (!a.kw.test(c.lure)) continue;
+      own++; ownSim += proCatchSimilar(c, ctx);
+    }
+    if (own) { s += Math.min(24, own * 8) + Math.min(12, ownSim * 3); why.unshift(`${own} of your catches came on this style${ownSim >= own ? ", in conditions like these" : ""}`); }
+    const m = proLureMatchItems(a, items);
+    scored.push({ a, score: Math.max(1, Math.min(98, Math.round(100 * Math.tanh((s - 35) / 70)))), raw: s, why: why.slice(0, 3), own, have: m.have, out: m.out });
   }
-  if (profile.salt && tideNext) {
-    picks.push(tideNext === "H"
-      ? { title: "Incoming tide", why: "Rising water pulls bait onto flats and structure — predators follow it in.", lures: ["Swimbait", "Live shrimp", "Topwater"], keywords: ["swimbait", "shrimp", "topwater", "soft plastic"], tag: "Tide" }
-      : { title: "Outgoing tide", why: "Falling water flushes bait out of cover — ambush the drains, edges and channels.", lures: ["Jig + soft plastic", "Live bait", "Paddle-tail"], keywords: ["jig", "soft plastic", "live", "paddle", "swimbait"], tag: "Tide" });
-  }
-  const hist = proHistoryLures(catches, profile.id);
-  if (hist.length && hist[0][1] >= 2) {
-    picks.unshift({ title: `Your own hot lure: ${hist[0][0]}`, why: `${hist[0][1]} of your ${profile.id === "generic" ? "" : profile.label.toLowerCase() + " "}catches came on it${hist[1] ? `, then ${hist[1][0]} (${hist[1][1]})` : ""}.`, lures: [hist[0][0]], keywords: [hist[0][0]], tag: "Your history" });
-  }
-  const seen = new Set();
-  return picks.filter((p) => (seen.has(p.title) ? false : (seen.add(p.title), true))).slice(0, 5).map((p) => ({
-    ...p,
-    matches: (items || []).filter((i) => p.keywords.some((k) => `${i.name} ${i.spec || ""} ${i.notes || ""}`.toLowerCase().includes(k.toLowerCase()))),
-  }));
+  scored.sort((x, y) => y.raw - x.raw);
+  // Variety: no more than two of the same style (surface, finesse, ...) before the rest of the list.
+  { const cnt = {}, keep = [], later = []; for (const r of scored) { cnt[r.a.kind] = (cnt[r.a.kind] || 0) + 1; (cnt[r.a.kind] <= 2 ? keep : later).push(r); } scored.length = 0; scored.push(...keep, ...later); }
+
+  const mk = (r) => {
+    const a = r.a;
+    const colors = a.colors[light === "low" ? "low" : clarity];
+    const missing = (a.needs || []).filter((n) => !(items || []).some((i) => n.kw.test(`${i.name} ${i.spec || ""}`) && Number(i.quantity) > 0));
+    return {
+      id: a.id, title: a.label, kind: a.kind, score: r.score, why: r.why, own: r.own,
+      retrieve: a.retrieve, size: a.size, rod: a.rod, line: a.line, colors, depth: proDepthText(waterC, light, a.kind),
+      have: r.have, out: r.out, needs: missing, buyName: a.label,
+    };
+  };
+  const top = scored.slice(0, 8).map(mk);
+  const owned = scored.filter((r) => r.have.length).slice(0, 4).map(mk);
+  const buy = scored.filter((r) => !r.have.length && r.score >= 58).slice(0, 3).map(mk);
+  const bits = [];
+  if (waterC != null) bits.push(`${fmtTemp(days.waterF)} water${days.waterSource === "estimate" ? " (estimated)" : ""}`);
+  bits.push(stained ? "stained after rain" : "clear water");
+  if (windMph != null) bits.push(windMph < 6 ? "light wind" : windMph > 15 ? `${fmtSpeed(windMph)} wind` : "a breeze");
+  if (trend) bits.push(`${trend} pressure`);
+  bits.push(isNight ? "night" : light === "low" ? "low light" : light === "bright" ? "bright sun" : "mixed light");
+  const aggressive = trend === "falling" || (light === "low" && windMph != null && windMph > 6);
+  const read = `${bits.join(", ")}. ${aggressive ? "Fish should be willing to chase — lead with power and reaction baits." : trend === "rising" || light === "bright" ? "Fish will be pickier — go smaller, slower and more natural." : "A balanced day — start with a search bait, then slow down where you find fish."}`;
+  return { read, top, owned, buy, light, clarity };
 }
+// Kept for callers that only need the ranked list.
+function proBuildPicks(args) { return proBuildPlan(args).top; }
 
 /* ---------------- catch condition snapshots + personal insights ---------------- */
 const PRO_TIME_BINS = [
@@ -1486,6 +1663,309 @@ function ProLockBox() {
 }
 // <<PRO-BILLING-END>>
 
+// <<PRO-SCAN-START>>
+/* ---------------- Tackle scan: photo -> identified gear -> your box ----------------
+   Two engines. (1) Bring-your-own-AI: the person pastes their own Claude / OpenAI / Gemini key in Settings;
+   the photo goes straight from the phone to that provider (no Epic Fishy server in between) and the key never
+   leaves the device. (2) A free on-device model (CLIP, runs in the browser) that recognises the broad kind of
+   tackle but not brand or size. */
+const AI_STORE = "efai:v1";
+const AI_PROVIDERS = {
+  claude: { label: "Claude (Anthropic)", model: "claude-sonnet-5-5", keyUrl: "https://console.anthropic.com/settings/keys", hint: "sk-ant-…" },
+  openai: { label: "ChatGPT (OpenAI)", model: "gpt-4o-mini", keyUrl: "https://platform.openai.com/api-keys", hint: "sk-…" },
+  gemini: { label: "Gemini (Google)", model: "gemini-2.5-flash", keyUrl: "https://aistudio.google.com/apikey", hint: "AIza…" },
+};
+function proAiGet() { try { const v = JSON.parse(localStorage.getItem(AI_STORE) || "null"); return v && v.key && AI_PROVIDERS[v.provider] ? v : null; } catch (e) { return null; } }
+function proAiSet(v) { try { if (v) localStorage.setItem(AI_STORE, JSON.stringify(v)); else localStorage.removeItem(AI_STORE); } catch (e) { /* storage blocked */ } }
+
+const PRO_SCAN_PROMPT = `You are identifying fishing tackle in a photo to log it in a tackle-box inventory.
+List every distinct tackle item or group of identical items you can see (lures, baits, hooks, line, weights, rods, reels, tools, other).
+For each give:
+- "name": brand and model if you can read or confidently recognise it, otherwise a clear generic description (e.g. "Walking topwater lure", "Texas-rig worm hooks")
+- "category": exactly one of lures, hooks, line, weights, rods, tools, other (put reels with rods)
+- "spec": size, weight, line test, colour pattern — only what is visible or on the packaging, comma-separated
+- "quantity": the number visible as an integer (1 if unsure)
+- "notes": one short useful note (colour pattern, condition, what it is good for)
+- "confidence": a number from 0 to 1
+Do not invent brands or sizes you cannot see. If no fishing tackle is visible return an empty list.
+Reply with ONLY JSON, no other text: {"items":[...],"summary":"one short sentence"}`;
+
+async function proAiCall(cfg, { prompt, imageDataUrl, maxTokens = 1200 }) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 60000);
+  const b64 = imageDataUrl ? imageDataUrl.split(",")[1] : null;
+  const mime = imageDataUrl ? (imageDataUrl.match(/^data:([^;]+);/) || [])[1] || "image/jpeg" : null;
+  try {
+    let res;
+    if (cfg.provider === "claude") {
+      const content = [];
+      if (b64) content.push({ type: "image", source: { type: "base64", media_type: mime, data: b64 } });
+      content.push({ type: "text", text: prompt });
+      res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", signal: ctl.signal,
+        headers: { "content-type": "application/json", "x-api-key": cfg.key, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+        body: JSON.stringify({ model: cfg.model, max_tokens: maxTokens, messages: [{ role: "user", content }] }),
+      });
+    } else if (cfg.provider === "openai") {
+      const content = [{ type: "text", text: prompt }];
+      if (b64) content.push({ type: "image_url", image_url: { url: imageDataUrl } });
+      res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST", signal: ctl.signal,
+        headers: { "content-type": "application/json", authorization: `Bearer ${cfg.key}` },
+        body: JSON.stringify({ model: cfg.model, max_tokens: maxTokens, messages: [{ role: "user", content }] }),
+      });
+    } else {
+      const parts = [{ text: prompt }];
+      if (b64) parts.push({ inline_data: { mime_type: mime, data: b64 } });
+      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model)}:generateContent`, {
+        method: "POST", signal: ctl.signal,
+        headers: { "content-type": "application/json", "x-goog-api-key": cfg.key },
+        body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: { maxOutputTokens: maxTokens } }),
+      });
+    }
+    if (!res.ok) {
+      const e = new Error(`HTTP ${res.status}`); e.status = res.status;
+      try { const j = await res.json(); e.detail = (j.error && (j.error.message || j.error)) || ""; } catch (x) { /* no body */ }
+      throw e;
+    }
+    const j = await res.json();
+    if (cfg.provider === "claude") return (j.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
+    if (cfg.provider === "openai") return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "";
+    return ((j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || []).map((p) => p.text || "").join("");
+  } finally { clearTimeout(timer); }
+}
+
+function proAiErrorText(e, cfg) {
+  const who = AI_PROVIDERS[cfg.provider].label;
+  if (e && e.name === "AbortError") return `${who} took too long to answer. Try again with a clearer, closer photo.`;
+  if (e && (e.status === 401 || e.status === 403)) return `${who} rejected your key. Check it in Settings.`;
+  if (e && e.status === 404) return `${who} doesn't know the model "${cfg.model}". Change the model name in Settings.`;
+  if (e && e.status === 429) return `${who} says you're out of quota or going too fast. Check your plan and try again shortly.`;
+  if (e && e.status === 400) return `${who} couldn't process that request${e.detail ? ` (${String(e.detail).slice(0, 120)})` : ""}.`;
+  if (e && e.status >= 500) return `${who} is having trouble right now. Try again in a minute.`;
+  return `Couldn't reach ${who}. Check your connection and try again.`;
+}
+
+const PRO_SCAN_CATS = ["lures", "hooks", "line", "weights", "rods", "tools", "other"];
+function proParseScan(text) {
+  let t = String(text || "").trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a < 0 || b <= a) throw new Error("no json");
+  const j = JSON.parse(t.slice(a, b + 1));
+  const clean = (v, n) => String(v == null ? "" : v).replace(/\s+/g, " ").trim().slice(0, n);
+  const items = (Array.isArray(j.items) ? j.items : []).slice(0, 12).map((i) => ({
+    name: clean(i.name, 80), category: PRO_SCAN_CATS.includes(String(i.category || "").toLowerCase()) ? String(i.category).toLowerCase() : "other",
+    spec: clean(i.spec, 80), quantity: Math.max(1, Math.min(999, parseInt(i.quantity, 10) || 1)), notes: clean(i.notes, 140),
+    confidence: typeof i.confidence === "number" ? Math.max(0, Math.min(1, i.confidence)) : null,
+  })).filter((i) => i.name);
+  return { items, summary: clean(j.summary, 160) };
+}
+
+// On-device recogniser (CLIP zero-shot): broad kind of tackle only.
+const PRO_CLIP_LABELS = [
+  ["a soft plastic worm fishing lure", "Soft plastic worm", "lures"], ["a soft plastic swimbait with a paddle tail", "Paddle-tail swimbait", "lures"],
+  ["a crankbait fishing lure with a diving lip", "Crankbait", "lures"], ["a spinnerbait fishing lure", "Spinnerbait", "lures"],
+  ["a topwater popper fishing lure", "Topwater popper", "lures"], ["a walking topwater fishing lure", "Walking topwater", "lures"],
+  ["a jerkbait minnow fishing lure", "Jerkbait", "lures"], ["a fishing jig with a skirt", "Skirted jig", "lures"],
+  ["a jig head with a soft plastic body", "Jig head + soft plastic", "lures"], ["a metal fishing spoon lure", "Spoon", "lures"],
+  ["an inline spinner fishing lure", "Inline spinner", "lures"], ["a hollow body fishing frog lure", "Frog lure", "lures"],
+  ["a fishing fly for fly fishing", "Fly", "lures"], ["a bag of soft plastic fishing baits", "Soft plastic baits (pack)", "lures"],
+  ["a pack of fishing hooks", "Fishing hooks", "hooks"], ["a treble hook", "Treble hooks", "hooks"], ["a fishing circle hook", "Circle hooks", "hooks"],
+  ["a spool of fishing line", "Fishing line", "line"], ["a fluorocarbon fishing leader spool", "Leader line", "line"],
+  ["fishing sinker weights", "Sinkers", "weights"], ["a bobber float for fishing", "Bobbers / floats", "other"],
+  ["a fishing reel", "Fishing reel", "rods"], ["a fishing rod", "Fishing rod", "rods"],
+  ["fishing pliers", "Fishing pliers", "tools"], ["a fishing line cutter or scissors", "Line cutters", "tools"], ["a fish landing net", "Landing net", "tools"],
+  ["a tackle box", "Tackle box", "other"], ["a bag of fishing swivels and snaps", "Swivels & snaps", "other"],
+];
+function proClipToItems(scores) {
+  const ranked = scores.map((s, i) => ({ score: s, l: PRO_CLIP_LABELS[i] })).filter((r) => r.l).sort((a, b) => b.score - a.score);
+  if (!ranked.length) return { items: [], alts: [] };
+  const top = ranked[0];
+  return {
+    items: [{ name: top.l[1], category: top.l[2], spec: "", quantity: 1, notes: "On-device guess — add the brand and size yourself", confidence: top.score }],
+    alts: ranked.slice(1, 4).map((r) => ({ name: r.l[1], category: r.l[2] })),
+  };
+}
+let proClipPromise = null;
+const proDynImport = (u) => import(u);
+async function proOnDeviceIdentify(dataUrl, onProgress) {
+  if (!proClipPromise) {
+    proClipPromise = (async () => {
+      const tf = await proDynImport("https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2");
+      tf.env.allowLocalModels = false;
+      return tf.pipeline("zero-shot-image-classification", "Xenova/clip-vit-base-patch32", { progress_callback: onProgress });
+    })().catch((e) => { proClipPromise = null; throw e; });
+  }
+  const clf = await proClipPromise;
+  const out = await clf(dataUrl, PRO_CLIP_LABELS.map((l) => l[0]));
+  const byLabel = new Map(out.map((o) => [o.label, o.score]));
+  return proClipToItems(PRO_CLIP_LABELS.map((l) => byLabel.get(l[0]) || 0));
+}
+
+function AiScanCard() {
+  const saved = proAiGet();
+  const [provider, setProvider] = useState(saved ? saved.provider : "claude");
+  const [key, setKey] = useState(saved ? saved.key : "");
+  const [model, setModel] = useState(saved ? saved.model : AI_PROVIDERS.claude.model);
+  const [show, setShow] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+  const cfg = () => ({ provider, key: key.trim(), model: model.trim() || AI_PROVIDERS[provider].model });
+  function pick(p) { setProvider(p); setModel(AI_PROVIDERS[p].model); setMsg(null); }
+  function save() { if (!key.trim()) { setMsg({ ok: false, t: "Paste your key first." }); return; } proAiSet(cfg()); setMsg({ ok: true, t: "Saved on this device." }); }
+  async function test() {
+    if (!key.trim()) { setMsg({ ok: false, t: "Paste your key first." }); return; }
+    setBusy(true); setMsg(null);
+    try { await proAiCall(cfg(), { prompt: "Reply with the single word OK.", maxTokens: 16 }); proAiSet(cfg()); setMsg({ ok: true, t: "Works. Key saved on this device." }); }
+    catch (e) { setMsg({ ok: false, t: proAiErrorText(e, cfg()) }); }
+    setBusy(false);
+  }
+  function remove() { proAiSet(null); setKey(""); setMsg({ ok: true, t: "Key removed from this device." }); }
+  return (
+    <CardShell title="TACKLE SCAN: YOUR OWN AI" subtitle="Photograph tackle and have your own AI name it and log it">
+      <div className="space-y-3">
+        <Field label="AI provider">
+          <select value={provider} onChange={(e) => pick(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle}>
+            {Object.entries(AI_PROVIDERS).map(([id, p]) => <option key={id} value={id}>{p.label}</option>)}
+          </select>
+        </Field>
+        <Field label="Your API key">
+          <div className="flex gap-2">
+            <input type={show ? "text" : "password"} value={key} onChange={(e) => setKey(e.target.value)} placeholder={AI_PROVIDERS[provider].hint} autoComplete="off" spellCheck={false} className="flex-1 min-w-0 rounded-lg py-2 px-3 text-sm outline-none tb-mono" style={inputStyle} />
+            <button type="button" onClick={() => setShow((v) => !v)} className="px-3 rounded-lg text-xs font-bold" style={{ ...inputStyle, color: "var(--tb-muted)" }}>{show ? "Hide" : "Show"}</button>
+          </div>
+        </Field>
+        <Field label="Model">
+          <input value={model} onChange={(e) => setModel(e.target.value)} autoComplete="off" spellCheck={false} className="w-full rounded-lg py-2 px-3 text-sm outline-none tb-mono" style={inputStyle} />
+        </Field>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={test} disabled={busy} className="px-3.5 py-2 rounded-lg text-sm font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)", opacity: busy ? 0.6 : 1 }}>{busy ? "Testing..." : "Test & save"}</button>
+          <button onClick={save} className="px-3.5 py-2 rounded-lg text-sm font-bold" style={{ ...inputStyle, color: "var(--tb-text)" }}>Save</button>
+          {saved && <button onClick={remove} className="px-3.5 py-2 rounded-lg text-sm font-bold" style={{ ...inputStyle, color: "var(--tb-flare)" }}>Remove key</button>}
+        </div>
+        {msg && <div role="status" className="text-[13px]" style={{ color: msg.ok ? "var(--tb-brass)" : "var(--tb-flare)" }}>{msg.t}</div>}
+        <div className="text-[12px] leading-snug" style={{ color: "var(--tb-muted)" }}>
+          The key is stored only on this device and is sent only to {AI_PROVIDERS[provider].label.split(" ")[0]}. When you scan, the photo goes straight to that provider and you pay them for it (usually a cent or two per photo). Epic Fishy never sees your key or your photos.{" "}
+          <a href={AI_PROVIDERS[provider].keyUrl} target="_blank" rel="noopener noreferrer" style={{ color: "var(--tb-blue)" }}>Get a key</a>
+        </div>
+      </div>
+    </CardShell>
+  );
+}
+
+function ScanTackleSheet({ onClose, onAdd, onOpenSettings }) {
+  const ent = useProEntitlement();
+  const cfg = proAiGet();
+  const [engine, setEngine] = useState(cfg ? "ai" : "device");
+  const [stage, setStage] = useState("pick"); // pick | busy | results
+  const [busyMsg, setBusyMsg] = useState("");
+  const [error, setError] = useState(null);
+  const [rows, setRows] = useState([]);
+  const [alts, setAlts] = useState([]);
+  const [summary, setSummary] = useState("");
+  const camRef = useRef(null), galRef = useRef(null);
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+
+  async function handle(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setError(null); setStage("busy"); setBusyMsg("Preparing photo...");
+    let big, thumb;
+    try { big = await compressImage(file, 1280, 0.82); thumb = await compressImage(file, 480, 0.6); }
+    catch (x) { setError("Couldn't read that photo. Try another."); setStage(rows.length ? "results" : "pick"); return; }
+    try {
+      let res;
+      if (engine === "ai" && cfg) {
+        setBusyMsg(`Asking ${AI_PROVIDERS[cfg.provider].label.split(" ")[0]}...`);
+        const text = await proAiCall(cfg, { prompt: PRO_SCAN_PROMPT, imageDataUrl: big });
+        try { res = proParseScan(text); } catch (x) { throw Object.assign(new Error("parse"), { parse: true }); }
+        setAlts([]);
+      } else {
+        setBusyMsg("Loading the on-device model (first time only, about 90 MB)...");
+        res = await proOnDeviceIdentify(big, (p) => { if (p && p.status === "progress" && typeof p.progress === "number") setBusyMsg(`Downloading the on-device model... ${Math.round(p.progress)}%`); });
+        setAlts(res.alts || []);
+      }
+      if (!res.items.length) { setError("I couldn't see any tackle in that photo. Try a closer, brighter shot with the item filling the frame."); setStage(rows.length ? "results" : "pick"); return; }
+      setSummary(res.summary || "");
+      setRows((prev) => prev.concat(res.items.map((i) => ({ ...i, key: uid(), include: true, photo: thumb }))));
+      setStage("results");
+    } catch (x) {
+      setError(x && x.parse ? "The AI's answer wasn't readable. Try the photo again." : engine === "ai" && cfg ? proAiErrorText(x, cfg) : "Couldn't load the on-device model. Check your connection (it downloads once, then works offline).");
+      setStage(rows.length ? "results" : "pick");
+    }
+  }
+  const upd = (k, patch) => setRows((r) => r.map((x) => (x.key === k ? { ...x, ...patch } : x)));
+  const chosen = rows.filter((r) => r.include && r.name.trim());
+  return (
+    <div className="tb-overlay absolute inset-0 z-30" style={{ background: "rgba(10,16,19,0.65)" }}>
+      <div className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-5 pt-4 pb-6" style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "92%", overflowY: "auto" }}>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="tb-stencil text-xl" style={{ color: "var(--tb-text)" }}>SCAN TACKLE</h2>
+          <button onClick={onClose} aria-label="Close"><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+        {!ent.unlocked ? (
+          <div>
+            <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Point your camera at a lure, a pack of hooks or a whole tray. Epic Fishy names each item, sizes it, and adds it to your box. Tackle scanning is part of Epic Fishy Pro.</div>
+            <ProLockBox />
+          </div>
+        ) : (
+          <>
+            <input ref={camRef} type="file" accept="image/*" capture="environment" onChange={handle} className="hidden" />
+            <input ref={galRef} type="file" accept="image/*" onChange={handle} className="hidden" />
+            <div className="flex gap-2 mb-3" role="group" aria-label="Recognition engine">
+              <ChipButton active={engine === "ai"} onClick={() => (cfg ? setEngine("ai") : onOpenSettings && onOpenSettings())} label={cfg ? `${AI_PROVIDERS[cfg.provider].label.split(" ")[0]} (best)` : "Your AI (set up)"} />
+              <ChipButton active={engine === "device"} onClick={() => setEngine("device")} label="On-device (free)" />
+            </div>
+            {engine === "device" && <div className="text-[12px] mb-3" style={{ color: "var(--tb-muted)" }}>Free and private, but it only recognises the broad kind of tackle. Add your own AI key in Settings for brand, size and counts.</div>}
+            {stage === "busy" ? (
+              <div className="flex items-center gap-2 text-sm rounded-lg py-3 px-3" style={inputStyle}><RefreshCw size={15} className="tb-spin" style={{ color: "var(--tb-muted)" }} /><span style={{ color: "var(--tb-muted)" }}>{busyMsg}</span></div>
+            ) : (
+              <div className="grid grid-cols-2 gap-2">
+                <button onClick={() => camRef.current && camRef.current.click()} className="py-3 rounded-xl text-[15px] font-bold flex items-center justify-center gap-2" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}><Camera size={18} /> {rows.length ? "Scan another" : "Take photo"}</button>
+                <button onClick={() => galRef.current && galRef.current.click()} className="py-3 rounded-xl text-[15px] font-bold" style={{ ...inputStyle, color: "var(--tb-text)" }}>Choose photo</button>
+              </div>
+            )}
+            {error && <div role="alert" className="mt-3 text-[13px]" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+            {summary && stage === "results" && <div className="mt-3 text-[13px]" style={{ color: "var(--tb-muted)" }}>{summary}</div>}
+            {rows.length > 0 && (
+              <div className="mt-3 space-y-3">
+                {rows.map((r) => (
+                  <div key={r.key} className="rounded-xl p-3" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)", opacity: r.include ? 1 : 0.5 }}>
+                    <div className="flex gap-3">
+                      <img src={r.photo} alt="" className="w-14 h-14 rounded-lg object-cover shrink-0" />
+                      <div className="flex-1 min-w-0 space-y-2">
+                        <input value={r.name} onChange={(e) => upd(r.key, { name: e.target.value })} aria-label="Item name" className="w-full rounded-lg py-1.5 px-2.5 text-sm outline-none font-bold" style={inputStyle} />
+                        <div className="grid grid-cols-2 gap-2">
+                          <select value={r.category} onChange={(e) => upd(r.key, { category: e.target.value })} aria-label="Compartment" className="rounded-lg py-1.5 px-2 text-sm outline-none" style={inputStyle}>{CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}</select>
+                          <input type="number" min="1" value={r.quantity} onChange={(e) => upd(r.key, { quantity: e.target.value })} aria-label="Quantity" className="rounded-lg py-1.5 px-2.5 text-sm outline-none tb-mono" style={inputStyle} />
+                        </div>
+                        <input value={r.spec} onChange={(e) => upd(r.key, { spec: e.target.value })} placeholder="Size / spec" aria-label="Size or spec" className="w-full rounded-lg py-1.5 px-2.5 text-sm outline-none" style={inputStyle} />
+                        {r.notes && <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>{r.notes}{typeof r.confidence === "number" && r.confidence < 0.6 ? " (low confidence)" : ""}</div>}
+                      </div>
+                    </div>
+                    <div className="flex justify-between mt-2">
+                      <label className="flex items-center gap-2 text-[13px]" style={{ color: "var(--tb-text)" }}><input type="checkbox" checked={r.include} onChange={(e) => upd(r.key, { include: e.target.checked })} /> Add to my box</label>
+                      <button onClick={() => setRows((x) => x.filter((y) => y.key !== r.key))} className="text-[12px]" style={{ color: "var(--tb-flare)" }}>Remove</button>
+                    </div>
+                  </div>
+                ))}
+                {alts.length > 0 && <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>Not right? It could also be: {alts.map((a) => a.name).join(", ")}. Edit the name above.</div>}
+                <button onClick={() => { onAdd(chosen.map((r) => ({ name: r.name.trim(), category: r.category, spec: r.spec.trim(), quantity: Math.max(1, parseInt(r.quantity, 10) || 1), notes: r.notes, photo: r.photo }))); }} disabled={!chosen.length} className="w-full py-3 rounded-xl text-[15px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)", opacity: chosen.length ? 1 : 0.5 }}>
+                  Add {chosen.length} item{chosen.length === 1 ? "" : "s"} to my box
+                </button>
+              </div>
+            )}
+            {engine === "ai" && cfg && <div className="mt-3 text-[11px]" style={{ color: "var(--tb-muted)" }}>Photos are sent to {AI_PROVIDERS[cfg.provider].label} with your key. Nothing else leaves your phone.</div>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+// <<PRO-SCAN-END>>
+
 // <<PRO-EXTRAS-START>>
 /* ---------------- Pro extras: map layers, calendar reminders, GPX export ---------------- */
 
@@ -1545,6 +2025,7 @@ function proBustForecast(lat, lon) {
   try {
     localStorage.removeItem(PRO_PREFIX + `fc:${lat.toFixed(2)},${lon.toFixed(2)}`);
     localStorage.removeItem(PRO_PREFIX + `mr:${lat.toFixed(2)},${lon.toFixed(2)}`);
+    localStorage.removeItem(PRO_PREFIX + `mw:${lat.toFixed(2)},${lon.toFixed(2)}`);
   } catch (e) { /* ignore */ }
 }
 
@@ -1556,13 +2037,14 @@ function useProForecast(lat, lon) {
     setSt((s) => ({ ...s, status: "loading" }));
     (async () => {
       try {
-        const [f, m, p] = await Promise.all([
+        const [f, m, p, w] = await Promise.all([
           proLoadForecast(lat, lon),
           proLoadMarine(lat, lon).catch(() => null),
           proLoadPlace(lat, lon).catch(() => null),
+          proLoadMeasuredWater(lat, lon).catch(() => null),
         ]);
         if (off) return;
-        setSt({ status: "ok", fc: proNormalizeForecast(f.data), marine: m ? m.data : null, place: p ? p.data : null, stale: f.stale, at: f.at });
+        setSt({ status: "ok", fc: proNormalizeForecast(f.data), marine: m ? m.data : null, place: p ? p.data : null, measured: w ? w.data : null, stale: f.stale, at: f.at });
       } catch (e) {
         if (!off) setSt({ status: "error" });
       }
@@ -1642,7 +2124,7 @@ function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQ
 
   const model = useMemo(() => {
     if (st.status !== "ok") return null;
-    try { return proBuildDays(st.fc, st.marine, targetName); } catch (e) { return null; }
+    try { return proBuildDays(st.fc, st.marine, targetName, st.measured); } catch (e) { return null; }
   }, [st, targetName]);
 
   useEffect(() => { setSelT(null); }, [dayIdx, targetName]);
@@ -1702,6 +2184,7 @@ function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQ
               <div>{PRO_MOON_EMOJI[day.solunar.phase.name]} {day.solunar.phase.name}</div>
               <div>{day.solunar.phase.illum}% lit</div>
               <div>Water {typeof model.waterF === "number" ? fmtTemp(model.waterF) : "—"}{model.waterSource === "estimate" ? " (est.)" : ""}</div>
+              {model.waterStation && <div className="text-[11px]">measured · {model.waterStation.name}{model.waterStation.miles ? `, ${isMetric() ? Math.round(model.waterStation.miles * 1.609) + " km" : model.waterStation.miles + " mi"}` : ""}</div>}
             </div>
           </div>
         )}
@@ -1785,7 +2268,7 @@ function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQ
         )}
 
         <p className="text-[12px] mt-3 leading-snug" style={{ color: "var(--tb-muted)" }}>
-          A guide, not a guarantee: it blends light, moon position, pressure trend, wind, sky, {model.hasTide ? "tide flow, " : ""}and {model.waterSource === "estimate" ? "estimated" : "modelled"} water temperature. Data: Open-Meteo{model.hasTide ? " (tides: coarse global model)" : ""}.
+          A guide, not a guarantee: it blends light, moon position, pressure trend, wind, sky, {model.hasTide ? "tide flow, " : ""}and {model.waterSource === "estimate" ? "estimated" : model.waterSource === "measured" ? "measured" : "modelled"} water temperature. Data: Open-Meteo{model.waterSource === "measured" ? ", NOAA CO-OPS water station" : ""}{model.hasTide ? " (tides: coarse global model)" : ""}.
         </p>
         <div className="flex justify-end -mb-1">
           <button onClick={refresh} aria-label="Refresh forecast" className="w-8 h-8 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
@@ -1799,45 +2282,97 @@ function ProBiteForecast({ st, targetName, onTarget, catches, nearby, items, onQ
   );
 }
 
+function ProPickCard({ p, onQuickAdd, compact }) {
+  const pill = p.score >= 80 ? "Excellent match" : p.score >= 66 ? "Strong match" : "Decent match";
+  return (
+    <div>
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{p.title}</div>
+        <span className="text-[11px] px-2 py-0.5 rounded-full" style={{ background: "rgba(45,212,191,0.14)", color: "var(--tb-brass)" }}>{p.kind}</span>
+        <span className="text-[11px] font-bold ml-auto" style={{ color: BITE_COLORS[p.score >= 80 ? "Excellent" : p.score >= 66 ? "Good" : "Fair"] }}>{pill} · {p.score}</span>
+      </div>
+      {p.why.length > 0 && (
+        <ul className="mt-1 space-y-0.5">
+          {p.why.map((w) => <li key={w} className="text-[13px] leading-snug" style={{ color: "var(--tb-muted)" }}>• {w}</li>)}
+        </ul>
+      )}
+      {!compact && (
+        <>
+          <div className="text-[13px] mt-2 leading-snug" style={{ color: "var(--tb-text)" }}><strong>How to fish it:</strong> {p.retrieve}</div>
+          <div className="text-[13px] mt-1" style={{ color: "var(--tb-muted)" }}><strong style={{ color: "var(--tb-text)" }}>Where:</strong> {p.depth}</div>
+          <div className="text-[13px] mt-1" style={{ color: "var(--tb-muted)" }}><strong style={{ color: "var(--tb-text)" }}>Size:</strong> {p.size}</div>
+          <div className="text-[13px] mt-1" style={{ color: "var(--tb-muted)" }}><strong style={{ color: "var(--tb-text)" }}>Setup:</strong> {p.rod} · {p.line}</div>
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {p.colors.map((c) => <span key={c} className="text-[12px] px-2 py-1 rounded-full" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>{c}</span>)}
+          </div>
+        </>
+      )}
+      {p.have.length > 0 ? (
+        <div className="mt-2 text-[13px]" style={{ color: "var(--tb-brass)" }}>In your box: {p.have.slice(0, 4).map((m) => m.name).join(", ")}</div>
+      ) : (
+        <button onClick={() => onQuickAdd && onQuickAdd(p.title, "lures")} className="mt-2 text-[12px] px-2.5 py-1 rounded-full" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+          + not in your box — add {p.title.toLowerCase()}
+        </button>
+      )}
+      {p.out.length > 0 && p.have.length === 0 && <div className="mt-1 text-[12px]" style={{ color: "var(--tb-flare)" }}>You are out of: {p.out.slice(0, 3).map((m) => m.name).join(", ")}</div>}
+      {!compact && p.needs.length > 0 && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <span className="text-[12px]" style={{ color: "var(--tb-muted)" }}>You'll also need:</span>
+          {p.needs.map((n) => (
+            <button key={n.name} onClick={() => onQuickAdd && onQuickAdd(n.name, n.category)} className="text-[12px] px-2 py-1 rounded-full" style={{ background: "var(--tb-surface-2)", color: "var(--tb-brass)", border: "1px solid var(--tb-line)" }}>+ {n.name}</button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProLurePicks({ st, model, catches, items, onQuickAdd, nowHour }) {
-  const picks = useMemo(() => {
+  const plan = useMemo(() => {
     const ext = st.marine ? proTideExtrema(st.marine) : null;
     const next = ext ? ext.find((e) => e.t > Date.now()) : null;
     const t = Date.now();
     const precip48h = st.fc.hours.filter((h) => h.t > t - 48 * 3600000 && h.t <= t).reduce((s, h) => s + (h.precip || 0), 0);
-    return proBuildPicks({ days: model, now: nowHour, items, catches, tideNext: next ? next.type : null, precip48h });
+    return proBuildPlan({ days: model, now: nowHour, items, catches, tideNext: next ? next.type : null, precip48h });
   }, [st, model, catches, items, nowHour]);
   const ent = useProEntitlement();
-  if (!picks.length) return null;
-  const shownPicks = ent.unlocked ? picks : picks.slice(0, 1);
+  const [more, setMore] = useState(false);
+  if (!plan.top.length) return null;
+  const best = plan.top.slice(0, ent.unlocked ? 3 : 1);
+  const bestIds = new Set(plan.top.slice(0, 3).map((p) => p.id));
+  const fromBox = plan.owned.filter((p) => !bestIds.has(p.id)).slice(0, 3);
+  const Sep = ({ children }) => <div className="text-[12px] font-bold tracking-wide mt-4 mb-2" style={{ color: "var(--tb-brass)" }}>{children}</div>;
   return (
-    <CardShell title="WHAT TO THROW" subtitle={`for ${model.profile.id === "generic" ? "general fishing" : model.profile.label.toLowerCase()} in today's conditions`}>
+    <CardShell title="WHAT TO THROW" subtitle={`for ${model.profile.id === "generic" ? "general fishing" : model.profile.label.toLowerCase()} right now`}>
+      <div className="text-[13px] leading-snug mb-3" style={{ color: "var(--tb-muted)" }}>{plan.read}</div>
       <div>
-        {shownPicks.map((p, idx) => (
-          <div key={p.title} style={{ borderTop: idx > 0 ? "1px solid var(--tb-line)" : "none", paddingTop: idx > 0 ? 10 : 0, marginTop: idx > 0 ? 10 : 0 }}>
-            <div className="flex items-center gap-2 flex-wrap">
-              <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{p.title}</div>
-              <span className="text-[11px] px-2 py-0.5 rounded-full" style={{ background: "rgba(45,212,191,0.14)", color: "var(--tb-brass)" }}>{p.tag}</span>
-            </div>
-            <div className="text-[13px] mt-0.5 leading-snug" style={{ color: "var(--tb-muted)" }}>{p.why}</div>
-            <div className="flex flex-wrap gap-1.5 mt-2">
-              {p.lures.map((l) => <span key={l} className="text-[12px] px-2 py-1 rounded-full" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>{l}</span>)}
-            </div>
-            {p.matches.length > 0 ? (
-              <div className="mt-2 text-[13px]" style={{ color: "var(--tb-brass)" }}>
-                In your box: {p.matches.slice(0, 4).map((m) => m.name).join(", ")}
-              </div>
-            ) : (
-              <button onClick={() => onQuickAdd && onQuickAdd(p.keywords[0], "lures")} className="mt-2 text-[12px] px-2.5 py-1 rounded-full" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
-                + nothing matching in your box — add {p.keywords[0]}
-              </button>
-            )}
+        {best.map((p, idx) => (
+          <div key={p.id} style={{ borderTop: idx > 0 ? "1px solid var(--tb-line)" : "none", paddingTop: idx > 0 ? 12 : 0, marginTop: idx > 0 ? 12 : 0 }}>
+            <ProPickCard p={p} onQuickAdd={onQuickAdd} />
           </div>
         ))}
       </div>
-      {!ent.unlocked && picks.length > 1 && (
+      {ent.unlocked && fromBox.length > 0 && (
+        <>
+          <Sep>ALSO GOOD, ALREADY IN YOUR BOX</Sep>
+          <div className="space-y-3">{fromBox.map((p) => <ProPickCard key={p.id} p={p} onQuickAdd={onQuickAdd} compact />)}</div>
+        </>
+      )}
+      {ent.unlocked && plan.buy.length > 0 && (
+        <>
+          <Sep>WORTH ADDING TO YOUR BOX</Sep>
+          <div className="space-y-3">{plan.buy.map((p) => <ProPickCard key={p.id} p={p} onQuickAdd={onQuickAdd} compact />)}</div>
+        </>
+      )}
+      {ent.unlocked && plan.top.length > 3 && (
         <div className="mt-3">
-          <div className="text-[13px]" style={{ color: "var(--tb-muted)" }}>{picks.length - 1} more pick{picks.length - 2 === 0 ? "" : "s"} for these conditions, including ones from your own catch history.</div>
+          <button onClick={() => setMore((m) => !m)} className="text-[13px] font-bold" style={{ color: "var(--tb-blue)" }}>{more ? "Hide" : "Show"} more options ({plan.top.length - 3})</button>
+          {more && <div className="mt-2 space-y-3">{plan.top.slice(3).map((p) => <ProPickCard key={p.id} p={p} onQuickAdd={onQuickAdd} compact />)}</div>}
+        </div>
+      )}
+      {!ent.unlocked && (
+        <div className="mt-3">
+          <div className="text-[13px]" style={{ color: "var(--tb-muted)" }}>Pro adds your 2 other best bets, the best lures already in your box, what to buy to fill the gaps, and the rest of the ranked list. Every pick also learns from your own catches.</div>
           <ProLockBox />
         </div>
       )}
@@ -1877,8 +2412,9 @@ function ProSpotRanker({ catches, targetName }) {
       try {
         const f = await proLoadForecast(sp.lat, sp.lon);
         const m = await proLoadMarine(sp.lat, sp.lon).then((r) => r.data).catch(() => null);
+        const mw = await proLoadMeasuredWater(sp.lat, sp.lon).then((r) => r.data).catch(() => null);
         const fc = proNormalizeForecast(f.data);
-        const model = proBuildDays(fc, m, targetName);
+        const model = proBuildDays(fc, m, targetName, mw);
         const today = model.days[0], tomorrow = model.days[1];
         const w = today.windows[0];
         const now = today.hours.find((h) => Date.now() >= h.t && Date.now() < h.t + 3600000);
@@ -2247,7 +2783,7 @@ function ProCommunityMap() {
   useEffect(() => {
     if (!leafletAvailable || !mapRef.current || mapInstance.current) return undefined;
     const map = window.L.map(mapRef.current, { attributionControl: true, worldCopyJump: true }).setView([30, -20], 2);
-    window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 17 }).addTo(map);
+    proBaseMap(window.L, map, 17);
     layerRef.current = window.L.layerGroup().addTo(map);
     mapInstance.current = map;
     return () => { map.remove(); mapInstance.current = null; layerRef.current = null; };
@@ -2345,6 +2881,7 @@ export default function TackleTracker() {
   const [showForm, setShowForm] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
   const [formPrefill, setFormPrefill] = useState(null);
+  const [showScan, setShowScan] = useState(false);
   const [tackleSubView, setTackleSubView] = useState("gear"); // 'gear' | 'guide' | 'knots'
   const [showSettings, setShowSettings] = useState(false);
   const [saveError, setSaveError] = useState(false);
@@ -2463,6 +3000,22 @@ export default function TackleTracker() {
     setShowForm(false);
     setEditingItem(null);
     setFormPrefill(null);
+  }
+
+  // Items identified from photos: merge duplicates by name + compartment, otherwise add new.
+  function addScanned(list) {
+    const norm = (t) => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    setItems((prev) => {
+      const next = prev.slice();
+      for (const n of list) {
+        const at = next.findIndex((i) => i.category === n.category && norm(i.name) === norm(n.name));
+        if (at >= 0) next[at] = { ...next[at], quantity: (Number(next[at].quantity) || 0) + n.quantity, photo: next[at].photo || n.photo };
+        else next.push({ id: uid(), name: n.name, category: n.category, spec: n.spec, quantity: n.quantity, lowThreshold: 1, location: "", condition: CONDITIONS[0], notes: n.notes || "", photo: n.photo || null, lastServiced: null, serviceIntervalDays: null });
+      }
+      return next;
+    });
+    showToast(list.length === 1 ? "Added to your tackle box" : `${list.length} items added to your tackle box`);
+    setShowScan(false);
   }
 
   // Attach the weather/moon/pressure at the moment of the catch (powers Insights). Runs in the background.
@@ -2651,7 +3204,8 @@ export default function TackleTracker() {
 
             {tackleSubView === "gear" && (
               <>
-                <div className="relative mb-4">
+                <div className="flex items-center gap-2 mb-4">
+                <div className="relative flex-1 min-w-0">
                   <Search size={18} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: "var(--tb-muted)" }} />
                   <input
                     value={search}
@@ -2661,6 +3215,10 @@ export default function TackleTracker() {
                     className="w-full rounded-xl py-3 pl-11 pr-3 text-[15px] outline-none"
                     style={{ background: "var(--tb-surface)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}
                   />
+                </div>
+                <button onClick={() => { haptic(); setShowScan(true); }} aria-label="Scan tackle with your camera" className="shrink-0 h-[48px] px-3.5 rounded-xl flex items-center gap-1.5 text-[14px] font-bold" style={{ background: "var(--tb-surface)", color: "var(--tb-brass)", border: "1px solid var(--tb-line)" }}>
+                  <Camera size={18} /> Scan
+                </button>
                 </div>
 
                 {loading && (
@@ -2834,6 +3392,7 @@ export default function TackleTracker() {
       )}
 
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {showScan && <ScanTackleSheet onClose={() => setShowScan(false)} onAdd={addScanned} onOpenSettings={() => { setShowScan(false); setShowSettings(true); }} />}
     </div>
   );
 }
@@ -3682,6 +4241,7 @@ function ConditionsView({ items = [], catches = [], onQuickAdd }) {
   const [tideLoading, setTideLoading] = useState(false);
 
   const [waterTemp, setWaterTemp] = useState(null); // null = not loaded/unavailable
+  const [waterSrc, setWaterSrc] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -3706,6 +4266,15 @@ function ConditionsView({ items = [], catches = [], onQuickAdd }) {
   }, []);
 
   const loadWaterTemp = useCallback(async (lat, lon) => {
+    try {
+      const mw = await proLoadMeasuredWater(lat, lon);
+      if (mw && mw.data && typeof mw.data.tempF === "number") {
+        setWaterTemp(mw.data.tempF);
+        setWaterSrc({ kind: "measured", name: mw.data.name, miles: mw.data.miles });
+        return;
+      }
+    } catch (e) { /* no close station: fall back to the ocean model */ }
+    setWaterSrc({ kind: "model" });
     try {
       const url = `https://marine-api.open-meteo.com/v1/marine?latitude=${lat}&longitude=${lon}&current=sea_surface_temperature&temperature_unit=fahrenheit&timezone=auto`;
       const res = await fetch(url);
@@ -3831,7 +4400,7 @@ function ConditionsView({ items = [], catches = [], onQuickAdd }) {
         </button>
       </div>
 
-      <WeatherCard weather={weather} loading={weatherLoading} error={weatherError} waterTemp={waterTemp} />
+      <WeatherCard weather={weather} loading={weatherLoading} error={weatherError} waterTemp={waterTemp} waterSrc={waterSrc} />
       {!tideError && <TideCard tide={tide} loading={tideLoading} error={null} />}
       <ProConditions location={location} items={items} catches={catches} onQuickAdd={onQuickAdd} noaaTideMissing={!!tideError && !tideLoading} />
       <RadarCard lat={location.lat} lon={location.lon} />
@@ -3841,7 +4410,7 @@ function ConditionsView({ items = [], catches = [], onQuickAdd }) {
   );
 }
 
-function WeatherCard({ weather, loading, error, waterTemp }) {
+function WeatherCard({ weather, loading, error, waterTemp, waterSrc }) {
   useUnits();
   if (loading) return <CardShell><span className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Loading weather...</span></CardShell>;
   if (error) return <CardShell><span className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{error}</span></CardShell>;
@@ -3874,14 +4443,14 @@ function WeatherCard({ weather, loading, error, waterTemp }) {
         <StatRow icon={Sunrise} label="Sunrise" value={fmtTime(sunrise)} />
         <StatRow icon={Sunset} label="Sunset" value={fmtTime(sunset)} />
         {typeof waterTemp === "number" && (
-          <StatRow icon={Waves} label="Water" value={fmtTemp(waterTemp)} />
+          <StatRow icon={Waves} label="Water" value={fmtTemp(waterTemp)} sub={waterSrc && waterSrc.kind === "measured" ? `measured · ${waterSrc.name}${waterSrc.miles ? `, ${isMetric() ? Math.round(waterSrc.miles * 1.609) + " km" : waterSrc.miles + " mi"}` : ""}` : "ocean model"} />
         )}
       </div>
     </CardShell>
   );
 }
 
-function StatRow({ icon: Icon, label, value, trendIcon: TrendIcon }) {
+function StatRow({ icon: Icon, label, value, sub, trendIcon: TrendIcon }) {
   return (
     <div className="flex items-start gap-2.5">
       <Icon size={18} className="shrink-0 mt-0.5" style={{ color: "var(--tb-brass)" }} />
@@ -3891,6 +4460,7 @@ function StatRow({ icon: Icon, label, value, trendIcon: TrendIcon }) {
           <span className="break-words min-w-0">{value}</span>
           {TrendIcon && <TrendIcon size={14} style={{ color: "var(--tb-brass)" }} />}
         </div>
+        {sub && <div className="text-[11px] mt-0.5 leading-tight" style={{ color: "var(--tb-muted)" }}>{sub}</div>}
       </div>
     </div>
   );
@@ -4258,7 +4828,7 @@ function MyMapCard({ catches }) {
   useEffect(() => {
     if (!leafletAvailable || !mapRef.current || mapInstance.current) return undefined;
     const map = window.L.map(mapRef.current, { attributionControl: true, zoomControl: false }).setView([39, -96], 3);
-    osmRef.current = window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: 18 }).addTo(map);
+    osmRef.current = proBaseMap(window.L, map, 18);
     window.L.control.zoom({ position: "bottomright" }).addTo(map);
     mapInstance.current = map;
     return () => { map.remove(); mapInstance.current = null; extraRef.current = {}; };
@@ -4276,7 +4846,8 @@ function MyMapCard({ catches }) {
       if (!on && have) { map.removeLayer(have); delete extraRef.current[def.id]; }
     });
     const sat = want.includes("sat");
-    if (osmRef.current) { if (sat && map.hasLayer(osmRef.current)) map.removeLayer(osmRef.current); if (!sat && !map.hasLayer(osmRef.current)) osmRef.current.addTo(map); }
+    const base = osmRef.current ? osmRef.current.get() : null;
+    if (base) { if (sat && map.hasLayer(base)) map.removeLayer(base); if (!sat && !map.hasLayer(base)) base.addTo(map); }
     if (layerRef.current && layerRef.current.bringToFront) layerRef.current.bringToFront();
   }, [active, ent.unlocked, leafletAvailable]);
 
@@ -6337,6 +6908,10 @@ function SettingsPanel({ onClose }) {
         </div>
 
         <SafetyNotifyCard />
+
+        <div className="h-3" />
+
+        <AiScanCard />
 
         <div className="h-3" />
 
