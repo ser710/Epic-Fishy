@@ -122,7 +122,7 @@ import {
   Trash2, AlertTriangle, ChevronLeft, Minus, Wind, Droplets, Gauge,
   Sunrise, Sunset, Waves, MapPin, RefreshCw, CloudRain, Sun, Cloud,
   CloudFog, CloudSnow, CloudLightning, TrendingUp, TrendingDown, ArrowUp,
-  Ruler, Scale, Trophy, Calendar, Pencil, Camera, ChevronDown, ExternalLink, Settings, Heart, Users, CloudSun
+  Ruler, Scale, Trophy, Calendar, Pencil, Camera, ChevronDown, ChevronRight, ExternalLink, Settings, Heart, Users, CloudSun
 } from "lucide-react";
 
 const CATEGORIES = [
@@ -865,6 +865,52 @@ function proBaseMap(L, map, maxZoom) {
   return { get: () => layer };
 }
 
+// ---- Offline map tiles: saved with the Cache API, served by the service worker when there is no signal ----
+const PRO_TILE_CACHE = "epic-fishy-tiles";
+const PRO_TILE_CAP = 150;
+function proTileKey(url) {
+  const m = /^https:\/\/(?:[a-d]\.)?basemaps\.cartocdn\.com\/rastertiles\/voyager\/(\d+)\/(\d+)\/(\d+)(?:@2x)?\.png/.exec(String(url));
+  return m ? `https://epicfishy.tiles/voyager/${m[1]}/${m[2]}/${m[3]}` : null;
+}
+function proTileXY(lat, lon, z) {
+  const n = 2 ** z, la = Math.max(-85.0511, Math.min(85.0511, lat)) * Math.PI / 180;
+  return { x: Math.max(0, Math.min(n - 1, Math.floor(((lon + 180) / 360) * n))), y: Math.max(0, Math.min(n - 1, Math.floor((1 - Math.log(Math.tan(la) + 1 / Math.cos(la)) / Math.PI) / 2 * n))) };
+}
+// Tiles covering the visible map at this zoom and up to two levels closer (capped, never above zoom 16).
+function proTilesForView(b, zoom, cap = PRO_TILE_CAP) {
+  const z0 = Math.max(1, Math.min(16, Math.round(zoom)));
+  const out = [], levels = [];
+  for (let z = z0; z <= Math.min(16, z0 + 2); z++) {
+    const a = proTileXY(b.north, b.west, z), c = proTileXY(b.south, b.east, z);
+    const list = [];
+    for (let x = a.x; x <= c.x; x++) for (let y = a.y; y <= c.y; y++) list.push({ z, x, y });
+    if (z === z0 && list.length > cap) return { tooBig: list.length, tiles: [], levels: [z0] };
+    if (out.length + list.length > cap) break;
+    out.push(...list); levels.push(z);
+  }
+  return { tiles: out, levels, tooBig: 0 };
+}
+const proTileUrl = (t) => `https://${"abcd"[Math.abs(t.x + t.y) % 4]}.basemaps.cartocdn.com/rastertiles/voyager/${t.z}/${t.x}/${t.y}.png`;
+async function proSaveTiles(tiles, onProgress) {
+  const cache = await caches.open(PRO_TILE_CACHE);
+  let done = 0, failed = 0, i = 0;
+  async function worker() {
+    while (i < tiles.length) {
+      const t = tiles[i++], url = proTileUrl(t);
+      try {
+        const res = await fetch(url, { mode: "cors" });
+        if (!res.ok) throw new Error("http " + res.status);
+        await cache.put(proTileKey(url), res);
+      } catch (e) { failed++; }
+      done++; if (onProgress) onProgress(done, tiles.length);
+    }
+  }
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  return { saved: tiles.length - failed, failed };
+}
+async function proSavedTileCount() { try { return (await (await caches.open(PRO_TILE_CACHE)).keys()).length; } catch (e) { return 0; } }
+async function proClearTiles() { try { return await caches.delete(PRO_TILE_CACHE); } catch (e) { return false; } }
+
 // MEASURED water temperature from the nearest NOAA CO-OPS station (US coasts, bays, Great Lakes).
 // Real sensor readings beat the ocean model and the air-temperature estimate, so they win when a station is close.
 const PRO_WT_MAX_MILES = 25;
@@ -1493,7 +1539,7 @@ async function proSnapshotForCatch(rec, fallbackLoc) {
   const when = new Date(rec.dateTime).getTime();
   if (!Number.isFinite(when)) return null;
   const ageDays = (Date.now() - when) / 86400000;
-  const hourly = "temperature_2m,pressure_msl,cloud_cover,wind_speed_10m";
+  const hourly = "temperature_2m,pressure_msl,cloud_cover,wind_speed_10m,weather_code&daily=sunrise,sunset";
   const units = "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto";
   let url;
   if (ageDays <= 7) {
@@ -1512,7 +1558,38 @@ async function proSnapshotForCatch(rec, fallbackLoc) {
   const moon = proMoonPhase(when);
   const water = proEstimateWaterF(fc, when);
   const r = (v, n = 0) => (typeof v === "number" ? Math.round(v * 10 ** n) / 10 ** n : null);
-  return { tempF: r(h.temp), pressure: r(h.pressure), pd: r(pd, 1), trend: proTrendOf(pd), cloud: r(h.cloud), windMph: r(h.wind), moon: moon.name, illum: moon.illum, waterF: r(water), at: Date.now() };
+  // Forecast scorecard: what would the bite model have said at this moment, and how does that rank against the rest of that day?
+  let score = null, pct = null;
+  try {
+    const day = fc.days.find((d) => when >= d.start && when < d.start + 86400000);
+    if (day && Number.isFinite(day.sunrise) && Number.isFinite(day.sunset)) {
+      const profile = proSpeciesProfile(rec.species);
+      const solunar = proSolunar(day.start, lat, lon);
+      const scoreAt = (hh, i) => {
+        const pv = fc.hours[i - 3];
+        const dp = pv && typeof pv.pressure === "number" && typeof hh.pressure === "number" ? hh.pressure - pv.pressure : null;
+        return proScoreHour({ t: hh.t, sunrise: day.sunrise, sunset: day.sunset, solunar, pressureDelta: dp, hour: hh, waterF: water, profile, tide: null }).score;
+      };
+      const dayScores = [];
+      fc.hours.forEach((hh, i) => { if (hh.t >= day.start && hh.t < day.start + 86400000) dayScores.push(scoreAt(hh, i)); });
+      score = Math.round(scoreAt(h, idx));
+      if (dayScores.length >= 12) pct = Math.round((dayScores.filter((v) => v <= score).length / dayScores.length) * 100) / 100;
+    }
+  } catch (e) { /* scorecard is optional */ }
+  return { v: 2, tempF: r(h.temp), pressure: r(h.pressure), pd: r(pd, 1), trend: proTrendOf(pd), cloud: r(h.cloud), windMph: r(h.wind), moon: moon.name, illum: moon.illum, waterF: r(water), score, pct, at: Date.now() };
+}
+
+// How often did the bite model's best hours line up with when you actually caught fish?
+function proScorecard(catches) {
+  const rows = (catches || []).filter((c) => c.conditions && typeof c.conditions.pct === "number" && typeof c.conditions.score === "number");
+  const n = rows.length;
+  if (!n) return { n: 0 };
+  const topThird = rows.filter((c) => c.conditions.pct >= 0.67).length;
+  const good = rows.filter((c) => c.conditions.score >= 65).length;
+  const avgPct = rows.reduce((a, c) => a + c.conditions.pct, 0) / n;
+  const bySpecies = {};
+  rows.forEach((c) => { const k = c.species || "Fish"; (bySpecies[k] = bySpecies[k] || []).push(c.conditions.pct); });
+  return { n, topThird: topThird / n, good: good / n, avgPct, bySpecies: Object.entries(bySpecies).filter((e) => e[1].length >= 3).map(([k, v]) => ({ species: k, n: v.length, avgPct: v.reduce((a, b) => a + b, 0) / v.length })).sort((a, b) => b.n - a.n).slice(0, 4) };
 }
 
 function proInsights(catches) {
@@ -2011,6 +2088,147 @@ function ScanTackleSheet({ onClose, onAdd, onOpenSettings }) {
 }
 // <<PRO-SCAN-END>>
 
+// <<PRO-GUIDE-START>>
+/* ---------------- Regulations links + species guide ---------------- */
+// There is no free official size-limit API, so we point to the official source for the angler's place and species
+// (a .gov-restricted search) instead of quoting limits that could be out of date. Never a legal answer.
+function proRegsUrl(place, species) {
+  const sp = String(species || "").trim();
+  if (place && place.countryCode === "GB") return "https://www.gov.uk/fishing-licences";
+  const region = place ? [place.region, place.country].filter(Boolean).join(" ") : "";
+  const isUS = place && place.countryCode === "US";
+  const q = `${region} ${sp} fishing regulations size limit season ${isUS ? "site:.gov" : ""}`.replace(/\s+/g, " ").trim();
+  return `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+}
+function useProPlace(lat, lon) {
+  const [place, setPlace] = useState(null);
+  useEffect(() => {
+    if (typeof lat !== "number" || typeof lon !== "number") return undefined;
+    let off = false;
+    proLoadPlace(lat, lon).then((r) => { if (!off) setPlace(r.data); }).catch(() => {});
+    return () => { off = true; };
+  }, [lat !== null && lat !== undefined ? lat.toFixed(1) : null, lon !== null && lon !== undefined ? lon.toFixed(1) : null]);
+  return place;
+}
+function RegsLink({ species, place }) {
+  if (!species) return null;
+  const where = place && (place.region || place.country);
+  return (
+    <a href={proRegsUrl(place, species)} target="_blank" rel="noopener noreferrer" className="inline-block text-[13px] font-bold" style={{ color: "var(--tb-blue)" }}>
+      Check {where ? where + " " : ""}rules for {species}
+    </a>
+  );
+}
+
+const SPECIES_GUIDE = [
+  { name: "Largemouth bass", sci: "Micropterus salmoides", water: "Freshwater", look: "Green back with a dark stripe along the side. The upper jaw reaches past the back of the eye, and the two dorsal fins are almost split in two by a deep notch.", habitat: "Weedy lakes, ponds, slow rivers and reservoirs around wood, docks, pads and grass lines.", mix: ["Smallmouth bass: bronze with vertical bars, jaw ends under the eye", "Spotted bass: tooth patch on the tongue, jaw reaches only to the eye"], handle: "Lip-grip is fine for the fish; support the belly on big ones." },
+  { name: "Smallmouth bass", sci: "Micropterus dolomieu", water: "Freshwater", look: "Bronze-brown with faint vertical bars and a red-brown eye. The jaw ends under the eye.", habitat: "Clear, cooler lakes and rivers over rock, gravel and boulders; current seams in rivers.", mix: ["Largemouth bass: green with a horizontal stripe, bigger mouth", "Spotted bass: rows of spots on the belly"], handle: "Powerful fighters; wet your hands and release quickly in warm water." },
+  { name: "Spotted bass", sci: "Micropterus punctulatus", water: "Freshwater", look: "Looks like a small largemouth but with rows of dark spots along the belly and a rough patch of teeth on the tongue. The jaw reaches only to the eye.", habitat: "Reservoirs and clear streams with rock, steep banks and brush.", mix: ["Largemouth bass: smooth tongue, jaw past the eye", "Smallmouth bass: vertical bars, no belly spots"], handle: "Lip-grip is fine; they are usually under 3 lb." },
+  { name: "Striped bass", sci: "Morone saxatilis", water: "Both", look: "Silver body with seven or eight unbroken dark stripes along the sides.", habitat: "Coastal surf, rips and bays, plus many big reservoirs. Follows schools of baitfish.", mix: ["White bass: smaller and deeper-bodied, stripes faint or broken", "Hybrid striped bass: stockier, stripes broken"], handle: "Support the body horizontally; sharp gill covers." },
+  { name: "White bass", sci: "Morone chrysops", water: "Freshwater", look: "Silver with faint, often broken horizontal stripes and a deep body. Usually 1-2 lb.", habitat: "Reservoirs and large rivers; runs upriver in spring and schools under feeding birds.", mix: ["Striped bass: much bigger, long unbroken stripes", "Yellow bass: yellow-silver with broken stripes, smaller"], handle: "Spiny dorsal fin; hold with a wet hand along the back." },
+  { name: "Black crappie", sci: "Pomoxis nigromaculatus", water: "Freshwater", look: "Silver-green with irregular black speckles and seven or eight dorsal spines.", habitat: "Brush, standing timber, docks and bridge pilings; schools suspended in cooler water.", mix: ["White crappie: faint vertical bars, five or six dorsal spines"], handle: "Paper-thin mouth; use a net or hold gently." },
+  { name: "White crappie", sci: "Pomoxis annularis", water: "Freshwater", look: "Silver-white with faint vertical bars and five or six dorsal spines.", habitat: "Murky reservoirs and slow rivers around brush and fallen trees.", mix: ["Black crappie: dense black speckles, seven or eight spines"], handle: "Paper-thin mouth; use a net or hold gently." },
+  { name: "Bluegill", sci: "Lepomis macrochirus", water: "Freshwater", look: "Deep flat body, dark ear flap with no red edge, a dark blotch at the back of the dorsal fin and often a bluish chin.", habitat: "Ponds, lakes and slow rivers near weeds, docks and beds in the shallows.", mix: ["Redear sunfish: red or orange edge on the ear flap", "Green sunfish: bigger mouth, light edge on fins"], handle: "Sharp dorsal spines; hold flat with a wet hand." },
+  { name: "Redear sunfish", sci: "Lepomis microlophus", water: "Freshwater", look: "Like a bluegill but with a red or orange edge on the ear flap and a smaller mouth. Nicknamed shellcracker.", habitat: "Warm lakes and ponds with sandy bottoms and snails.", mix: ["Bluegill: dark ear flap with no red edge"], handle: "Sharp dorsal spines; hold flat." },
+  { name: "Yellow perch", sci: "Perca flavescens", water: "Freshwater", look: "Gold-yellow with six to eight dark vertical bars and orange-tinged lower fins.", habitat: "Cool lakes and slow rivers; schools over weed edges and drop-offs.", mix: ["Walleye: no bars, big glassy eyes, white tail tip"], handle: "Sharp dorsal spines; wet hands." },
+  { name: "Walleye", sci: "Sander vitreus", water: "Freshwater", look: "Olive-gold with big glassy eyes, sharp teeth and a white tip on the lower lobe of the tail.", habitat: "Cool lakes and rivers; rocky points, humps, weed edges and current breaks, best at dawn, dusk and night.", mix: ["Sauger: blotchy saddle markings, spotted dorsal fin, no white tail tip", "Yellow perch: barred and much smaller"], handle: "Sharp teeth and gill covers; use a lip-gripper or net." },
+  { name: "Northern pike", sci: "Esox lucius", water: "Freshwater", look: "Long, torpedo-shaped, olive-green with rows of light bean-shaped spots. Scales cover only the upper half of the gill cover.", habitat: "Weedy bays, shallow flats and drop-offs in cool lakes and slow rivers.", mix: ["Muskellunge: dark markings on a light body, scales on the whole cheek", "Chain pickerel: chain-link pattern, much smaller"], handle: "Needle teeth; use long pliers, a net and a jaw spreader." },
+  { name: "Chain pickerel", sci: "Esox niger", water: "Freshwater", look: "Green-gold with a dark chain-link pattern and a dark bar under the eye. Scales cover the whole cheek and gill cover.", habitat: "Weedy ponds, backwaters and tannin-stained streams.", mix: ["Northern pike: bean-shaped spots, bigger"], handle: "Sharp teeth; use pliers." },
+  { name: "Channel catfish", sci: "Ictalurus punctatus", water: "Freshwater", look: "Deeply forked tail and sharp whiskers. Small ones have scattered dark spots; large ones are plain blue-gray.", habitat: "Rivers, lakes and ponds; holes, ledges and wood, feeding mostly at night.", mix: ["Blue catfish: straight-edged anal fin, no spots, bigger", "Bullhead: rounded tail"], handle: "Spines on pectoral and dorsal fins can stab; use a grip or pliers." },
+  { name: "Flathead catfish", sci: "Pylodictis olivaris", water: "Freshwater", look: "Flat wide head, protruding lower jaw, mottled yellow-brown body and a squared tail.", habitat: "Big rivers and reservoirs near deep wood and undercut banks; takes live bait.", mix: ["Channel catfish: forked tail, upper jaw longer", "Blue catfish: forked tail, gray-blue"], handle: "Heavy and strong; support the belly and watch the spines." },
+  { name: "Rainbow trout", sci: "Oncorhynchus mykiss", water: "Freshwater", look: "Pink to red stripe along the side and many small black spots on the body and tail.", habitat: "Cold clear streams, lakes and tailwaters; riffles, seams and undercut banks.", mix: ["Brown trout: red-orange spots with pale halos, no tail spots", "Cutthroat trout: red slash under the jaw"], handle: "Wet hands, keep it in the water, never squeeze." },
+  { name: "Brown trout", sci: "Salmo trutta", water: "Freshwater", look: "Golden brown with dark and red-orange spots circled by pale halos; the tail is mostly unspotted.", habitat: "Cool streams and lakes with cover; most active at dusk, dawn and cloud.", mix: ["Rainbow trout: pink stripe, tail spotted"], handle: "Wet hands, keep it in the water, never squeeze." },
+  { name: "Brook trout", sci: "Salvelinus fontinalis", water: "Freshwater", look: "Dark olive with wormlike pale marks on the back, red dots with blue halos, and white-edged lower fins.", habitat: "Small, cold, clean streams and lakes.", mix: ["Brown trout: halos on spots, no wormlike marks"], handle: "Delicate; wet hands, release in cold water." },
+  { name: "Redfish (red drum)", sci: "Sciaenops ocellatus", water: "Saltwater", look: "Copper-bronze with one or more black spots near the tail and no chin barbels.", habitat: "Shallow flats, oyster bars, marsh edges and surf; tails up while feeding on the flats.", mix: ["Black drum: chin barbels, no tail spot, high back"], handle: "Support the body; they thrash, so mind the hooks." },
+  { name: "Spotted seatrout", sci: "Cynoscion nebulosus", water: "Saltwater", look: "Silver with many round dark spots on the back and on both tail fins, and two canine teeth up front.", habitat: "Grass flats, channel edges and potholes in warm shallow bays.", mix: ["Weakfish: fewer, smaller spots, tail unspotted", "Redfish: copper, tail spot, no canines"], handle: "Soft mouth, so the hook tears easily; use a net." },
+  { name: "Snook", sci: "Centropomus undecimalis", water: "Saltwater", look: "Sleek with a sloping forehead, protruding lower jaw, a bold black lateral line and yellowish pelvic fins.", habitat: "Mangrove shorelines, docks, bridges and passes; warm water only.", mix: ["Other snook species: smaller and with a differently placed lateral line"], handle: "Razor-sharp gill plates and cold-sensitive; keep it wet and handle with care. Often has closed seasons, so check the rules." },
+  { name: "Tarpon", sci: "Megalops atlanticus", water: "Saltwater", look: "Huge silvery scales, an upturned mouth and a long filament on the last dorsal fin ray.", habitat: "Passes, bridges, beaches and big rivers in warm water.", mix: ["Ladyfish: slim, far smaller, no filament"], handle: "Large fish need to stay in the water; a permit or tag is required in some places, so check the rules." },
+  { name: "Southern flounder", sci: "Paralichthys lethostigma", water: "Saltwater", look: "Flat, with both eyes on the left side and a brown mottled upper side without large eye-like spots.", habitat: "Sandy and muddy bottoms near passes, docks, creeks and inlets.", mix: ["Summer flounder (fluke): five eye-like spots on the upper side", "Gulf flounder: three eye-like spots"], handle: "Handle on the flat; strong teeth for the size." },
+  { name: "Sheepshead", sci: "Archosargus probatocephalus", water: "Saltwater", look: "Silver-gray with five or six black vertical bars and human-like front teeth.", habitat: "Pilings, jetties, oyster bars and docks; feeds on barnacles and crabs.", mix: ["Black drum (juvenile): bars but chin barbels and no human teeth"], handle: "Sharp dorsal spines; wet hands." },
+  { name: "Black drum", sci: "Pogonias cromis", water: "Saltwater", look: "High-arched back, rows of short chin barbels and a dark body (young ones have vertical bars).", habitat: "Channels, bridges and oyster bars; feeds on crabs and clams.", mix: ["Redfish: no barbels and has a tail spot", "Sheepshead: human-like teeth"], handle: "Heavy; support the belly." },
+  { name: "Mahi-mahi", sci: "Coryphaena hippurus", water: "Saltwater", look: "Bright blue-green and gold with a long dorsal fin; males have a blunt, square forehead.", habitat: "Offshore, under floating weed, debris and rips in warm water.", mix: ["Pompano dolphinfish: smaller, deeper body"], handle: "Very active; use gloves and a gaff or net with care." },
+  { name: "Common carp", sci: "Cyprinus carpio", water: "Freshwater", look: "Golden-bronze with large scales, a long dorsal fin and two barbels on each side of the mouth.", habitat: "Warm lakes, ponds and slow rivers; muddy flats and weedy edges.", mix: ["Grass carp: no barbels, torpedo-shaped"], handle: "Heavy and slippery; use an unhooking mat or wet towel." },
+];
+function proGuideFind(name) {
+  const n = proNorm(name || "");
+  if (!n) return null;
+  return SPECIES_GUIDE.find((g) => proNorm(g.name) === n) || SPECIES_GUIDE.find((g) => proNorm(g.name).includes(n) || n.includes(proNorm(g.name))) || null;
+}
+function proGuideBaits(g) {
+  const prof = proSpeciesProfile(g.name);
+  const picks = PRO_LURE_KB.filter((l) => l.fit.includes(prof.id)).slice(0, 6).map((l) => l.label);
+  const bandBaits = [];
+  (prof.bands || []).forEach((b) => (b.baits || b.lures || []).forEach((x) => { if (!bandBaits.includes(x)) bandBaits.push(x); }));
+  return { prof, styles: picks, temps: prof.c ? `${fmtTemp(prof.c.lo * 9 / 5 + 32)}–${fmtTemp(prof.c.hi * 9 / 5 + 32)} water` : null, bandBaits: bandBaits.slice(0, 6) };
+}
+
+function SpeciesGuideEntry({ onOpen }) {
+  return (
+    <button type="button" onClick={() => { haptic(); onOpen(null); }} className="w-full text-left rounded-2xl px-4 py-3 mb-4 flex items-center gap-3" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+      <Fish size={22} style={{ color: "var(--tb-brass)" }} />
+      <span className="min-w-0 flex-1">
+        <span className="block text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>Species guide</span>
+        <span className="block text-[13px]" style={{ color: "var(--tb-muted)" }}>{SPECIES_GUIDE.length} fish: how to spot them, where they live, what they eat</span>
+      </span>
+      <ChevronRight size={18} style={{ color: "var(--tb-muted)" }} />
+    </button>
+  );
+}
+
+function SpeciesGuideSheet({ focus, onClose, place }) {
+  useUnits();
+  const [q, setQ] = useState("");
+  const [openName, setOpenName] = useState(focus || null);
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+  const list = SPECIES_GUIDE.filter((g) => !q.trim() || g.name.toLowerCase().includes(q.trim().toLowerCase()) || g.sci.toLowerCase().includes(q.trim().toLowerCase()));
+  return (
+    <div className="tb-overlay absolute inset-0 z-30" style={{ background: "rgba(10,16,19,0.65)" }}>
+      <div className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-5 pt-4 pb-6" style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "92%", overflowY: "auto" }}>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="tb-stencil text-xl" style={{ color: "var(--tb-text)" }}>SPECIES GUIDE</h2>
+          <button onClick={onClose} aria-label="Close"><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+        <div className="relative mb-3">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--tb-muted)" }} />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search fish" className="w-full rounded-lg py-2 pl-9 pr-3 text-sm outline-none" style={inputStyle} />
+        </div>
+        <div className="space-y-2">
+          {list.map((g) => {
+            const open = openName === g.name;
+            const info = open ? proGuideBaits(g) : null;
+            return (
+              <div key={g.name} className="rounded-xl" style={{ background: "var(--tb-surface)", border: `1px solid ${open ? "var(--tb-brass)" : "var(--tb-line)"}` }}>
+                <button type="button" onClick={() => setOpenName(open ? null : g.name)} aria-expanded={open} className="w-full text-left px-3 py-2.5 flex items-center justify-between gap-2">
+                  <span className="min-w-0">
+                    <span className="block text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{g.name}</span>
+                    <span className="block text-[12px] italic" style={{ color: "var(--tb-muted)" }}>{g.sci} · {g.water}</span>
+                  </span>
+                  <ChevronRight size={16} style={{ color: "var(--tb-muted)", transform: open ? "rotate(90deg)" : "none" }} />
+                </button>
+                {open && (
+                  <div className="px-3 pb-3 space-y-2 text-[13px]" style={{ color: "var(--tb-muted)" }}>
+                    <div><strong style={{ color: "var(--tb-text)" }}>How to spot it:</strong> {g.look}</div>
+                    <div><strong style={{ color: "var(--tb-text)" }}>Where to find it:</strong> {g.habitat}</div>
+                    {info.temps && <div><strong style={{ color: "var(--tb-text)" }}>Most active in:</strong> {info.temps}</div>}
+                    {info.styles.length > 0 && <div><strong style={{ color: "var(--tb-text)" }}>Lure styles that work:</strong> {info.styles.join(", ")}</div>}
+                    {info.bandBaits.length > 0 && <div><strong style={{ color: "var(--tb-text)" }}>Go-to baits:</strong> {info.bandBaits.join(", ")}</div>}
+                    {g.mix.length > 0 && <div><strong style={{ color: "var(--tb-text)" }}>Easily mixed up with:</strong> {g.mix.join(" · ")}</div>}
+                    <div><strong style={{ color: "var(--tb-text)" }}>Handling:</strong> {g.handle}</div>
+                    <RegsLink species={g.name} place={place} />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {!list.length && <div className="text-[13px] py-4 text-center" style={{ color: "var(--tb-muted)" }}>No fish match that search.</div>}
+        </div>
+        <div className="text-[12px] mt-3" style={{ color: "var(--tb-muted)" }}>A general guide written by the Epic Fishy team, not a legal reference. Local size limits, seasons and protected species vary: use the rules links.</div>
+      </div>
+    </div>
+  );
+}
+// <<PRO-GUIDE-END>>
+
 // <<PRO-FISHID-START>>
 /* ---------------- Fish ID: photo of a fish -> likely species -> the catch form ----------------
    Same two engines as the tackle scan: your own AI key (best, explains why and names look-alikes) or the free
@@ -2066,7 +2284,7 @@ async function proFishOnDevice(dataUrl, nearby, onProgress) {
   };
 }
 
-function FishIdPanel({ photo, nearbyNames, onPhoto, onPick }) {
+function FishIdPanel({ photo, nearbyNames, place, onPhoto, onPick, onOpenGuide }) {
   const ent = useProEntitlement();
   const cfg = proAiGet();
   const [engine, setEngine] = useState(cfg ? "ai" : "device");
@@ -2152,6 +2370,10 @@ function FishIdPanel({ photo, nearbyNames, onPhoto, onPick }) {
               {f.features && <div className="text-[13px] mt-1" style={{ color: "var(--tb-muted)" }}>{f.features}</div>}
               {f.lookalikes.length > 0 && <div className="text-[12px] mt-1" style={{ color: "var(--tb-muted)" }}><strong style={{ color: "var(--tb-text)" }}>Easily mixed up with:</strong> {f.lookalikes.join(" · ")}</div>}
               {f.tip && <div className="text-[12px] mt-1" style={{ color: "var(--tb-muted)" }}><strong style={{ color: "var(--tb-text)" }}>Handling:</strong> {f.tip}</div>}
+              <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
+                <RegsLink species={f.name} place={place} />
+                {onOpenGuide && proGuideFind(f.name) && <button type="button" onClick={() => onOpenGuide(proGuideFind(f.name).name)} className="text-[13px] font-bold" style={{ color: "var(--tb-blue)" }}>Species guide</button>}
+              </div>
               <button type="button" onClick={() => { haptic(); onPick(f.name); setStage("idle"); setRes(null); }} className="mt-2 px-3 py-1.5 rounded-lg text-[13px] font-bold" style={{ background: i === 0 ? "var(--tb-brass)" : "var(--tb-surface-2)", color: i === 0 ? "var(--tb-bg)" : "var(--tb-text)" }}>Use {f.name}</button>
             </div>
           ))}
@@ -2792,6 +3014,46 @@ function ProBars({ rows, max, labelW = 78 }) {
   );
 }
 
+function ProForecastScorecard({ catches }) {
+  const sc = useMemo(() => proScorecard(catches), [catches]);
+  const pending = (catches || []).filter((c) => c.gps && c.dateTime).length;
+  if (!catches || !catches.length) return null;
+  const pc = (v) => `${Math.round(v * 100)}%`;
+  let verdict = "";
+  if (sc.n >= 5) verdict = sc.topThird >= 0.5 ? "The forecast is lining up with your fishing." : sc.topThird >= 0.4 ? "A little better than chance. Keep logging." : "No better than chance so far, so treat the forecast as a guide only.";
+  return (
+    <CardShell title="FORECAST SCORECARD" subtitle="did the bite forecast match your real catches?">
+      {sc.n < 5 ? (
+        <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>
+          {sc.n} catch{sc.n === 1 ? "" : "es"} checked so far (it needs 5). Catches with a GPS tag are checked against what the forecast would have said at that hour. {pending > sc.n ? "A few more are still being looked up." : "Log a few more with GPS on."}
+        </div>
+      ) : (
+        <div>
+          <div className="flex items-end gap-3">
+            <div className="tb-stencil text-[48px] leading-[0.9]" style={{ color: sc.topThird >= 0.4 ? "var(--tb-brass)" : "var(--tb-muted)" }}>{pc(sc.topThird)}</div>
+            <div className="text-[14px] pb-1 leading-snug" style={{ color: "var(--tb-text)" }}>of your {sc.n} catches came in the best third of that day's hours. Chance alone would be about 33%.</div>
+          </div>
+          <div className="text-[14px] font-bold mt-2" style={{ color: "var(--tb-text)" }}>{verdict}</div>
+          <div className="text-[13px] mt-1" style={{ color: "var(--tb-muted)" }}>{pc(sc.good)} were in hours rated Good or better. On average your catches ranked in the top {Math.max(1, Math.round((1 - sc.avgPct) * 100))}% of their day.</div>
+          {sc.bySpecies.length > 0 && (
+            <div className="mt-3 space-y-1.5">
+              {sc.bySpecies.map((b) => (
+                <div key={b.species} className="flex items-center gap-2 text-[13px]">
+                  <span className="w-28 shrink-0 truncate" style={{ color: "var(--tb-muted)" }}>{b.species}</span>
+                  <span className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: "var(--tb-surface-2)" }} aria-hidden="true"><span className="block h-full rounded-full" style={{ width: `${Math.round(b.avgPct * 100)}%`, background: "var(--tb-brass)" }} /></span>
+                  <span className="tb-mono w-10 text-right" style={{ color: "var(--tb-text)" }}>{Math.round(b.avgPct * 100)}</span>
+                </div>
+              ))}
+              <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>Bars: average rank of that species' catches within their day (50 = chance, higher is better).</div>
+            </div>
+          )}
+          <div className="text-[12px] mt-3" style={{ color: "var(--tb-muted)" }}>Small samples are noisy: fish also get caught when you fish more, and most people fish at dawn and dusk. Treat this as a trend, not proof.</div>
+        </div>
+      )}
+    </CardShell>
+  );
+}
+
 function ProCatchHub({ catches }) {
   const ent = useProEntitlement();
   const [tab, setTab] = useState("life");
@@ -3080,6 +3342,9 @@ export default function TackleTracker() {
   const [editingItem, setEditingItem] = useState(null);
   const [formPrefill, setFormPrefill] = useState(null);
   const [showScan, setShowScan] = useState(false);
+  const [guide, setGuide] = useState({ open: false, focus: null });
+  const guideLoc = useSavedLocation();
+  const guidePlace = useProPlace(guideLoc ? guideLoc.lat : null, guideLoc ? guideLoc.lon : null);
   const [tackleSubView, setTackleSubView] = useState("gear"); // 'gear' | 'guide' | 'knots'
   const [showSettings, setShowSettings] = useState(false);
   const [saveError, setSaveError] = useState(false);
@@ -3167,7 +3432,7 @@ export default function TackleTracker() {
   const condTried = useRef(new Set());
   useEffect(() => {
     if (!catches) return undefined;
-    const todo = catches.filter((c) => c.gps && c.dateTime && (!c.conditions || c.condKey !== proCondKey(c)) && !condTried.current.has(c.id)).slice(0, 4);
+    const todo = catches.filter((c) => c.gps && c.dateTime && (!c.conditions || c.condKey !== proCondKey(c) || c.conditions.v !== 2) && !condTried.current.has(c.id)).slice(0, 4);
     if (!todo.length) return undefined;
     let off = false;
     (async () => {
@@ -3496,6 +3761,7 @@ export default function TackleTracker() {
             onEdit={(c) => { setEditingCatch(c); setShowCatchForm(true); }}
             onDelete={deleteCatch}
             onToast={showToast}
+            onOpenGuide={(f) => setGuide({ open: true, focus: f })}
           />
         )}
 
@@ -3587,9 +3853,11 @@ export default function TackleTracker() {
           recentSpecies={[...new Set([...(catches || [])].sort((a, b) => new Date(b.dateTime) - new Date(a.dateTime)).map((c) => c.species).filter(Boolean))].slice(0, 6)}
           onCancel={() => { setShowCatchForm(false); setEditingCatch(null); }}
           onSave={upsertCatch}
+          onOpenGuide={(f) => setGuide({ open: true, focus: f })}
         />
       )}
 
+      {guide.open && <SpeciesGuideSheet focus={guide.focus} place={guidePlace} onClose={() => setGuide({ open: false, focus: null })} />}
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
       {showScan && <ScanTackleSheet onClose={() => setShowScan(false)} onAdd={addScanned} onOpenSettings={() => { setShowScan(false); setShowSettings(true); }} />}
     </div>
@@ -3980,7 +4248,7 @@ function groupCatchesByTrip(sortedCatches) {
     });
 }
 
-function CatchesView({ catches, items, onEdit, onDelete, onToast }) {
+function CatchesView({ catches, items, onEdit, onDelete, onToast, onOpenGuide }) {
   const [groupByTrip, setGroupByTrip] = useState(false);
   const bestIds = personalBestIds(catches || []);
 
@@ -3990,7 +4258,8 @@ function CatchesView({ catches, items, onEdit, onDelete, onToast }) {
 
   if (catches.length === 0) {
     return (
-      <div className="py-10 text-center space-y-3">
+      <div className="py-6 text-center space-y-3">
+        <SpeciesGuideEntry onOpen={onOpenGuide} />
         <Fish size={32} className="mx-auto" style={{ color: "var(--tb-brass)" }} />
         <p className="text-sm" style={{ color: "var(--tb-muted)" }}>
           No catches logged yet. Tap + to record your first fish.
@@ -4018,7 +4287,9 @@ function CatchesView({ catches, items, onEdit, onDelete, onToast }) {
 
   return (
     <div className="space-y-3">
+      <SpeciesGuideEntry onOpen={onOpenGuide} />
       <ProCatchHub catches={catches} />
+      <ProForecastScorecard catches={catches} />
       <div className="grid grid-cols-3 gap-2">
         <StatTile label="Total" value={catches.length} />
         <StatTile label="Top species" value={topSpecies ? topSpecies[0] : "—"} small />
@@ -4193,7 +4464,7 @@ function toDatetimeLocal(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onCancel, onSave }) {
+function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onCancel, onSave, onOpenGuide }) {
   const [species, setSpecies] = useState(initial?.species || "");
   const [length, setLength] = useState(initial?.length || "");
   const [lengthUnit, setLengthUnit] = useState(initial?.lengthUnit || (isMetric() ? "cm" : "in"));
@@ -4212,6 +4483,7 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
   const communityAvailable = typeof window !== "undefined" && window.communityAPI && window.communityAPI.configured;
   const savedLoc = useSavedLocation();
   const nearbyForId = useProNearbySpecies(gps ? gps.lat : savedLoc ? savedLoc.lat : null, gps ? gps.lon : savedLoc ? savedLoc.lon : null);
+  const formPlace = useProPlace(gps ? gps.lat : savedLoc ? savedLoc.lat : null, gps ? gps.lon : savedLoc ? savedLoc.lon : null);
   const fishNearby = useMemo(() => (nearbyForId.list || []).map((x) => x.name), [nearbyForId.list]);
 
   const captureGps = useCallback(() => {
@@ -4301,7 +4573,14 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
 
           <PhotoField photo={photo} onChange={setPhoto} label="Catch photo" />
 
-          <FishIdPanel photo={photo} nearbyNames={fishNearby} onPhoto={setPhoto} onPick={setSpecies} />
+          <FishIdPanel photo={photo} nearbyNames={fishNearby} place={formPlace} onPhoto={setPhoto} onPick={setSpecies} onOpenGuide={onOpenGuide} />
+
+          {species.trim() && (
+            <div className="flex flex-wrap gap-x-4 gap-y-1 -mt-1">
+              <RegsLink species={species.trim()} place={formPlace} />
+              {proGuideFind(species) && <button type="button" onClick={() => onOpenGuide && onOpenGuide(proGuideFind(species).name)} className="text-[13px] font-bold" style={{ color: "var(--tb-blue)" }}>Species guide</button>}
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-3">
             <Field label="Length">
@@ -5005,7 +5284,26 @@ function MyMapCard({ catches }) {
   const [filter, setFilter] = useState("all"); // all | catches | waypoints
   const [active, setActive] = useState([]); // ids of Pro layers that are on
   const [showLock, setShowLock] = useState(false);
+  const [offline, setOffline] = useState({ busy: false, msg: null, count: 0 });
   const leafletAvailable = typeof window !== "undefined" && !!window.L;
+
+  useEffect(() => { proSavedTileCount().then((n) => setOffline((o) => ({ ...o, count: n }))); }, []);
+  async function saveOffline() {
+    haptic();
+    if (!ent.unlocked) { setShowLock(true); return; }
+    const map = mapInstance.current;
+    if (!map || typeof caches === "undefined") { setOffline((o) => ({ ...o, msg: "Offline maps aren't available in this browser." })); return; }
+    const bb = map.getBounds();
+    const plan = proTilesForView({ north: bb.getNorth(), south: bb.getSouth(), east: bb.getEast(), west: bb.getWest() }, map.getZoom());
+    if (plan.tooBig) { setOffline((o) => ({ ...o, msg: `That's a big area (${plan.tooBig} map pieces). Zoom in to one lake or bay first and try again.` })); return; }
+    setOffline((o) => ({ ...o, busy: true, msg: `Saving 0 of ${plan.tiles.length}...` }));
+    try {
+      const r = await proSaveTiles(plan.tiles, (d, t) => setOffline((o) => ({ ...o, msg: `Saving ${d} of ${t}...` })));
+      const n = await proSavedTileCount();
+      setOffline({ busy: false, count: n, msg: r.failed ? `Saved ${r.saved} map pieces; ${r.failed} didn't download. Try again with a better signal.` : `Saved. This area now works with no signal.` });
+    } catch (e) { setOffline((o) => ({ ...o, busy: false, msg: "Couldn't save the map. Check your connection and try again." })); }
+  }
+  async function clearOffline() { haptic(); await proClearTiles(); setOffline({ busy: false, count: 0, msg: "Saved maps removed." }); }
 
   useEffect(() => {
     (async () => {
@@ -5122,6 +5420,11 @@ function MyMapCard({ catches }) {
         <span className="flex items-center gap-1.5"><span className="inline-block w-3 h-3 rounded-full" style={{ background: "#ff6f5e" }} /> Waypoint</span>
         <button onClick={exportGpx} className="ml-auto font-bold" style={{ color: "var(--tb-blue)" }}>{ent.unlocked ? "" : "🔒 "}Export GPX</button>
         <span>Private to this device</span>
+      </div>
+      <div className="px-4 py-2.5 text-[12px] flex flex-wrap items-center gap-x-3 gap-y-1" style={{ color: "var(--tb-muted)", borderTop: "1px solid var(--tb-line)" }}>
+        <button onClick={saveOffline} disabled={offline.busy} className="font-bold" style={{ color: "var(--tb-blue)", opacity: offline.busy ? 0.6 : 1 }}>{ent.unlocked ? "" : "🔒 "}Save this view for offline</button>
+        {offline.count > 0 && <button onClick={clearOffline} className="font-bold" style={{ color: "var(--tb-flare)" }}>Remove saved maps ({offline.count})</button>}
+        <span role="status" aria-live="polite">{offline.msg || (offline.count > 0 ? `${offline.count} map pieces saved on this device` : "Download the map around a spot before you lose signal")}</span>
       </div>
     </CardShell>
   );

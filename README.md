@@ -114,6 +114,15 @@ likely species, the visible features behind each guess, look-alikes and how to t
 tip. Without a key, the free on-device model gives a rough guess from common species plus fish recorded near
 you. Tap **Use** and the species is filled in. It is a best guess, never a legal ruling; always check local rules.
 
+## Species guide, rules links, forecast scorecard, offline maps
+
+- **Species guide** (Catches tab): 27 fish with how to spot them, where they live, what they eat, look-alikes and handling. Written by hand, not a legal reference.
+- **Rules links**: next to an identified or chosen species there is a "Check [state] rules for [fish]" link. It opens a search limited to
+  government sites for that place and species. There is no free official size-limit feed, so the app points to the source instead of quoting limits.
+- **Forecast scorecard** (Catches tab): each GPS-tagged catch is scored by the bite model for the hour it happened and ranked within that day. The card shows how
+  many catches fell in the best third of their day (chance is about 33%). Needs 5+ catches to show a result; small samples are noisy.
+- **Offline maps** (Spots tab, My map): "Save this view for offline" stores up to 150 map tiles for the area and two zoom levels closer. Tiles you view are also kept (up to 1,200) so the map still works with no signal.
+
 ## Smarter lure picks
 
 The picks score ~30 lure and bait styles against live conditions, the target species and your own catch
