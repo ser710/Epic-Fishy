@@ -1643,10 +1643,30 @@ function ProLockCard({ title, children }) {
     </CardShell>
   );
 }
+// Our own little Loch Ness monster: asleep (eyes shut) while Pro is locked.
+function NessieMascot({ size = 64 }) {
+  return (
+    <svg width={size} height={size * 0.62} viewBox="0 0 100 62" role="img" aria-label="Sleeping Loch Ness monster" style={{ flexShrink: 0 }}>
+      <path d="M0 52 Q8 47 16 52 T32 52 T48 52 T64 52 T80 52 T100 52 V62 H0Z" fill="var(--tb-blue)" opacity="0.35" />
+      <path d="M10 54 C10 38 22 38 22 54 M30 54 C30 40 40 40 40 54" fill="none" stroke="var(--tb-brass)" strokeWidth="7" strokeLinecap="round" />
+      <path d="M52 54 C52 34 56 22 66 20 C74 18 82 20 84 27" fill="none" stroke="var(--tb-brass)" strokeWidth="7" strokeLinecap="round" />
+      <ellipse cx="87" cy="29" rx="10" ry="6.5" fill="var(--tb-brass)" />
+      <path d="M83 27 q2.5 2.2 5 0" fill="none" stroke="var(--tb-bg)" strokeWidth="1.6" strokeLinecap="round" />
+      <circle cx="93" cy="31" r="0.9" fill="var(--tb-bg)" />
+      <text x="70" y="14" fontSize="8" fontWeight="700" fill="var(--tb-muted)">z</text>
+      <text x="77" y="8" fontSize="6" fontWeight="700" fill="var(--tb-muted)">z</text>
+      <path d="M0 55 Q8 50 16 55 T32 55 T48 55 T64 55 T80 55 T100 55" fill="none" stroke="var(--tb-blue)" strokeWidth="1.5" />
+    </svg>
+  );
+}
 function ProLockBox() {
   const ent = useProEntitlement();
   return (
       <div className="mt-3 rounded-xl p-3" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-brass)" }}>
+        <div className="flex items-center gap-3 mb-2">
+          <NessieMascot />
+          <div className="text-[13px] leading-snug" style={{ color: "var(--tb-muted)" }}>Nessie is napping on the Pro features. <strong style={{ color: "var(--tb-text)" }}>{ent.price || "$3.50"}</strong> wakes her up.</div>
+        </div>
         <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>Epic Fishy Pro · {ent.price || "$3.50"} once</div>
         <div className="text-[13px] mt-0.5" style={{ color: "var(--tb-muted)" }}>Satellite, nautical-chart, sea-temperature and depth map layers, spot ranking for today and tomorrow, every lure pick, full catch insights, calendar reminders for your best windows, and GPX export. Pay once, keep it.</div>
         {ent.supported ? (
