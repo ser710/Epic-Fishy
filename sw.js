@@ -1,5 +1,5 @@
-const CACHE_NAME = "tackle-box-v40";
-const TILE_CACHE = "epic-fishy-tiles"; // saved + recently viewed map tiles; never deleted on update
+const CACHE_NAME = "tackle-box-v41";
+const TILE_CACHE = "epic-fishy-tiles-2"; // saved + recently viewed map tiles; never deleted on update
 const TILE_MAX = 1200;
 const PREFS_CACHE = "epic-fishy-prefs"; // small settings shared with the page (alert prefs); never deleted on update
 const APP_SHELL = ["./", "./index.html", "./manifest.json", "./firebase-config.js", "./firebase-bootstrap.js", "./icons/icon-180.png", "./icons/icon-192.png", "./icons/icon-512.png"];
@@ -22,10 +22,10 @@ self.addEventListener("activate", (event) => {
 
 // Pages (index.html): network-first so a new release shows on the very next open; falls back to the saved copy offline.
 // Other app-shell files: cache-first. Everything else (weather/tide/radar APIs, CDN modules): network-first.
-// Same key the page uses when it saves tiles for offline (the a/b/c/d subdomain is ignored).
+// Same key the page uses when it saves tiles for offline .
 function tileKey(url) {
-  const m = /^https:\/\/(?:[a-d]\.)?basemaps\.cartocdn\.com\/rastertiles\/voyager\/(\d+)\/(\d+)\/(\d+)(?:@2x)?\.png/.exec(url);
-  return m ? "https://epicfishy.tiles/voyager/" + m[1] + "/" + m[2] + "/" + m[3] : null;
+  const m = /^https:\/\/server\.arcgisonline\.com\/ArcGIS\/rest\/services\/World_Topo_Map\/MapServer\/tile\/(\d+)\/(\d+)\/(\d+)/.exec(url);
+  return m ? "https://epicfishy.tiles/topo/" + m[1] + "/" + m[2] + "/" + m[3] : null;
 }
 let tilePuts = 0;
 async function tileResponse(request, key) {

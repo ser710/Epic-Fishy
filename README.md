@@ -143,7 +143,7 @@ depth, retrieve, rod and line for each pick.
 
 ## Maps and data sources
 
-Base map: CARTO Voyager, with automatic fallback to OpenStreetMap tiles. Water temperature uses the nearest
+Base map: Esri World Topo, with automatic fallback to OpenStreetMap tiles. Water temperature uses the nearest
 NOAA CO-OPS sensor station within 25 miles when available (labelled "measured"), else the Open-Meteo ocean
 model, else an air-temperature estimate (labelled "est.").
 
