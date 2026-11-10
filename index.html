@@ -1644,7 +1644,7 @@ function ProLockCard({ title, children }) {
   );
 }
 // Our own little Loch Ness monster: slowly rises out of the water, then tells you what Pro costs. Tap to replay.
-function NessieMascot({ size = 64 }) {
+function NessieMascot({ size = 64, note = "($3.50, once.)" }) {
   const [run, setRun] = useState(0);
   const replay = () => { haptic(); setRun((n) => n + 1); };
   return (
@@ -1673,8 +1673,16 @@ function NessieMascot({ size = 64 }) {
         </svg>
       </button>
       <div key={"t" + run} className="ness-say text-[14px] leading-snug min-w-0" style={{ color: "var(--tb-text)", opacity: 0, animation: "ness-say 0.6s ease-out 3.4s forwards" }} aria-live="polite">
-        <span className="font-bold">Pro's about tree fiddy.</span> <span style={{ color: "var(--tb-muted)" }}>($3.50, once.)</span>
+        <span className="font-bold">Pro's about tree fiddy.</span> <span style={{ color: "var(--tb-muted)" }}>{note}</span>
       </div>
+    </div>
+  );
+}
+// Everyone sees her, even while Pro is still free: a small home-screen card.
+function NessieCard() {
+  return (
+    <div className="mb-4 rounded-2xl px-3 py-2.5" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-border, rgba(45,212,191,0.25))" }}>
+      <NessieMascot note={PRO_PAYWALL_ON ? "($3.50, once.)" : "(Free while we test it.)"} />
     </div>
   );
 }
@@ -3240,6 +3248,7 @@ export default function TackleTracker() {
 
             {tackleSubView === "gear" && (
               <>
+                <NessieCard />
                 <div className="flex items-center gap-2 mb-4">
                 <div className="relative flex-1 min-w-0">
                   <Search size={18} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: "var(--tb-muted)" }} />
