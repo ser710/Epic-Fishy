@@ -107,6 +107,43 @@ On the Tackle tab, tap **Scan** and take or pick a photo. Two ways to identify w
 
 Results are shown as a checklist; tap **Add** and items are merged into your box (quantities add up).
 
+## Identify a fish from a photo
+
+In **Log a catch**, add or take a photo and tap **Identify my photo**. With your own AI key you get up to three
+likely species, the visible features behind each guess, look-alikes and how to tell them apart, and a handling
+tip. Without a key, the free on-device model gives a rough guess from common species plus fish recorded near
+you. Tap **Use** and the species is filled in. It is a best guess, never a legal ruling; always check local rules.
+
+## Species guide, rules links, forecast scorecard, offline maps
+
+- **Species guide** (Catches tab): 27 fish with how to spot them, where they live, what they eat, look-alikes and handling. Written by hand, not a legal reference.
+- **Rules links**: next to an identified or chosen species there is a "Check [state] rules for [fish]" link. It opens a search limited to
+  government sites for that place and species. There is no free official size-limit feed, so the app points to the source instead of quoting limits.
+- **Forecast scorecard** (Catches tab): each GPS-tagged catch is scored by the bite model for the hour it happened and ranked within that day. The card shows how
+  many catches fell in the best third of their day (chance is about 33%). Needs 5+ catches to show a result; small samples are noisy.
+- **Offline maps** (Spots tab, My map): "Save this view for offline" stores up to 150 map tiles for the area and two zoom levels closer. Tiles you view are also kept (up to 1,200) so the map still works with no signal.
+
+## Add to home screen (iPhone and Android)
+
+Opened in a browser, the app shows a "Get app" button in the header and a
+one-time banner. On Android Chrome it triggers the browser's own install
+prompt. On iPhone it opens a step-by-step sheet (Share, Add to Home Screen,
+Add), with separate wording for Chrome on iOS and for in-app browsers such
+as Instagram that can't add icons. Both are hidden once the app runs from
+the home screen or from the Play Store version.
+
+## Today's call and Explore nearby
+
+- **Today's call** (top of Conditions) turns the bite forecast into one
+  verdict: go now, or the next window with a countdown, whether the bite is
+  building or fading, the top lure, and warnings for thunderstorms, strong
+  gusts, heat, cold or an approaching front in the next few hours.
+- **Explore nearby** (top of Spots) shows named lakes and rivers, fishing
+  spots and piers, boat ramps, bait and tackle shops and marinas from
+  OpenStreetMap on a map and in a filterable list, with directions and
+  one-tap "save as waypoint". It asks several public Overpass mirrors and
+  keeps results on the device for a week.
+
 ## Smarter lure picks
 
 The picks score ~30 lure and bait styles against live conditions, the target species and your own catch
@@ -115,7 +152,7 @@ depth, retrieve, rod and line for each pick.
 
 ## Maps and data sources
 
-Base map: CARTO Voyager, with automatic fallback to OpenStreetMap tiles. Water temperature uses the nearest
+Base map: Esri World Topo, with automatic fallback to OpenStreetMap tiles. Water temperature uses the nearest
 NOAA CO-OPS sensor station within 25 miles when available (labelled "measured"), else the Open-Meteo ocean
 model, else an air-temperature estimate (labelled "est.").
 

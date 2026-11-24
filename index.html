@@ -18,6 +18,10 @@
 <meta name="apple-mobile-web-app-title" content="Epic Fishy" />
 
 <script src="https://cdn.tailwindcss.com"></script>
+<script>window.addEventListener("beforeinstallprompt",function(e){e.preventDefault();window.__efBip=e;window.dispatchEvent(new Event("ef-bip"));});</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bangers&family=Chewy&family=Comic+Neue:wght@700&family=Luckiest+Guy&family=Permanent+Marker&display=swap" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
@@ -122,7 +126,7 @@ import {
   Trash2, AlertTriangle, ChevronLeft, Minus, Wind, Droplets, Gauge,
   Sunrise, Sunset, Waves, MapPin, RefreshCw, CloudRain, Sun, Cloud,
   CloudFog, CloudSnow, CloudLightning, TrendingUp, TrendingDown, ArrowUp,
-  Ruler, Scale, Trophy, Calendar, Pencil, Camera, ChevronDown, ExternalLink, Settings, Heart, Users, CloudSun
+  Ruler, Scale, Trophy, Calendar, Pencil, Camera, ChevronDown, ChevronRight, ExternalLink, Settings, Heart, Users, CloudSun
 } from "lucide-react";
 
 const CATEGORIES = [
@@ -561,7 +565,7 @@ function SafetyBanner({ alerts }) {
   return (
     <div
       className="mb-4 rounded-xl px-3 py-2.5"
-      style={{ background: danger ? "rgba(249,115,98,0.12)" : "rgba(45,212,191,0.10)", border: `1px solid ${accent}` }}
+      style={{ background: danger ? "rgba(249,115,98,0.12)" : "rgba(var(--tb-accent-rgb),0.10)", border: `1px solid ${accent}` }}
       role="alert"
     >
       <div className="flex items-start gap-2">
@@ -723,6 +727,53 @@ async function proCached(key, maxAgeMs, loader) {
   }
 }
 
+// Overpass (OpenStreetMap query service) is volunteer-run and often slow or rate-limited, so we
+// ask several public mirrors, staggered, and take the first good answer. Nearby waters and
+// marinas barely change, so results are cached for a week (and shown stale if every mirror is down).
+const PRO_OVERPASS_MIRRORS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.openstreetmap.fr/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://lz4.overpass-api.de/api/interpreter",
+];
+function proOverpassFetch(query, timeoutMs = 20000, staggerMs = 2500) {
+  return new Promise((resolve, reject) => {
+    const ctls = [];
+    const timers = [];
+    let done = false, failed = 0;
+    const finish = (fn, v) => {
+      if (done) return;
+      done = true;
+      timers.forEach(clearTimeout);
+      ctls.forEach((c) => { try { c.abort(); } catch (e) { /* ignore */ } });
+      fn(v);
+    };
+    const oneFailed = (e) => { failed += 1; if (failed >= PRO_OVERPASS_MIRRORS.length) finish(reject, e || new Error("overpass unavailable")); };
+    PRO_OVERPASS_MIRRORS.forEach((url, i) => {
+      timers.push(setTimeout(async () => {
+        if (done) return;
+        const ctl = new AbortController();
+        ctls.push(ctl);
+        const killer = setTimeout(() => ctl.abort(), timeoutMs);
+        try {
+          const res = await fetch(url, { method: "POST", body: query, signal: ctl.signal });
+          if (!res.ok) throw new Error("overpass " + res.status);
+          const data = await res.json();
+          if (!data || !Array.isArray(data.elements)) throw new Error("overpass bad reply");
+          if (data.elements.length === 0 && data.remark) throw new Error("overpass runtime error");
+          finish(resolve, data);
+        } catch (e) {
+          oneFailed(e);
+        } finally { clearTimeout(killer); }
+      }, i * staggerMs));
+    });
+  });
+}
+function proLoadOverpass(kind, lat, lon, query) {
+  return proCached(`op:${kind}:${lat.toFixed(2)},${lon.toFixed(2)}`, 7 * 86400000, () => proOverpassFetch(query));
+}
+
 // "2026-11-08T14:00" in the SPOT's local time → real UTC milliseconds.
 function proLocalToMs(iso, offSec) {
   const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso || "");
@@ -844,13 +895,13 @@ function proMarineSstNow(marine) {
   } catch (e) { return null; }
 }
 
-// Base street map: CARTO "Voyager" (clean, readable, free, no key). If its tiles keep failing
+// Base map: Esri World Topo (free, no key, shows water and terrain well). If its tiles keep failing
 // (blocked network, outage) it quietly swaps itself for the plain OpenStreetMap tiles.
 function proBaseMap(L, map, maxZoom) {
   const osm = () => L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution: "© OpenStreetMap contributors", maxZoom: Math.min(maxZoom, 19) });
-  const carto = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
-    subdomains: "abcd", maxZoom, maxNativeZoom: 19, detectRetina: false,
-    attribution: "© OpenStreetMap contributors © CARTO",
+  const carto = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}", {
+    maxZoom, maxNativeZoom: 18, detectRetina: false,
+    attribution: "Tiles © Esri and its data providers",
   });
   let layer = carto, errs = 0, okTiles = 0;
   carto.on("tileload", () => { okTiles++; });
@@ -864,6 +915,52 @@ function proBaseMap(L, map, maxZoom) {
   carto.addTo(map);
   return { get: () => layer };
 }
+
+// ---- Offline map tiles: saved with the Cache API, served by the service worker when there is no signal ----
+const PRO_TILE_CACHE = "epic-fishy-tiles-2";
+const PRO_TILE_CAP = 150;
+function proTileKey(url) {
+  const m = /^https:\/\/server\.arcgisonline\.com\/ArcGIS\/rest\/services\/World_Topo_Map\/MapServer\/tile\/(\d+)\/(\d+)\/(\d+)/.exec(String(url));
+  return m ? `https://epicfishy.tiles/topo/${m[1]}/${m[2]}/${m[3]}` : null;
+}
+function proTileXY(lat, lon, z) {
+  const n = 2 ** z, la = Math.max(-85.0511, Math.min(85.0511, lat)) * Math.PI / 180;
+  return { x: Math.max(0, Math.min(n - 1, Math.floor(((lon + 180) / 360) * n))), y: Math.max(0, Math.min(n - 1, Math.floor((1 - Math.log(Math.tan(la) + 1 / Math.cos(la)) / Math.PI) / 2 * n))) };
+}
+// Tiles covering the visible map at this zoom and up to two levels closer (capped, never above zoom 16).
+function proTilesForView(b, zoom, cap = PRO_TILE_CAP) {
+  const z0 = Math.max(1, Math.min(16, Math.round(zoom)));
+  const out = [], levels = [];
+  for (let z = z0; z <= Math.min(16, z0 + 2); z++) {
+    const a = proTileXY(b.north, b.west, z), c = proTileXY(b.south, b.east, z);
+    const list = [];
+    for (let x = a.x; x <= c.x; x++) for (let y = a.y; y <= c.y; y++) list.push({ z, x, y });
+    if (z === z0 && list.length > cap) return { tooBig: list.length, tiles: [], levels: [z0] };
+    if (out.length + list.length > cap) break;
+    out.push(...list); levels.push(z);
+  }
+  return { tiles: out, levels, tooBig: 0 };
+}
+const proTileUrl = (t) => `https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/${t.z}/${t.y}/${t.x}`;
+async function proSaveTiles(tiles, onProgress) {
+  const cache = await caches.open(PRO_TILE_CACHE);
+  let done = 0, failed = 0, i = 0;
+  async function worker() {
+    while (i < tiles.length) {
+      const t = tiles[i++], url = proTileUrl(t);
+      try {
+        const res = await fetch(url, { mode: "cors" });
+        if (!res.ok) throw new Error("http " + res.status);
+        await cache.put(proTileKey(url), res);
+      } catch (e) { failed++; }
+      done++; if (onProgress) onProgress(done, tiles.length);
+    }
+  }
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  return { saved: tiles.length - failed, failed };
+}
+async function proSavedTileCount() { try { return (await (await caches.open(PRO_TILE_CACHE)).keys()).length; } catch (e) { return 0; } }
+async function proClearTiles() { try { return await caches.delete(PRO_TILE_CACHE); } catch (e) { return false; } }
 
 // MEASURED water temperature from the nearest NOAA CO-OPS station (US coasts, bays, Great Lakes).
 // Real sensor readings beat the ocean model and the air-temperature estimate, so they win when a station is close.
@@ -1295,6 +1392,116 @@ function proBuildDays(fc, marine, targetName, measured) {
   return { days, profile, waterF, waterSource, waterStation, hasTide: !!tides };
 }
 
+// "Today's call": one plain-English verdict built from the scored hours — go now, or when to go,
+// whether the bite is building or fading, and anything in the next few hours that should change plans.
+function proTodayCall(model, nowMs) {
+  if (!model || !model.days || !model.days.length) return null;
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const all = [];
+  model.days.forEach((d, di) => d.hours.forEach((h) => all.push({ ...h, di })));
+  const cur = all.find((h) => now >= h.t && now < h.t + 3600000) || null;
+  const ahead = all.filter((h) => h.t > now).slice(0, 3);
+  let trend = null;
+  if (cur && ahead.length >= 2) {
+    const nxt = (ahead[0].score + ahead[1].score) / 2;
+    trend = nxt - cur.score >= 5 ? "building" : nxt - cur.score <= -5 ? "fading" : "holding";
+  }
+  // windows still to come (today first, then tomorrow), soonest first
+  const wins = [];
+  model.days.slice(0, 2).forEach((d, di) => d.windows.forEach((w) => { if (w.end > now + 15 * 60000) wins.push({ ...w, di }); }));
+  wins.sort((a, b) => a.start - b.start);
+  const inWin = wins.find((w) => now >= w.start && now < w.end) || null;
+  const next = wins.find((w) => w.start > now) || null;
+  let verdict, tone;
+  if (cur && (inWin || cur.score >= 72)) { verdict = "go"; tone = "good"; }
+  else if (next && next.di === 0) { verdict = "wait"; tone = next.avg >= 65 ? "good" : "mid"; }
+  else if (next) { verdict = "tomorrow"; tone = "mid"; }
+  else { verdict = "slow"; tone = "low"; }
+  // hazards in the next 8 hours
+  const soon = all.filter((h) => h.t + 3600000 > now && h.t < now + 8 * 3600000);
+  const hazards = [];
+  const storm = soon.find((h) => h.hour && [95, 96, 99].includes(h.hour.code));
+  if (storm) hazards.push({ id: "storm", level: "high", t: storm.t, text: "Thunderstorms possible" });
+  const gustH = soon.reduce((b, h) => (h.hour && typeof h.hour.gust === "number" && (!b || h.hour.gust > b.hour.gust) ? h : b), null);
+  if (gustH && gustH.hour.gust >= 25) hazards.push({ id: "gust", level: gustH.hour.gust >= 35 ? "high" : "mid", t: gustH.t, gust: gustH.hour.gust, text: "Strong gusts" });
+  if (!storm) { const rain = soon.find((h) => h.hour && typeof h.hour.pop === "number" && h.hour.pop >= 60); if (rain) hazards.push({ id: "rain", level: "low", t: rain.t, pop: rain.hour.pop, text: "Rain likely" }); }
+  const hot = soon.find((h) => h.hour && typeof h.hour.temp === "number" && h.hour.temp >= 95);
+  if (hot) hazards.push({ id: "heat", level: "mid", t: hot.t, text: "Dangerous heat" });
+  const cold = soon.find((h) => h.hour && typeof h.hour.temp === "number" && h.hour.temp <= 34);
+  if (cold) hazards.push({ id: "cold", level: "mid", t: cold.t, text: "Near freezing" });
+  // a front: pressure that has been falling turns and climbs fast in the next 18 h
+  const later = all.filter((h) => h.t > now && h.t < now + 18 * 3600000);
+  const fallingNow = cur && typeof cur.pd === "number" && cur.pd <= -0.6;
+  const front = later.find((h) => typeof h.pd === "number" && h.pd >= 1.5);
+  const frontInfo = front && (fallingNow || later.some((h) => h.t < front.t && typeof h.pd === "number" && h.pd <= -0.8)) ? { t: front.t } : null;
+  // best day of the outlook
+  let bestDay = null;
+  model.days.forEach((d, di) => { const top = d.windows[0]; const v = top ? top.avg : d.best; if (!bestDay || v > bestDay.score + 3) bestDay = { di, start: d.start, score: v, window: top || null }; });
+  return { now: cur, trend, verdict, tone, inWin, next, hazards, front: frontInfo, bestDay };
+}
+function proCountdown(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60), r = m % 60;
+  return r >= 5 ? `${h} h ${r} min` : `${h} h`;
+}
+
+/* ---------------- nearby places (OpenStreetMap) ---------------- */
+const PRO_NEARBY_KINDS = [
+  { id: "water", label: "Lakes & rivers", color: "#38bdf8" },
+  { id: "fishing", label: "Fishing spots", color: "#2dd4bf" },
+  { id: "ramp", label: "Boat ramps", color: "#fbbf24" },
+  { id: "bait", label: "Bait & tackle", color: "#f472b6" },
+  { id: "marina", label: "Marinas", color: "#a78bfa" },
+];
+function proNearbyQuery(lat, lon) {
+  const a = `(around:24000,${lat},${lon})`, w = `(around:12000,${lat},${lon})`, m = `(around:40000,${lat},${lon})`;
+  return `[out:json][timeout:25];` +
+    `(nwr["leisure"="fishing"]${a};nwr["man_made"="pier"]["fishing"="yes"]${a};nwr["leisure"="slipway"]${a};nwr["shop"="fishing"]${a};nwr["leisure"="marina"]${m};);out tags center 400;` +
+    `(way["natural"="water"]["name"]${w};relation["natural"="water"]["name"]${w};);out tags center 400;` +
+    `(way["waterway"="river"]["name"]${a};);out tags center 120;`;
+}
+function proParseNearby(data, lat, lon) {
+  const best = new Map();
+  for (const el of (data && data.elements) || []) {
+    const la = el.lat != null ? el.lat : el.center && el.center.lat;
+    const lo = el.lon != null ? el.lon : el.center && el.center.lon;
+    const t = el.tags || {};
+    if (la == null || lo == null) continue;
+    if (t.access === "private" || t.access === "no") continue;
+    let kind, type;
+    if (t.shop === "fishing") { kind = "bait"; type = "Bait & tackle shop"; }
+    else if (t.leisure === "marina") { kind = "marina"; type = "Marina"; }
+    else if (t.leisure === "slipway") { kind = "ramp"; type = "Boat ramp"; }
+    else if (t.man_made === "pier") { kind = "fishing"; type = "Fishing pier"; }
+    else if (t.leisure === "fishing") { kind = "fishing"; type = "Fishing spot"; }
+    else if (t.waterway === "river") { kind = "water"; type = "River"; }
+    else if (t.natural === "water") { kind = "water"; type = t.water === "pond" ? "Pond" : t.water === "reservoir" ? "Reservoir" : t.water === "river" ? "River" : t.water === "lagoon" ? "Lagoon" : "Lake"; }
+    else continue;
+    const name = typeof t.name === "string" && t.name.trim() ? t.name.trim().slice(0, 80) : null;
+    if (!name && (kind === "water" || kind === "marina" || kind === "bait")) continue;
+    const distance = haversineMiles(lat, lon, la, lo);
+    const key = name ? `${kind}|${name.toLowerCase()}` : `${kind}|${la.toFixed(3)},${lo.toFixed(3)}`;
+    const prev = best.get(key);
+    if (prev && prev.distance <= distance) continue;
+    const it = { key, kind, type, name, lat: +la.toFixed(5), lon: +lo.toFixed(5), distance: Math.round(distance * 100) / 100 };
+    if (t.fee === "yes") it.fee = "fee"; else if (t.fee === "no") it.fee = "free";
+    if (typeof t.opening_hours === "string" && t.opening_hours.length <= 40) it.hours = t.opening_hours;
+    const web = t.website || t["contact:website"];
+    if (typeof web === "string" && /^https?:\/\//i.test(web) && web.length < 200) it.web = web;
+    best.set(key, it);
+  }
+  const out = [];
+  for (const k of PRO_NEARBY_KINDS) {
+    out.push(...[...best.values()].filter((x) => x.kind === k.id).sort((a, b) => a.distance - b.distance).slice(0, k.id === "water" ? 40 : 25));
+  }
+  return out.sort((a, b) => a.distance - b.distance);
+}
+function proLoadNearbyPlaces(lat, lon, force) {
+  // force = the refresh button: go to the network even if the saved copy is fresh, but keep the saved copy if that fails.
+  return proCached(`nb2:${lat.toFixed(2)},${lon.toFixed(2)}`, force ? -1 : 7 * 86400000, async () => proParseNearby(await proOverpassFetch(proNearbyQuery(lat, lon), 25000), lat, lon));
+}
+
 /* ---------------- lure / bait picks ---------------- */
 function proTrendOf(pd) { return typeof pd !== "number" ? null : pd <= -0.6 ? "falling" : pd >= 0.6 ? "rising" : "steady"; }
 
@@ -1493,7 +1700,7 @@ async function proSnapshotForCatch(rec, fallbackLoc) {
   const when = new Date(rec.dateTime).getTime();
   if (!Number.isFinite(when)) return null;
   const ageDays = (Date.now() - when) / 86400000;
-  const hourly = "temperature_2m,pressure_msl,cloud_cover,wind_speed_10m";
+  const hourly = "temperature_2m,pressure_msl,cloud_cover,wind_speed_10m,weather_code&daily=sunrise,sunset";
   const units = "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto";
   let url;
   if (ageDays <= 7) {
@@ -1512,7 +1719,38 @@ async function proSnapshotForCatch(rec, fallbackLoc) {
   const moon = proMoonPhase(when);
   const water = proEstimateWaterF(fc, when);
   const r = (v, n = 0) => (typeof v === "number" ? Math.round(v * 10 ** n) / 10 ** n : null);
-  return { tempF: r(h.temp), pressure: r(h.pressure), pd: r(pd, 1), trend: proTrendOf(pd), cloud: r(h.cloud), windMph: r(h.wind), moon: moon.name, illum: moon.illum, waterF: r(water), at: Date.now() };
+  // Forecast scorecard: what would the bite model have said at this moment, and how does that rank against the rest of that day?
+  let score = null, pct = null;
+  try {
+    const day = fc.days.find((d) => when >= d.start && when < d.start + 86400000);
+    if (day && Number.isFinite(day.sunrise) && Number.isFinite(day.sunset)) {
+      const profile = proSpeciesProfile(rec.species);
+      const solunar = proSolunar(day.start, lat, lon);
+      const scoreAt = (hh, i) => {
+        const pv = fc.hours[i - 3];
+        const dp = pv && typeof pv.pressure === "number" && typeof hh.pressure === "number" ? hh.pressure - pv.pressure : null;
+        return proScoreHour({ t: hh.t, sunrise: day.sunrise, sunset: day.sunset, solunar, pressureDelta: dp, hour: hh, waterF: water, profile, tide: null }).score;
+      };
+      const dayScores = [];
+      fc.hours.forEach((hh, i) => { if (hh.t >= day.start && hh.t < day.start + 86400000) dayScores.push(scoreAt(hh, i)); });
+      score = Math.round(scoreAt(h, idx));
+      if (dayScores.length >= 12) pct = Math.round((dayScores.filter((v) => v <= score).length / dayScores.length) * 100) / 100;
+    }
+  } catch (e) { /* scorecard is optional */ }
+  return { v: 2, tempF: r(h.temp), pressure: r(h.pressure), pd: r(pd, 1), trend: proTrendOf(pd), cloud: r(h.cloud), windMph: r(h.wind), moon: moon.name, illum: moon.illum, waterF: r(water), score, pct, at: Date.now() };
+}
+
+// How often did the bite model's best hours line up with when you actually caught fish?
+function proScorecard(catches) {
+  const rows = (catches || []).filter((c) => c.conditions && typeof c.conditions.pct === "number" && typeof c.conditions.score === "number");
+  const n = rows.length;
+  if (!n) return { n: 0 };
+  const topThird = rows.filter((c) => c.conditions.pct >= 0.67).length;
+  const good = rows.filter((c) => c.conditions.score >= 65).length;
+  const avgPct = rows.reduce((a, c) => a + c.conditions.pct, 0) / n;
+  const bySpecies = {};
+  rows.forEach((c) => { const k = c.species || "Fish"; (bySpecies[k] = bySpecies[k] || []).push(c.conditions.pct); });
+  return { n, topThird: topThird / n, good: good / n, avgPct, bySpecies: Object.entries(bySpecies).filter((e) => e[1].length >= 3).map(([k, v]) => ({ species: k, n: v.length, avgPct: v.reduce((a, b) => a + b, 0) / v.length })).sort((a, b) => b.n - a.n).slice(0, 4) };
 }
 
 function proInsights(catches) {
@@ -1643,50 +1881,103 @@ function ProLockCard({ title, children }) {
     </CardShell>
   );
 }
-// Our own little Loch Ness monster: slowly rises out of the water when the Pro box scrolls into view, then tells you the price.
-// Tap her to watch it again.
-function NessieMascot({ size = 72 }) {
-  const [up, setUp] = useState(false);
+// Our own little Loch Ness monster: rises slowly all the way out of the water (splashing as she breaks the surface),
+// then tells you what Pro costs. Tap her to replay.
+// ---- Nessie is customisable (Settings → Nessie): what she says, lettering, her colour, bubble colour, or hide her ----
+const NESSIE_KEY = "efness:v1";
+const NESSIE_DEFAULT = { show: true, text: "", font: "bangers", color: "teal", bubble: "cream" };
+const NESSIE_FONTS = [
+  { id: "bangers", label: "Comic", css: '"Bangers", "Comic Neue", "Comic Sans MS", cursive', size: 22, spacing: "0.06em", upper: true },
+  { id: "chunky", label: "Chunky", css: '"Luckiest Guy", "Bangers", "Comic Sans MS", cursive', size: 19, spacing: "0.03em", upper: true },
+  { id: "marker", label: "Marker", css: '"Permanent Marker", "Comic Neue", "Comic Sans MS", cursive', size: 18, spacing: "0.01em", upper: false },
+  { id: "bubbly", label: "Bubbly", css: '"Chewy", "Comic Neue", "Comic Sans MS", cursive', size: 21, spacing: "0.02em", upper: false },
+];
+const NESSIE_COLORS = [
+  { id: "teal", label: "Teal", hex: "#2dd4bf" }, { id: "green", label: "Green", hex: "#4ade80" }, { id: "purple", label: "Purple", hex: "#a78bfa" },
+  { id: "pink", label: "Pink", hex: "#f472b6" }, { id: "orange", label: "Orange", hex: "#fb923c" }, { id: "yellow", label: "Yellow", hex: "#facc15" },
+  { id: "red", label: "Red", hex: "#f87171" }, { id: "blue", label: "Blue", hex: "#38bdf8" }, { id: "lime", label: "Lime", hex: "#a3e635" },
+  { id: "magenta", label: "Magenta", hex: "#e879f9" }, { id: "indigo", label: "Indigo", hex: "#818cf8" }, { id: "white", label: "White", hex: "#f1f5f9" },
+];
+const NESSIE_BUBBLES = [
+  { id: "cream", label: "Cream", hex: "#fffdf2" }, { id: "yellow", label: "Yellow", hex: "#fde68a" }, { id: "pink", label: "Pink", hex: "#fbcfe8" },
+  { id: "blue", label: "Blue", hex: "#bae6fd" }, { id: "mint", label: "Mint", hex: "#bbf7d0" },
+  { id: "lavender", label: "Lavender", hex: "#ddd6fe" }, { id: "peach", label: "Peach", hex: "#fed7aa" }, { id: "white", label: "White", hex: "#ffffff" },
+];
+function nessieClean(o) {
+  const p = Object.assign({}, NESSIE_DEFAULT, o && typeof o === "object" ? o : {});
+  return {
+    show: p.show !== false,
+    text: typeof p.text === "string" ? p.text.replace(/\s+/g, " ").slice(0, 40) : "",
+    font: NESSIE_FONTS.some((f) => f.id === p.font) ? p.font : "bangers",
+    color: NESSIE_COLORS.some((c) => c.id === p.color) ? p.color : "teal",
+    bubble: NESSIE_BUBBLES.some((c) => c.id === p.bubble) ? p.bubble : "cream",
+  };
+}
+function nessieGet() { try { return nessieClean(JSON.parse(localStorage.getItem(NESSIE_KEY) || "null")); } catch (e) { return nessieClean(null); } }
+function nessieSet(patch) {
+  const next = nessieClean(Object.assign({}, nessieGet(), patch));
+  try { localStorage.setItem(NESSIE_KEY, JSON.stringify(next)); } catch (e) { /* storage blocked */ }
+  try { window.dispatchEvent(new CustomEvent("nessie-changed", { detail: next })); } catch (e) { /* ignore */ }
+  return next;
+}
+function useNessie() {
+  const [p, setP] = useState(nessieGet);
+  useEffect(() => { const on = () => setP(nessieGet()); window.addEventListener("nessie-changed", on); return () => window.removeEventListener("nessie-changed", on); }, []);
+  return p;
+}
+function NessieMascot({ size = 96, note = "($3.50, once.)", custom = false }) {
+  const np = useNessie();
+  const nFont = NESSIE_FONTS.find((f) => f.id === np.font) || NESSIE_FONTS[0];
+  const nCol = (NESSIE_COLORS.find((c) => c.id === np.color) || NESSIE_COLORS[0]).hex;
+  const nBub = (NESSIE_BUBBLES.find((c) => c.id === np.bubble) || NESSIE_BUBBLES[0]).hex;
+  const nText = custom && np.text.trim() ? np.text.trim() : "Pro's about tree fiddy!";
   const [run, setRun] = useState(0);
-  const wrap = useRef(null);
-  useEffect(() => {
-    const still = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (still) { setUp(true); return undefined; }
-    setUp(false);
-    let timer = null;
-    const go = () => { timer = setTimeout(() => setUp(true), 350); };
-    let io = null;
-    if (typeof IntersectionObserver !== "undefined" && wrap.current) {
-      io = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) { io.disconnect(); go(); } }, { threshold: 0.6 });
-      io.observe(wrap.current);
-    } else go();
-    return () => { if (io) io.disconnect(); if (timer) clearTimeout(timer); };
-  }, [run]);
-  const rise = { transform: up ? "translateY(0)" : "translateY(38px)", transition: up ? "transform 3.2s cubic-bezier(.25,.1,.25,1)" : "none" };
+  const replay = () => { haptic(); setRun((n) => n + 1); };
+  const drops = [[30, 2.6, -6], [38, 2.8, 2], [58, 2.7, 6], [66, 3.0, -2], [74, 2.9, 5]];
   return (
-    <div ref={wrap} className="flex items-center gap-3 min-w-0">
-      <button type="button" onClick={() => { haptic(); setRun((r) => r + 1); }} aria-label="Watch Nessie again" className="shrink-0 p-0 border-0 bg-transparent">
-        <style>{`@keyframes ness-wave{from{transform:translateX(0)}to{transform:translateX(-16px)}}@keyframes ness-pop{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}@media (prefers-reduced-motion:reduce){.ness-a{animation:none!important}}`}</style>
-        <svg width={size} height={size * 0.62} viewBox="0 0 100 62" role="img" aria-label="Loch Ness monster rising out of the water" style={{ overflow: "hidden" }}>
-          <defs><clipPath id="ness-clip"><rect x="0" y="0" width="100" height="54" /></clipPath></defs>
-          <g clipPath="url(#ness-clip)">
-            <g style={rise}>
-              <path d="M10 60 C10 38 22 38 22 60 M30 60 C30 40 40 40 40 60" fill="none" stroke="var(--tb-brass)" strokeWidth="7" strokeLinecap="round" />
-              <path d="M52 62 C52 34 56 22 66 20 C74 18 82 20 84 27" fill="none" stroke="var(--tb-brass)" strokeWidth="7" strokeLinecap="round" />
-              <ellipse cx="87" cy="29" rx="10" ry="6.5" fill="var(--tb-brass)" />
-              <circle cx="86" cy="27" r="1.8" fill="var(--tb-bg)" />
-              <circle cx="93" cy="31" r="0.9" fill="var(--tb-bg)" />
+    <div className="flex items-center gap-3 min-w-0">
+      <button type="button" onClick={replay} aria-label="Replay Nessie" className="shrink-0 p-0 border-0 bg-transparent">
+        <style>{`@keyframes ness-rise{0%{transform:translateY(46px)}100%{transform:translateY(-12px)}}@keyframes ness-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}@keyframes ness-wave{from{transform:translateX(0)}to{transform:translateX(-16px)}}@keyframes ness-drop{0%{opacity:0;transform:translate(0,0)}15%{opacity:.9}100%{opacity:0;transform:translate(var(--dx),22px)}}@keyframes ness-pop{0%{opacity:0;transform:scale(.3) rotate(-6deg)}100%{opacity:1;transform:scale(1) rotate(-1.5deg)}}@media (prefers-reduced-motion:reduce){.ness-a{animation:none!important}.ness-say{animation:none!important;opacity:1!important;transform:rotate(-1.5deg)}}`}</style>
+        <svg key={run} width={size} height={size * 0.78} viewBox="0 -12 100 78" role="img" aria-label="Loch Ness monster rising out of the water" style={{ overflow: "hidden" }}>
+          <g className="ness-a" style={{ animation: "ness-rise 4.2s cubic-bezier(.25,.1,.25,1) both" }}>
+            <g className="ness-a" style={{ animation: "ness-bob 2.4s ease-in-out 4.2s infinite" }}>
+              <path d="M12 60 C12 40 26 40 26 60 M34 60 C34 43 46 43 46 60" fill="none" stroke={nCol} strokeWidth="8" strokeLinecap="round" />
+              <path d="M52 62 C52 38 58 24 68 21 C77 19 85 22 87 29" fill="none" stroke={nCol} strokeWidth="8" strokeLinecap="round" />
+              <ellipse cx="90" cy="31" rx="10" ry="6.5" fill={nCol} />
+              <circle cx="89" cy="29" r="1.8" fill="var(--tb-bg)" />
+              <circle cx="96" cy="33" r="0.9" fill="var(--tb-bg)" />
             </g>
           </g>
+          <rect x="0" y="57" width="100" height="12" fill="var(--tb-surface-2)" />
           <g className="ness-a" style={{ animation: "ness-wave 3s linear infinite" }}>
-            <path d="M-16 52 Q-8 47 0 52 T16 52 T32 52 T48 52 T64 52 T80 52 T96 52 T112 52 V62 H-16Z" fill="var(--tb-blue)" opacity="0.55" />
+            <path d="M-16 57 Q-8 52 0 57 T16 57 T32 57 T48 57 T64 57 T80 57 T96 57 T112 57 V66 H-16Z" fill="var(--tb-blue)" opacity="0.4" />
           </g>
-          <path d="M0 55 Q8 50 16 55 T32 55 T48 55 T64 55 T80 55 T100 55" fill="none" stroke="var(--tb-blue)" strokeWidth="1.5" />
+          <path d="M0 58 Q8 53 16 58 T32 58 T48 58 T64 58 T80 58 T100 58" fill="none" stroke="var(--tb-blue)" strokeWidth="1.5" />
+          {drops.map(([x, d, dx], i) => (
+            <circle key={i} className="ness-a" cx={x} cy="44" r="1.6" fill="var(--tb-blue)" style={{ opacity: 0, "--dx": dx + "px", animation: `ness-drop 1.1s ease-in ${d}s both` }} />
+          ))}
         </svg>
       </button>
-      <div className="text-[14px] leading-snug min-w-0 font-bold" style={{ color: "var(--tb-text)", minHeight: 40, display: "flex", alignItems: "center" }} aria-live="polite">
-        {up && <span key={run} style={{ animation: "ness-pop .6s ease-out 3s both" }}>Pro will be about "3.fitty"</span>}
+      <div key={"t" + run} className="ness-say relative min-w-0" style={{ opacity: 0, animation: "ness-pop 0.45s cubic-bezier(.3,1.6,.5,1) 3.9s forwards", transformOrigin: "left center" }} aria-live="polite">
+        <svg width="18" height="20" viewBox="0 0 18 20" aria-hidden="true" style={{ position: "absolute", left: -13, top: "50%", marginTop: -6, zIndex: 1 }}>
+          <path d="M17 2 L1 12 L17 15" fill={nBub} stroke="#0b1413" strokeWidth="2.5" strokeLinejoin="round" />
+          <path d="M17 3.5 V13.6" stroke={nBub} strokeWidth="3.5" />
+        </svg>
+        <div style={{ background: nBub, color: "#0b1413", border: "2.5px solid #0b1413", borderRadius: "22px 24px 20px 26px / 24px 20px 26px 22px", boxShadow: "3px 4px 0 rgba(0,0,0,0.55)", padding: "8px 14px 9px", fontFamily: '"Comic Sans MS", "Comic Neue", "Chalkboard SE", "Marker Felt", "Arial Rounded MT Bold", system-ui, sans-serif', lineHeight: 1.15 }}>
+          <div style={{ fontFamily: nFont.css, fontSize: nText.length > 26 ? nFont.size - 4 : nFont.size, fontWeight: 400, letterSpacing: nFont.spacing, lineHeight: 1.08, textTransform: nFont.upper ? "uppercase" : "none", color: "#0b1413", textShadow: `1.5px 1.5px 0 ${nCol}`, overflowWrap: "anywhere" }}>{nText}</div>
+          {note && <div style={{ fontFamily: '"Comic Neue", "Comic Sans MS", "Chalkboard SE", cursive', fontSize: 13, fontWeight: 700, opacity: 0.75, marginTop: 3 }}>{note}</div>}
+        </div>
       </div>
+    </div>
+  );
+}
+// Everyone sees her, even while Pro is still free: a small home-screen card.
+function NessieCard() {
+  const np = useNessie();
+  if (!np.show) return null;
+  return (
+    <div className="mb-4 rounded-2xl px-3 py-2.5" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-border, rgba(var(--tb-accent-rgb),0.25))" }}>
+      <NessieMascot custom note={np.text.trim() ? "" : PRO_PAYWALL_ON ? "($3.50, once.)" : "(Free while we test it.)"} />
     </div>
   );
 }
@@ -1871,7 +2162,7 @@ function AiScanCard() {
   }
   function remove() { proAiSet(null); setKey(""); setMsg({ ok: true, t: "Key removed from this device." }); }
   return (
-    <CardShell title="TACKLE SCAN: YOUR OWN AI" subtitle="Photograph tackle and have your own AI name it and log it">
+    <CardShell title="YOUR OWN AI: TACKLE SCAN & FISH ID" subtitle="Photograph tackle or a fish and have your own AI name it">
       <div className="space-y-3">
         <Field label="AI provider">
           <select value={provider} onChange={(e) => pick(e.target.value)} className="w-full rounded-lg py-2 px-3 text-sm outline-none" style={inputStyle}>
@@ -2013,6 +2304,304 @@ function ScanTackleSheet({ onClose, onAdd, onOpenSettings }) {
   );
 }
 // <<PRO-SCAN-END>>
+
+// <<PRO-GUIDE-START>>
+/* ---------------- Regulations links + species guide ---------------- */
+// There is no free official size-limit API, so we point to the official source for the angler's place and species
+// (a .gov-restricted search) instead of quoting limits that could be out of date. Never a legal answer.
+function proRegsUrl(place, species) {
+  const sp = String(species || "").trim();
+  if (place && place.countryCode === "GB") return "https://www.gov.uk/fishing-licences";
+  const region = place ? [place.region, place.country].filter(Boolean).join(" ") : "";
+  const isUS = place && place.countryCode === "US";
+  const q = `${region} ${sp} fishing regulations size limit season ${isUS ? "site:.gov" : ""}`.replace(/\s+/g, " ").trim();
+  return `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+}
+function useProPlace(lat, lon) {
+  const [place, setPlace] = useState(null);
+  useEffect(() => {
+    if (typeof lat !== "number" || typeof lon !== "number") return undefined;
+    let off = false;
+    proLoadPlace(lat, lon).then((r) => { if (!off) setPlace(r.data); }).catch(() => {});
+    return () => { off = true; };
+  }, [lat !== null && lat !== undefined ? lat.toFixed(1) : null, lon !== null && lon !== undefined ? lon.toFixed(1) : null]);
+  return place;
+}
+function RegsLink({ species, place }) {
+  if (!species) return null;
+  const where = place && (place.region || place.country);
+  return (
+    <a href={proRegsUrl(place, species)} target="_blank" rel="noopener noreferrer" className="inline-block text-[13px] font-bold" style={{ color: "var(--tb-blue)" }}>
+      Check {where ? where + " " : ""}rules for {species}
+    </a>
+  );
+}
+
+const SPECIES_GUIDE = [
+  { name: "Largemouth bass", sci: "Micropterus salmoides", water: "Freshwater", look: "Green back with a dark stripe along the side. The upper jaw reaches past the back of the eye, and the two dorsal fins are almost split in two by a deep notch.", habitat: "Weedy lakes, ponds, slow rivers and reservoirs around wood, docks, pads and grass lines.", mix: ["Smallmouth bass: bronze with vertical bars, jaw ends under the eye", "Spotted bass: tooth patch on the tongue, jaw reaches only to the eye"], handle: "Lip-grip is fine for the fish; support the belly on big ones." },
+  { name: "Smallmouth bass", sci: "Micropterus dolomieu", water: "Freshwater", look: "Bronze-brown with faint vertical bars and a red-brown eye. The jaw ends under the eye.", habitat: "Clear, cooler lakes and rivers over rock, gravel and boulders; current seams in rivers.", mix: ["Largemouth bass: green with a horizontal stripe, bigger mouth", "Spotted bass: rows of spots on the belly"], handle: "Powerful fighters; wet your hands and release quickly in warm water." },
+  { name: "Spotted bass", sci: "Micropterus punctulatus", water: "Freshwater", look: "Looks like a small largemouth but with rows of dark spots along the belly and a rough patch of teeth on the tongue. The jaw reaches only to the eye.", habitat: "Reservoirs and clear streams with rock, steep banks and brush.", mix: ["Largemouth bass: smooth tongue, jaw past the eye", "Smallmouth bass: vertical bars, no belly spots"], handle: "Lip-grip is fine; they are usually under 3 lb." },
+  { name: "Striped bass", sci: "Morone saxatilis", water: "Both", look: "Silver body with seven or eight unbroken dark stripes along the sides.", habitat: "Coastal surf, rips and bays, plus many big reservoirs. Follows schools of baitfish.", mix: ["White bass: smaller and deeper-bodied, stripes faint or broken", "Hybrid striped bass: stockier, stripes broken"], handle: "Support the body horizontally; sharp gill covers." },
+  { name: "White bass", sci: "Morone chrysops", water: "Freshwater", look: "Silver with faint, often broken horizontal stripes and a deep body. Usually 1-2 lb.", habitat: "Reservoirs and large rivers; runs upriver in spring and schools under feeding birds.", mix: ["Striped bass: much bigger, long unbroken stripes", "Yellow bass: yellow-silver with broken stripes, smaller"], handle: "Spiny dorsal fin; hold with a wet hand along the back." },
+  { name: "Black crappie", sci: "Pomoxis nigromaculatus", water: "Freshwater", look: "Silver-green with irregular black speckles and seven or eight dorsal spines.", habitat: "Brush, standing timber, docks and bridge pilings; schools suspended in cooler water.", mix: ["White crappie: faint vertical bars, five or six dorsal spines"], handle: "Paper-thin mouth; use a net or hold gently." },
+  { name: "White crappie", sci: "Pomoxis annularis", water: "Freshwater", look: "Silver-white with faint vertical bars and five or six dorsal spines.", habitat: "Murky reservoirs and slow rivers around brush and fallen trees.", mix: ["Black crappie: dense black speckles, seven or eight spines"], handle: "Paper-thin mouth; use a net or hold gently." },
+  { name: "Bluegill", sci: "Lepomis macrochirus", water: "Freshwater", look: "Deep flat body, dark ear flap with no red edge, a dark blotch at the back of the dorsal fin and often a bluish chin.", habitat: "Ponds, lakes and slow rivers near weeds, docks and beds in the shallows.", mix: ["Redear sunfish: red or orange edge on the ear flap", "Green sunfish: bigger mouth, light edge on fins"], handle: "Sharp dorsal spines; hold flat with a wet hand." },
+  { name: "Redear sunfish", sci: "Lepomis microlophus", water: "Freshwater", look: "Like a bluegill but with a red or orange edge on the ear flap and a smaller mouth. Nicknamed shellcracker.", habitat: "Warm lakes and ponds with sandy bottoms and snails.", mix: ["Bluegill: dark ear flap with no red edge"], handle: "Sharp dorsal spines; hold flat." },
+  { name: "Yellow perch", sci: "Perca flavescens", water: "Freshwater", look: "Gold-yellow with six to eight dark vertical bars and orange-tinged lower fins.", habitat: "Cool lakes and slow rivers; schools over weed edges and drop-offs.", mix: ["Walleye: no bars, big glassy eyes, white tail tip"], handle: "Sharp dorsal spines; wet hands." },
+  { name: "Walleye", sci: "Sander vitreus", water: "Freshwater", look: "Olive-gold with big glassy eyes, sharp teeth and a white tip on the lower lobe of the tail.", habitat: "Cool lakes and rivers; rocky points, humps, weed edges and current breaks, best at dawn, dusk and night.", mix: ["Sauger: blotchy saddle markings, spotted dorsal fin, no white tail tip", "Yellow perch: barred and much smaller"], handle: "Sharp teeth and gill covers; use a lip-gripper or net." },
+  { name: "Northern pike", sci: "Esox lucius", water: "Freshwater", look: "Long, torpedo-shaped, olive-green with rows of light bean-shaped spots. Scales cover only the upper half of the gill cover.", habitat: "Weedy bays, shallow flats and drop-offs in cool lakes and slow rivers.", mix: ["Muskellunge: dark markings on a light body, scales on the whole cheek", "Chain pickerel: chain-link pattern, much smaller"], handle: "Needle teeth; use long pliers, a net and a jaw spreader." },
+  { name: "Chain pickerel", sci: "Esox niger", water: "Freshwater", look: "Green-gold with a dark chain-link pattern and a dark bar under the eye. Scales cover the whole cheek and gill cover.", habitat: "Weedy ponds, backwaters and tannin-stained streams.", mix: ["Northern pike: bean-shaped spots, bigger"], handle: "Sharp teeth; use pliers." },
+  { name: "Channel catfish", sci: "Ictalurus punctatus", water: "Freshwater", look: "Deeply forked tail and sharp whiskers. Small ones have scattered dark spots; large ones are plain blue-gray.", habitat: "Rivers, lakes and ponds; holes, ledges and wood, feeding mostly at night.", mix: ["Blue catfish: straight-edged anal fin, no spots, bigger", "Bullhead: rounded tail"], handle: "Spines on pectoral and dorsal fins can stab; use a grip or pliers." },
+  { name: "Flathead catfish", sci: "Pylodictis olivaris", water: "Freshwater", look: "Flat wide head, protruding lower jaw, mottled yellow-brown body and a squared tail.", habitat: "Big rivers and reservoirs near deep wood and undercut banks; takes live bait.", mix: ["Channel catfish: forked tail, upper jaw longer", "Blue catfish: forked tail, gray-blue"], handle: "Heavy and strong; support the belly and watch the spines." },
+  { name: "Rainbow trout", sci: "Oncorhynchus mykiss", water: "Freshwater", look: "Pink to red stripe along the side and many small black spots on the body and tail.", habitat: "Cold clear streams, lakes and tailwaters; riffles, seams and undercut banks.", mix: ["Brown trout: red-orange spots with pale halos, no tail spots", "Cutthroat trout: red slash under the jaw"], handle: "Wet hands, keep it in the water, never squeeze." },
+  { name: "Brown trout", sci: "Salmo trutta", water: "Freshwater", look: "Golden brown with dark and red-orange spots circled by pale halos; the tail is mostly unspotted.", habitat: "Cool streams and lakes with cover; most active at dusk, dawn and cloud.", mix: ["Rainbow trout: pink stripe, tail spotted"], handle: "Wet hands, keep it in the water, never squeeze." },
+  { name: "Brook trout", sci: "Salvelinus fontinalis", water: "Freshwater", look: "Dark olive with wormlike pale marks on the back, red dots with blue halos, and white-edged lower fins.", habitat: "Small, cold, clean streams and lakes.", mix: ["Brown trout: halos on spots, no wormlike marks"], handle: "Delicate; wet hands, release in cold water." },
+  { name: "Redfish (red drum)", sci: "Sciaenops ocellatus", water: "Saltwater", look: "Copper-bronze with one or more black spots near the tail and no chin barbels.", habitat: "Shallow flats, oyster bars, marsh edges and surf; tails up while feeding on the flats.", mix: ["Black drum: chin barbels, no tail spot, high back"], handle: "Support the body; they thrash, so mind the hooks." },
+  { name: "Spotted seatrout", sci: "Cynoscion nebulosus", water: "Saltwater", look: "Silver with many round dark spots on the back and on both tail fins, and two canine teeth up front.", habitat: "Grass flats, channel edges and potholes in warm shallow bays.", mix: ["Weakfish: fewer, smaller spots, tail unspotted", "Redfish: copper, tail spot, no canines"], handle: "Soft mouth, so the hook tears easily; use a net." },
+  { name: "Snook", sci: "Centropomus undecimalis", water: "Saltwater", look: "Sleek with a sloping forehead, protruding lower jaw, a bold black lateral line and yellowish pelvic fins.", habitat: "Mangrove shorelines, docks, bridges and passes; warm water only.", mix: ["Other snook species: smaller and with a differently placed lateral line"], handle: "Razor-sharp gill plates and cold-sensitive; keep it wet and handle with care. Often has closed seasons, so check the rules." },
+  { name: "Tarpon", sci: "Megalops atlanticus", water: "Saltwater", look: "Huge silvery scales, an upturned mouth and a long filament on the last dorsal fin ray.", habitat: "Passes, bridges, beaches and big rivers in warm water.", mix: ["Ladyfish: slim, far smaller, no filament"], handle: "Large fish need to stay in the water; a permit or tag is required in some places, so check the rules." },
+  { name: "Southern flounder", sci: "Paralichthys lethostigma", water: "Saltwater", look: "Flat, with both eyes on the left side and a brown mottled upper side without large eye-like spots.", habitat: "Sandy and muddy bottoms near passes, docks, creeks and inlets.", mix: ["Summer flounder (fluke): five eye-like spots on the upper side", "Gulf flounder: three eye-like spots"], handle: "Handle on the flat; strong teeth for the size." },
+  { name: "Sheepshead", sci: "Archosargus probatocephalus", water: "Saltwater", look: "Silver-gray with five or six black vertical bars and human-like front teeth.", habitat: "Pilings, jetties, oyster bars and docks; feeds on barnacles and crabs.", mix: ["Black drum (juvenile): bars but chin barbels and no human teeth"], handle: "Sharp dorsal spines; wet hands." },
+  { name: "Black drum", sci: "Pogonias cromis", water: "Saltwater", look: "High-arched back, rows of short chin barbels and a dark body (young ones have vertical bars).", habitat: "Channels, bridges and oyster bars; feeds on crabs and clams.", mix: ["Redfish: no barbels and has a tail spot", "Sheepshead: human-like teeth"], handle: "Heavy; support the belly." },
+  { name: "Mahi-mahi", sci: "Coryphaena hippurus", water: "Saltwater", look: "Bright blue-green and gold with a long dorsal fin; males have a blunt, square forehead.", habitat: "Offshore, under floating weed, debris and rips in warm water.", mix: ["Pompano dolphinfish: smaller, deeper body"], handle: "Very active; use gloves and a gaff or net with care." },
+  { name: "Common carp", sci: "Cyprinus carpio", water: "Freshwater", look: "Golden-bronze with large scales, a long dorsal fin and two barbels on each side of the mouth.", habitat: "Warm lakes, ponds and slow rivers; muddy flats and weedy edges.", mix: ["Grass carp: no barbels, torpedo-shaped"], handle: "Heavy and slippery; use an unhooking mat or wet towel." },
+];
+function proGuideFind(name) {
+  const n = proNorm(name || "");
+  if (!n) return null;
+  return SPECIES_GUIDE.find((g) => proNorm(g.name) === n) || SPECIES_GUIDE.find((g) => proNorm(g.name).includes(n) || n.includes(proNorm(g.name))) || null;
+}
+function proGuideBaits(g) {
+  const prof = proSpeciesProfile(g.name);
+  const picks = PRO_LURE_KB.filter((l) => l.fit.includes(prof.id)).slice(0, 6).map((l) => l.label);
+  const bandBaits = [];
+  (prof.bands || []).forEach((b) => (b.baits || b.lures || []).forEach((x) => { if (!bandBaits.includes(x)) bandBaits.push(x); }));
+  return { prof, styles: picks, temps: prof.c ? `${fmtTemp(prof.c.lo * 9 / 5 + 32)}–${fmtTemp(prof.c.hi * 9 / 5 + 32)} water` : null, bandBaits: bandBaits.slice(0, 6) };
+}
+
+function SpeciesGuideEntry({ onOpen }) {
+  return (
+    <button type="button" onClick={() => { haptic(); onOpen(null); }} className="w-full text-left rounded-2xl px-4 py-3 mb-4 flex items-center gap-3" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+      <Fish size={22} style={{ color: "var(--tb-brass)" }} />
+      <span className="min-w-0 flex-1">
+        <span className="block text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>Species guide</span>
+        <span className="block text-[13px]" style={{ color: "var(--tb-muted)" }}>{SPECIES_GUIDE.length} fish: how to spot them, where they live, what they eat</span>
+      </span>
+      <ChevronRight size={18} style={{ color: "var(--tb-muted)" }} />
+    </button>
+  );
+}
+
+function SpeciesGuideSheet({ focus, onClose, place }) {
+  useUnits();
+  const [q, setQ] = useState("");
+  const [openName, setOpenName] = useState(focus || null);
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+  const list = SPECIES_GUIDE.filter((g) => !q.trim() || g.name.toLowerCase().includes(q.trim().toLowerCase()) || g.sci.toLowerCase().includes(q.trim().toLowerCase()));
+  return (
+    <div className="tb-overlay absolute inset-0 z-30" style={{ background: "rgba(10,16,19,0.65)" }}>
+      <div className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-5 pt-4 pb-6" style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "92%", overflowY: "auto" }}>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="tb-stencil text-xl" style={{ color: "var(--tb-text)" }}>SPECIES GUIDE</h2>
+          <button onClick={onClose} aria-label="Close"><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+        <div className="relative mb-3">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--tb-muted)" }} />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search fish" className="w-full rounded-lg py-2 pl-9 pr-3 text-sm outline-none" style={inputStyle} />
+        </div>
+        <div className="space-y-2">
+          {list.map((g) => {
+            const open = openName === g.name;
+            const info = open ? proGuideBaits(g) : null;
+            return (
+              <div key={g.name} className="rounded-xl" style={{ background: "var(--tb-surface)", border: `1px solid ${open ? "var(--tb-brass)" : "var(--tb-line)"}` }}>
+                <button type="button" onClick={() => setOpenName(open ? null : g.name)} aria-expanded={open} className="w-full text-left px-3 py-2.5 flex items-center justify-between gap-2">
+                  <span className="min-w-0">
+                    <span className="block text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{g.name}</span>
+                    <span className="block text-[12px] italic" style={{ color: "var(--tb-muted)" }}>{g.sci} · {g.water}</span>
+                  </span>
+                  <ChevronRight size={16} style={{ color: "var(--tb-muted)", transform: open ? "rotate(90deg)" : "none" }} />
+                </button>
+                {open && (
+                  <div className="px-3 pb-3 space-y-2 text-[13px]" style={{ color: "var(--tb-muted)" }}>
+                    <div><strong style={{ color: "var(--tb-text)" }}>How to spot it:</strong> {g.look}</div>
+                    <div><strong style={{ color: "var(--tb-text)" }}>Where to find it:</strong> {g.habitat}</div>
+                    {info.temps && <div><strong style={{ color: "var(--tb-text)" }}>Most active in:</strong> {info.temps}</div>}
+                    {info.styles.length > 0 && <div><strong style={{ color: "var(--tb-text)" }}>Lure styles that work:</strong> {info.styles.join(", ")}</div>}
+                    {info.bandBaits.length > 0 && <div><strong style={{ color: "var(--tb-text)" }}>Go-to baits:</strong> {info.bandBaits.join(", ")}</div>}
+                    {g.mix.length > 0 && <div><strong style={{ color: "var(--tb-text)" }}>Easily mixed up with:</strong> {g.mix.join(" · ")}</div>}
+                    <div><strong style={{ color: "var(--tb-text)" }}>Handling:</strong> {g.handle}</div>
+                    <RegsLink species={g.name} place={place} />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {!list.length && <div className="text-[13px] py-4 text-center" style={{ color: "var(--tb-muted)" }}>No fish match that search.</div>}
+        </div>
+        <div className="text-[12px] mt-3" style={{ color: "var(--tb-muted)" }}>A general guide written by the Epic Fishy team, not a legal reference. Local size limits, seasons and protected species vary: use the rules links.</div>
+      </div>
+    </div>
+  );
+}
+// <<PRO-GUIDE-END>>
+
+// <<PRO-FISHID-START>>
+/* ---------------- Fish ID: photo of a fish -> likely species -> the catch form ----------------
+   Same two engines as the tackle scan: your own AI key (best, explains why and names look-alikes) or the free
+   on-device model (a rough guess from a list of common species plus what's been recorded near you). */
+const PRO_FISH_BASE = [
+  "Largemouth bass", "Smallmouth bass", "Spotted bass", "White bass", "Striped bass", "Black crappie", "White crappie", "Bluegill",
+  "Redear sunfish", "Green sunfish", "Pumpkinseed", "Warmouth", "Yellow perch", "Walleye", "Northern pike", "Muskellunge", "Chain pickerel",
+  "Channel catfish", "Blue catfish", "Flathead catfish", "Bullhead catfish", "Common carp", "Grass carp", "Longnose gar", "Bowfin",
+  "Rainbow trout", "Brown trout", "Brook trout", "Lake trout", "Cutthroat trout", "Chinook salmon", "Coho salmon", "Atlantic salmon",
+  "Redfish (red drum)", "Spotted seatrout", "Snook", "Tarpon", "Southern flounder", "Black drum", "Sheepshead", "Mangrove snapper", "Red snapper",
+  "Gag grouper", "Mahi-mahi", "Bonefish", "Permit", "Jack crevalle", "Spanish mackerel", "King mackerel", "Bluefish", "Florida pompano", "Cobia",
+];
+const PRO_FISH_PROMPT = (nearby) => `You are helping an angler identify a fish from a photo so they can log the catch.
+Look at body shape, mouth, fins, scales, colour pattern, markings and any visible spots or bars.
+${nearby && nearby.length ? `Fish recorded near the angler (use as a hint only, not a limit): ${nearby.slice(0, 25).join(", ")}.` : ""}
+Give up to 3 candidate species, most likely first. For each:
+- "name": common name
+- "scientific": scientific name
+- "confidence": 0 to 1, honest (use 0.5 or lower when the photo is unclear or the fish is partly hidden)
+- "features": one sentence naming the specific visible features that support this species
+- "lookalikes": up to 2 similar species and one short phrase on how to tell them apart
+- "tip": one short handling or measuring tip for this species (for example spiny fins, sharp gill plates, how to hold it)
+If the photo does not show a fish, return an empty list and say why in "note". Do not state regulations, size limits or whether the fish is legal to keep. Tell the angler to check local rules in "note" only when the species is commonly regulated or easily confused with a protected one.
+Reply with ONLY JSON, no other text: {"fish":[...],"note":"one short sentence"}`;
+function proParseFish(text) {
+  let t = String(text || "").trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a < 0 || b <= a) throw new Error("no json");
+  const j = JSON.parse(t.slice(a, b + 1));
+  const clean = (v, n) => String(v == null ? "" : v).replace(/\s+/g, " ").trim().slice(0, n);
+  const fish = (Array.isArray(j.fish) ? j.fish : []).slice(0, 3).map((f) => ({
+    name: clean(f.name, 60), scientific: clean(f.scientific, 70), features: clean(f.features, 220), tip: clean(f.tip, 160),
+    confidence: typeof f.confidence === "number" ? Math.max(0, Math.min(1, f.confidence)) : null,
+    lookalikes: (Array.isArray(f.lookalikes) ? f.lookalikes : []).slice(0, 2).map((l) => clean(typeof l === "string" ? l : (l && (l.name ? l.name + (l.difference ? ": " + l.difference : "") : "")) || "", 140)).filter(Boolean),
+  })).filter((f) => f.name);
+  return { fish, note: clean(j.note, 200) };
+}
+async function proFishOnDevice(dataUrl, nearby, onProgress) {
+  if (!proClipPromise) {
+    proClipPromise = (async () => {
+      const tf = await proDynImport("https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2");
+      tf.env.allowLocalModels = false;
+      return tf.pipeline("zero-shot-image-classification", "Xenova/clip-vit-base-patch32", { progress_callback: onProgress });
+    })().catch((e) => { proClipPromise = null; throw e; });
+  }
+  const clf = await proClipPromise;
+  const names = [...new Set([...(nearby || []).slice(0, 25), ...PRO_FISH_BASE])].slice(0, 70);
+  const out = await clf(dataUrl, names.map((n) => `a photo of a ${n}, a fish`));
+  const top = out.slice().sort((a, b) => b.score - a.score).slice(0, 3);
+  return {
+    fish: top.map((o) => ({ name: names[out.findIndex((x) => x.label === o.label)] || o.label, scientific: "", features: "On-device guess from the overall look. Add your own AI key in Settings for a reasoned answer.", tip: "", lookalikes: [], confidence: o.score })),
+    note: "",
+  };
+}
+
+function FishIdPanel({ photo, nearbyNames, place, onPhoto, onPick, onOpenGuide }) {
+  const ent = useProEntitlement();
+  const cfg = proAiGet();
+  const [engine, setEngine] = useState(cfg ? "ai" : "device");
+  const [stage, setStage] = useState("idle"); // idle | busy | done
+  const [busyMsg, setBusyMsg] = useState("");
+  const [error, setError] = useState(null);
+  const [res, setRes] = useState(null);
+  const camRef = useRef(null);
+  const inputStyle = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
+
+  async function run(dataUrl) {
+    setError(null); setStage("busy"); setRes(null);
+    try {
+      let r;
+      if (engine === "ai" && cfg) {
+        setBusyMsg(`Asking ${AI_PROVIDERS[cfg.provider].label.split(" ")[0]}...`);
+        const text = await proAiCall(cfg, { prompt: PRO_FISH_PROMPT(nearbyNames), imageDataUrl: dataUrl, maxTokens: 900 });
+        try { r = proParseFish(text); } catch (x) { throw Object.assign(new Error("parse"), { parse: true }); }
+      } else {
+        setBusyMsg("Loading the on-device model (first time only, about 90 MB)...");
+        r = await proFishOnDevice(dataUrl, nearbyNames, (p) => { if (p && p.status === "progress" && typeof p.progress === "number") setBusyMsg(`Downloading the on-device model... ${Math.round(p.progress)}%`); });
+      }
+      if (!r.fish.length) { setError(r.note || "I couldn't see a fish in that photo. Try a clear side-on shot with the whole fish in frame."); setStage("idle"); return; }
+      setRes(r); setStage("done");
+    } catch (x) {
+      setError(x && x.parse ? "The AI's answer wasn't readable. Try again." : engine === "ai" && cfg ? proAiErrorText(x, cfg) : "Couldn't load the on-device model. Check your connection (it downloads once, then works offline).");
+      setStage("idle");
+    }
+  }
+  async function onFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setStage("busy"); setBusyMsg("Preparing photo...");
+    try {
+      const big = await compressImage(file, 1280, 0.82);
+      const thumb = await compressImage(file, 640, 0.62);
+      if (onPhoto) onPhoto(thumb);
+      await run(big);
+    } catch (x) { setError("Couldn't read that photo. Try another."); setStage("idle"); }
+  }
+  if (!ent.unlocked) {
+    return (
+      <div className="rounded-xl p-3" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+        <div className="text-[14px] font-bold" style={{ color: "var(--tb-text)" }}>Identify fish from a photo</div>
+        <div className="text-[13px] mt-0.5" style={{ color: "var(--tb-muted)" }}>Part of Epic Fishy Pro.</div>
+        <ProLockBox />
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-xl p-3" style={{ background: "var(--tb-surface)", border: "1px solid var(--tb-line)" }}>
+      <input ref={camRef} type="file" accept="image/*" capture="environment" onChange={onFile} className="hidden" />
+      <div className="flex items-center gap-2 mb-2">
+        <Fish size={16} style={{ color: "var(--tb-brass)" }} />
+        <div className="text-[14px] font-bold" style={{ color: "var(--tb-text)" }}>Identify this fish</div>
+      </div>
+      <div className="flex gap-2 mb-2" role="group" aria-label="Recognition engine">
+        <ChipButton active={engine === "ai"} onClick={() => { if (cfg) { setEngine("ai"); setError(null); } else setError("To use your own AI, save a key first: close this form, open Settings (gear icon) and find \"Your own AI\". Your free on-device option works now."); }} label={cfg ? `${AI_PROVIDERS[cfg.provider].label.split(" ")[0]} (best)` : "Your AI (set up)"} />
+        <ChipButton active={engine === "device"} onClick={() => { setEngine("device"); setError(null); }} label="On-device (free)" />
+      </div>
+      {stage === "busy" ? (
+        <div className="flex items-center gap-2 text-sm rounded-lg py-3 px-3" style={inputStyle}><RefreshCw size={15} className="tb-spin" style={{ color: "var(--tb-muted)" }} /><span style={{ color: "var(--tb-muted)" }}>{busyMsg}</span></div>
+      ) : (
+        <div className="grid grid-cols-2 gap-2">
+          <button type="button" onClick={() => photo && run(photo)} disabled={!photo} className="py-2.5 rounded-xl text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)", opacity: photo ? 1 : 0.45 }}>Identify my photo</button>
+          <button type="button" onClick={() => camRef.current && camRef.current.click()} className="py-2.5 rounded-xl text-[14px] font-bold flex items-center justify-center gap-2" style={{ ...inputStyle, color: "var(--tb-text)" }}><Camera size={16} /> Take new photo</button>
+        </div>
+      )}
+      {!photo && stage !== "busy" && <div className="text-[12px] mt-2" style={{ color: "var(--tb-muted)" }}>Add a catch photo below, or take one here. A clear side-on shot of the whole fish works best.</div>}
+      {error && <div role="alert" className="mt-2 text-[13px]" style={{ color: "var(--tb-flare)" }}>{error}</div>}
+      {res && stage === "done" && (
+        <div className="mt-3 space-y-2">
+          {res.fish.map((f, i) => (
+            <div key={f.name + i} className="rounded-lg p-2.5" style={{ background: "var(--tb-bg)", border: `1px solid ${i === 0 ? "var(--tb-brass)" : "var(--tb-line)"}` }}>
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{f.name}</div>
+                  {f.scientific && <div className="text-[12px] italic" style={{ color: "var(--tb-muted)" }}>{f.scientific}</div>}
+                </div>
+                {typeof f.confidence === "number" && <div className="text-[12px] tb-mono shrink-0" style={{ color: f.confidence >= 0.7 ? "var(--tb-brass)" : "var(--tb-muted)" }}>{Math.round(f.confidence * 100)}% sure</div>}
+              </div>
+              {f.features && <div className="text-[13px] mt-1" style={{ color: "var(--tb-muted)" }}>{f.features}</div>}
+              {f.lookalikes.length > 0 && <div className="text-[12px] mt-1" style={{ color: "var(--tb-muted)" }}><strong style={{ color: "var(--tb-text)" }}>Easily mixed up with:</strong> {f.lookalikes.join(" · ")}</div>}
+              {f.tip && <div className="text-[12px] mt-1" style={{ color: "var(--tb-muted)" }}><strong style={{ color: "var(--tb-text)" }}>Handling:</strong> {f.tip}</div>}
+              <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
+                <RegsLink species={f.name} place={place} />
+                {onOpenGuide && proGuideFind(f.name) && <button type="button" onClick={() => onOpenGuide(proGuideFind(f.name).name)} className="text-[13px] font-bold" style={{ color: "var(--tb-blue)" }}>Species guide</button>}
+              </div>
+              <button type="button" onClick={() => { haptic(); onPick(f.name); setStage("idle"); setRes(null); }} className="mt-2 px-3 py-1.5 rounded-lg text-[13px] font-bold" style={{ background: i === 0 ? "var(--tb-brass)" : "var(--tb-surface-2)", color: i === 0 ? "var(--tb-bg)" : "var(--tb-text)" }}>Use {f.name}</button>
+            </div>
+          ))}
+          {res.note && <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>{res.note}</div>}
+          <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>A best guess from a photo, not a guarantee. Check local rules before keeping a fish you aren't sure about.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+// <<PRO-FISHID-END>>
 
 // <<PRO-EXTRAS-START>>
 /* ---------------- Pro extras: map layers, calendar reminders, GPX export ---------------- */
@@ -2336,7 +2925,7 @@ function ProPickCard({ p, onQuickAdd, compact }) {
     <div>
       <div className="flex items-center gap-2 flex-wrap">
         <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{p.title}</div>
-        <span className="text-[11px] px-2 py-0.5 rounded-full" style={{ background: "rgba(45,212,191,0.14)", color: "var(--tb-brass)" }}>{p.kind}</span>
+        <span className="text-[11px] px-2 py-0.5 rounded-full" style={{ background: "rgba(var(--tb-accent-rgb),0.14)", color: "var(--tb-brass)" }}>{p.kind}</span>
         <span className="text-[11px] font-bold ml-auto" style={{ color: BITE_COLORS[p.score >= 80 ? "Excellent" : p.score >= 66 ? "Good" : "Fair"] }}>{pill} · {p.score}</span>
       </div>
       {p.why.length > 0 && (
@@ -2583,12 +3172,109 @@ function ProNearbySpecies({ nearby, place, catches, onPick, targetName }) {
 
 /* ---------------- container for the Conditions tab ---------------- */
 
+function ProTodayCall({ st, targetName, items, catches }) {
+  useUnits();
+  const [, setTick] = useState(0);
+  useEffect(() => { const id = setInterval(() => setTick((t) => t + 1), 60000); return () => clearInterval(id); }, []);
+  const model = useMemo(() => {
+    if (st.status !== "ok") return null;
+    try { return proBuildDays(st.fc, st.marine, targetName, st.measured); } catch (e) { return null; }
+  }, [st, targetName]);
+  if (st.status === "loading" && !model) return <div className="tb-skeleton" style={{ height: 172, order: -1 }} aria-label="Loading today's call" />;
+  if (!model) return null;
+  const now = Date.now();
+  const call = proTodayCall(model, now);
+  if (!call) return null;
+  const tz = st.fc.tz;
+  const hr = (ms) => proFmtTime(ms, tz, { hour: "numeric", minute: undefined });
+  const span = (w) => `${hr(w.start)} – ${hr(w.end)}`;
+  const score = call.now ? call.now.score : call.next ? call.next.avg : model.days[0].best;
+  const col = call.tone === "good" ? "var(--tb-brass)" : call.tone === "mid" ? "#fbbf24" : "var(--tb-muted)";
+  let title, line;
+  if (call.verdict === "go") {
+    title = "Go now";
+    line = call.inWin ? `The bite is on until about ${hr(call.inWin.end)}.` : `${call.now.label} bite right now.${call.next && call.next.di === 0 && call.next.avg > call.now.score + 4 ? ` Even better ${span(call.next)} (${call.next.avg}).` : ""}`;
+  } else if (call.verdict === "wait") {
+    title = `Best shot ${span(call.next)}`;
+    line = `Starts in ${proCountdown(call.next.start - now)} · expect a ${call.next.peak.label.toLowerCase()} bite (${call.next.avg}).`;
+  } else if (call.verdict === "tomorrow") {
+    title = "Today's best is behind you";
+    line = `Next good window: tomorrow ${span(call.next)} (${call.next.avg}).`;
+  } else {
+    title = "Slow going";
+    line = "No strong window in the next two days. Fish slow and deep, or pick another day.";
+  }
+  const trendWord = call.trend === "building" ? "Building" : call.trend === "fading" ? "Fading" : call.trend === "holding" ? "Holding steady" : null;
+  const TrendI = call.trend === "building" ? TrendingUp : call.trend === "fading" ? TrendingDown : null;
+  let lure = null;
+  try {
+    const ext = st.marine ? proTideExtrema(st.marine) : null;
+    const nx = ext ? ext.find((e) => e.t > now) : null;
+    const top = proBuildPlan({ days: model, now: call.now, items, catches, tideNext: nx ? nx.type : null, precip48h: 0 }).top;
+    lure = top && top[0] ? top[0].title : null;
+  } catch (e) { lure = null; }
+  const hazText = (h) => h.id === "storm" ? `Thunderstorms possible around ${hr(h.t)}. Be off the water before then.`
+    : h.id === "gust" ? `Gusts to ${fmtSpeed(h.gust)} around ${hr(h.t)}. Rough for kayaks and small boats.`
+    : h.id === "rain" ? `Rain likely from ${hr(h.t)} (${Math.round(h.pop)}%).`
+    : h.id === "heat" ? `Dangerous heat by ${hr(h.t)}. Bring more water than you think you need.`
+    : `Near freezing around ${hr(h.t)}. Dress for it.`;
+  const C = 2 * Math.PI * 34;
+  const waterNote = model.waterSource === "measured" ? "measured" : model.waterSource === "model" ? "sea model" : "estimated from air temps";
+  const best = call.bestDay;
+  return (
+    <section className="rounded-2xl overflow-hidden relative" style={{ order: -1, background: "linear-gradient(145deg, rgba(var(--tb-accent-rgb),0.16), var(--tb-surface) 55%)", border: "1px solid var(--tb-line)" }} aria-label="Today's call">
+      <div className="p-4 flex items-center gap-4">
+        <div className="relative shrink-0" style={{ width: 84, height: 84 }}>
+          <svg width="84" height="84" viewBox="0 0 84 84" aria-hidden="true">
+            <circle cx="42" cy="42" r="34" fill="none" stroke="var(--tb-surface-2)" strokeWidth="8" />
+            <circle cx="42" cy="42" r="34" fill="none" stroke={col} strokeWidth="8" strokeLinecap="round" strokeDasharray={`${(C * Math.max(4, score)) / 100} ${C}`} transform="rotate(-90 42 42)" style={{ transition: "stroke-dasharray .6s ease" }} />
+          </svg>
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <div className="tb-stencil text-[28px] leading-none" style={{ color: "var(--tb-text)" }}>{score}</div>
+            <div className="text-[10px] font-bold mt-0.5" style={{ color: "var(--tb-muted)" }}>{call.now ? "NOW" : "PEAK"}</div>
+          </div>
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-[12px] font-bold tracking-wide" style={{ color: col }}>TODAY'S CALL{model.profile.id !== "generic" ? ` · ${model.profile.label.toUpperCase()}` : ""}</div>
+          <div className="text-[21px] font-bold leading-tight mt-0.5" style={{ color: "var(--tb-text)" }}>{title}</div>
+          <div className="text-[14px] leading-snug mt-1" style={{ color: "var(--tb-muted)" }}>{line}</div>
+        </div>
+      </div>
+      <div className="px-4 pb-3 flex flex-wrap gap-x-4 gap-y-1.5 text-[13px]" style={{ color: "var(--tb-text)" }}>
+        {trendWord && <span className="inline-flex items-center gap-1">{TrendI && <TrendI size={14} style={{ color: col }} />}{trendWord}</span>}
+        {lure && <span className="inline-flex items-center gap-1"><Fish size={14} style={{ color: "var(--tb-brass)" }} />Throw: {lure}</span>}
+        {typeof model.waterF === "number" && <span className="inline-flex items-center gap-1"><Waves size={14} style={{ color: "var(--tb-brass)" }} />Water {fmtTemp(model.waterF)} <span style={{ color: "var(--tb-muted)" }}>({waterNote})</span></span>}
+      </div>
+      {(call.hazards.length > 0 || call.front) && (
+        <div className="px-4 pb-3 space-y-1.5">
+          {call.hazards.map((h) => (
+            <div key={h.id} className="flex items-start gap-2 rounded-lg px-3 py-2 text-[13px] leading-snug" style={{ background: h.level === "high" ? "rgba(255,111,94,0.14)" : "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+              <AlertTriangle size={15} className="shrink-0 mt-0.5" style={{ color: h.level === "low" ? "var(--tb-muted)" : "var(--tb-flare)" }} /><span>{hazText(h)}</span>
+            </div>
+          ))}
+          {call.front && (
+            <div className="flex items-start gap-2 rounded-lg px-3 py-2 text-[13px] leading-snug" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)" }}>
+              <Gauge size={15} className="shrink-0 mt-0.5" style={{ color: "var(--tb-brass)" }} /><span>A front passes around {hr(call.front.t)}. Fish ahead of it; the bite usually drops off for a day after.</span>
+            </div>
+          )}
+        </div>
+      )}
+      {best && best.di > 0 && best.window && (
+        <div className="px-4 py-2.5 text-[13px]" style={{ borderTop: "1px solid var(--tb-line)", color: "var(--tb-muted)" }}>
+          Best day ahead: <strong style={{ color: "var(--tb-text)" }}>{best.di === 1 ? "tomorrow" : proFmtDay(best.start, tz, { weekday: "long", month: undefined, day: undefined })}</strong>, {span(best.window)} ({best.score})
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ProConditions({ location, items, catches, onQuickAdd, noaaTideMissing }) {
   const [st, refresh] = useProForecast(location.lat, location.lon);
   const nearby = useProNearbySpecies(location.lat, location.lon);
   const [target, setTarget] = proUsePersisted(PRO_TARGET_KEY, "");
   return (
     <>
+      <ProTodayCall st={st} targetName={target} items={items} catches={catches} />
       <ProBiteForecast placeName={location.name} st={st} targetName={target} onTarget={setTarget} catches={catches} nearby={nearby.list} items={items} onQuickAdd={onQuickAdd} refresh={refresh} loading={st.status === "loading"} />
       <ProSpotRanker catches={catches} targetName={target} />
       {noaaTideMissing && <ProModelTideCard st={st} />}
@@ -2639,6 +3325,46 @@ function ProBars({ rows, max, labelW = 78 }) {
         </div>
       ))}
     </div>
+  );
+}
+
+function ProForecastScorecard({ catches }) {
+  const sc = useMemo(() => proScorecard(catches), [catches]);
+  const pending = (catches || []).filter((c) => c.gps && c.dateTime).length;
+  if (!catches || !catches.length) return null;
+  const pc = (v) => `${Math.round(v * 100)}%`;
+  let verdict = "";
+  if (sc.n >= 5) verdict = sc.topThird >= 0.5 ? "The forecast is lining up with your fishing." : sc.topThird >= 0.4 ? "A little better than chance. Keep logging." : "No better than chance so far, so treat the forecast as a guide only.";
+  return (
+    <CardShell title="FORECAST SCORECARD" subtitle="did the bite forecast match your real catches?">
+      {sc.n < 5 ? (
+        <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>
+          {sc.n} catch{sc.n === 1 ? "" : "es"} checked so far (it needs 5). Catches with a GPS tag are checked against what the forecast would have said at that hour. {pending > sc.n ? "A few more are still being looked up." : "Log a few more with GPS on."}
+        </div>
+      ) : (
+        <div>
+          <div className="flex items-end gap-3">
+            <div className="tb-stencil text-[48px] leading-[0.9]" style={{ color: sc.topThird >= 0.4 ? "var(--tb-brass)" : "var(--tb-muted)" }}>{pc(sc.topThird)}</div>
+            <div className="text-[14px] pb-1 leading-snug" style={{ color: "var(--tb-text)" }}>of your {sc.n} catches came in the best third of that day's hours. Chance alone would be about 33%.</div>
+          </div>
+          <div className="text-[14px] font-bold mt-2" style={{ color: "var(--tb-text)" }}>{verdict}</div>
+          <div className="text-[13px] mt-1" style={{ color: "var(--tb-muted)" }}>{pc(sc.good)} were in hours rated Good or better. On average your catches ranked in the top {Math.max(1, Math.round((1 - sc.avgPct) * 100))}% of their day.</div>
+          {sc.bySpecies.length > 0 && (
+            <div className="mt-3 space-y-1.5">
+              {sc.bySpecies.map((b) => (
+                <div key={b.species} className="flex items-center gap-2 text-[13px]">
+                  <span className="w-28 shrink-0 truncate" style={{ color: "var(--tb-muted)" }}>{b.species}</span>
+                  <span className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: "var(--tb-surface-2)" }} aria-hidden="true"><span className="block h-full rounded-full" style={{ width: `${Math.round(b.avgPct * 100)}%`, background: "var(--tb-brass)" }} /></span>
+                  <span className="tb-mono w-10 text-right" style={{ color: "var(--tb-text)" }}>{Math.round(b.avgPct * 100)}</span>
+                </div>
+              ))}
+              <div className="text-[12px]" style={{ color: "var(--tb-muted)" }}>Bars: average rank of that species' catches within their day (50 = chance, higher is better).</div>
+            </div>
+          )}
+          <div className="text-[12px] mt-3" style={{ color: "var(--tb-muted)" }}>Small samples are noisy: fish also get caught when you fish more, and most people fish at dawn and dusk. Treat this as a trend, not proof.</div>
+        </div>
+      )}
+    </CardShell>
   );
 }
 
@@ -2850,7 +3576,7 @@ function ProCommunityMap() {
       } else {
         const n = cl.items.length;
         const size = n > 99 ? 46 : n > 9 ? 40 : 34;
-        const icon = L.divIcon({ className: "", iconSize: [size, size], html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:#2dd4bf;color:#040707;border:3px solid rgba(4,7,7,.85);display:flex;align-items:center;justify-content:center;font:700 14px system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.5)">${n}</div>` });
+        const icon = L.divIcon({ className: "", iconSize: [size, size], html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:#2dd4bf;color:#040707;border:3px solid rgba(var(--tb-bg-rgb),.85);display:flex;align-items:center;justify-content:center;font:700 14px system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.5)">${n}</div>` });
         const m = L.marker([cl.lat, cl.lon], { icon, keyboard: true, title: `${n} catches — zoom in` }).addTo(layer);
         m.on("click", () => {
           const b = L.latLngBounds(cl.items.map((c) => [c.lat, c.lon]));
@@ -2904,7 +3630,7 @@ function ProCommunityMap() {
       <div className="relative">
         <div ref={mapRef} style={{ height: 340, borderRadius: 12, overflow: "hidden" }} />
         {empty && (
-          <div className="absolute inset-0 flex items-center justify-center text-center px-6 rounded-xl" style={{ background: "rgba(4,7,7,0.72)", zIndex: 500 }}>
+          <div className="absolute inset-0 flex items-center justify-center text-center px-6 rounded-xl" style={{ background: "rgba(var(--tb-bg-rgb),0.72)", zIndex: 500 }}>
             <span className="text-[14px]" style={{ color: "var(--tb-text)" }}>No shared catch locations yet. Tick “Also show on the community map” when you log a catch to be the first.</span>
           </div>
         )}
@@ -2922,7 +3648,12 @@ function ProCommunityMap() {
 // <<PRO-UI-END>>
 
 export default function TackleTracker() {
-  const [view, setView] = useState("tackle"); // 'tackle' | 'conditions' | 'catches'
+  const appPrefs = useAppPrefs();
+  const appLook = useMemo(() => appThemeVars(appPrefs), [appPrefs]);
+  useEffect(() => { try { const m = document.querySelector('meta[name="theme-color"]'); if (m) m.setAttribute("content", appLook.theme.bg); document.body.style.background = appLook.theme.bg; } catch (e) { /* ignore */ } }, [appLook]);
+  const [view, setView] = useState(() => appPrefsGet().start);
+  const [showInstall, setShowInstall] = useState(false);
+  useEffect(() => { const on = () => { setShowSettings(false); setShowInstall(true); }; window.addEventListener("ef-open-install", on); return () => window.removeEventListener("ef-open-install", on); }, []); // 'tackle' | 'conditions' | 'catches'
   const [items, setItems] = useState(null);
   const [activeCategory, setActiveCategory] = useState(null);
   const [search, setSearch] = useState("");
@@ -2930,6 +3661,9 @@ export default function TackleTracker() {
   const [editingItem, setEditingItem] = useState(null);
   const [formPrefill, setFormPrefill] = useState(null);
   const [showScan, setShowScan] = useState(false);
+  const [guide, setGuide] = useState({ open: false, focus: null });
+  const guideLoc = useSavedLocation();
+  const guidePlace = useProPlace(guideLoc ? guideLoc.lat : null, guideLoc ? guideLoc.lon : null);
   const [tackleSubView, setTackleSubView] = useState("gear"); // 'gear' | 'guide' | 'knots'
   const [showSettings, setShowSettings] = useState(false);
   const [saveError, setSaveError] = useState(false);
@@ -3017,7 +3751,7 @@ export default function TackleTracker() {
   const condTried = useRef(new Set());
   useEffect(() => {
     if (!catches) return undefined;
-    const todo = catches.filter((c) => c.gps && c.dateTime && (!c.conditions || c.condKey !== proCondKey(c)) && !condTried.current.has(c.id)).slice(0, 4);
+    const todo = catches.filter((c) => c.gps && c.dateTime && (!c.conditions || c.condKey !== proCondKey(c) || c.conditions.v !== 2) && !condTried.current.has(c.id)).slice(0, 4);
     if (!todo.length) return undefined;
     let off = false;
     (async () => {
@@ -3162,18 +3896,7 @@ export default function TackleTracker() {
     >
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Big+Shoulders+Stencil:wght@700;800&display=swap');
-        :root {
-          --tb-bg: #040707;
-          --tb-surface: #0e1514;
-          --tb-surface-2: #172321;
-          --tb-line: #234440;
-          --tb-brass: #2dd4bf;
-          --tb-brass-dim: #0f8f82;
-          --tb-flare: #ff6f5e;
-          --tb-text: #f6fbfa;
-          --tb-muted: #9db6b2;
-          --tb-blue: #6ee7d8;
-        }
+        :root { ${appLook.css} }
         .tb-stencil { font-family: 'Big Shoulders Stencil', 'Arial Narrow', sans-serif; letter-spacing: 0.03em; font-weight: 800; text-transform: uppercase; }
         /* "tb-mono" is the old data-label class; it now means tabular figures in the body face. */
         .tb-mono { font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: 0; }
@@ -3184,7 +3907,7 @@ export default function TackleTracker() {
         .tb-scroll::-webkit-scrollbar-thumb { background: var(--tb-line); border-radius: 4px; }
         .tb-waterline {
           height: 10px; opacity: 0.5; background-repeat: repeat-x; background-position: left center;
-          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='10' viewBox='0 0 40 10'%3E%3Cpath d='M0 5 Q10 0 20 5 T40 5' fill='none' stroke='%232dd4bf' stroke-width='1.5'/%3E%3C/svg%3E");
+          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='10' viewBox='0 0 40 10'%3E%3Cpath d='M0 5 Q10 0 20 5 T40 5' fill='none' stroke='%23${appLook.brass.slice(1)}' stroke-width='1.5'/%3E%3C/svg%3E");
         }
         input:focus, textarea:focus, select:focus { border-color: var(--tb-brass) !important; }
         button:focus-visible, a:focus-visible { outline: 2px solid var(--tb-blue); outline-offset: 2px; border-radius: 8px; }
@@ -3193,6 +3916,10 @@ export default function TackleTracker() {
         @keyframes tb-fade-in { from { opacity: 0; } to { opacity: 1; } }
         @keyframes tb-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes tb-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+        @keyframes tb-nudge { 0%, 100% { transform: translate(-50%, 0); } 50% { transform: translate(-50%, 8px); } }
+        .tb-nudge { animation: tb-nudge 1.1s ease-in-out infinite; }
+        @keyframes tb-view-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .tb-view { animation: tb-view-in 0.26s cubic-bezier(.2,.8,.3,1); }
         .tb-tray { animation: tb-slide-up 0.28s cubic-bezier(.2,.8,.3,1); }
         .tb-overlay { animation: tb-fade-in 0.2s ease; }
         .tb-toast { animation: tb-fade-in 0.15s ease; }
@@ -3203,7 +3930,7 @@ export default function TackleTracker() {
           background-size: 200% 100%; animation: tb-shimmer 1.6s linear infinite;
         }
         @media (prefers-reduced-motion: reduce) {
-          .tb-tray, .tb-overlay, .tb-toast, .tb-skeleton { animation: none !important; }
+          .tb-tray, .tb-overlay, .tb-toast, .tb-skeleton, .tb-view { animation: none !important; }
           .tb-spin { animation-duration: 3s; }
         }
       `}</style>
@@ -3215,6 +3942,8 @@ export default function TackleTracker() {
             <BrandMark />
             <span className="tb-stencil text-[26px] leading-none" style={{ color: "var(--tb-text)" }}>EPIC FISHY</span>
           </div>
+          <div className="flex items-center gap-1">
+          <HeaderInstallButton />
           <button
             onClick={() => setShowSettings(true)}
             aria-label="Settings"
@@ -3222,6 +3951,7 @@ export default function TackleTracker() {
           >
             <Settings size={22} style={{ color: "var(--tb-muted)" }} />
           </button>
+          </div>
         </div>
 
         <div className="tb-waterline mt-3 -mx-5" aria-hidden="true" />
@@ -3232,12 +3962,14 @@ export default function TackleTracker() {
         className="flex-1 min-h-0 overflow-y-auto tb-scroll px-4 pt-5"
         style={{ paddingBottom: "calc(112px + env(safe-area-inset-bottom, 0px))", overscrollBehaviorY: "contain" }}
       >
+        <div key={view} className="tb-view" style={appLook.zoom !== 1 ? { zoom: appLook.zoom } : undefined}>
         <div className="mb-5">
           <h1 className="tb-stencil text-[44px] leading-[0.95]" style={{ color: "var(--tb-text)" }}>{meta.title}</h1>
           <p className="text-[15px] mt-1.5 min-h-[22px]" style={{ color: "var(--tb-muted)" }}>{meta.note}</p>
         </div>
 
         <SafetyBanner alerts={safety.alerts} />
+        {view === appPrefs.start && <InstallBanner />}
 
         {view === "tackle" && (
           <>
@@ -3252,6 +3984,7 @@ export default function TackleTracker() {
 
             {tackleSubView === "gear" && (
               <>
+                <NessieCard />
                 <div className="flex items-center gap-2 mb-4">
                 <div className="relative flex-1 min-w-0">
                   <Search size={18} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: "var(--tb-muted)" }} />
@@ -3311,7 +4044,7 @@ export default function TackleTracker() {
                           style={{ background: "var(--tb-surface)" }}
                         >
                           <div className={wide ? "flex items-center gap-4" : ""}>
-                            <div className="w-11 h-11 rounded-xl flex items-center justify-center shrink-0" style={{ background: "rgba(45,212,191,0.12)" }}>
+                            <div className="w-11 h-11 rounded-xl flex items-center justify-center shrink-0" style={{ background: "rgba(var(--tb-accent-rgb),0.12)" }}>
                               <Icon size={22} style={{ color: "var(--tb-brass)" }} />
                             </div>
                             <div className={wide ? "" : "mt-4"}>
@@ -3345,12 +4078,14 @@ export default function TackleTracker() {
             onEdit={(c) => { setEditingCatch(c); setShowCatchForm(true); }}
             onDelete={deleteCatch}
             onToast={showToast}
+            onOpenGuide={(f) => setGuide({ open: true, focus: f })}
           />
         )}
 
         {view === "spots" && <SpotsView catches={catches || []} />}
 
         {view === "community" && <CommunityView />}
+        </div>
 
       </main>
 
@@ -3436,10 +4171,13 @@ export default function TackleTracker() {
           recentSpecies={[...new Set([...(catches || [])].sort((a, b) => new Date(b.dateTime) - new Date(a.dateTime)).map((c) => c.species).filter(Boolean))].slice(0, 6)}
           onCancel={() => { setShowCatchForm(false); setEditingCatch(null); }}
           onSave={upsertCatch}
+          onOpenGuide={(f) => setGuide({ open: true, focus: f })}
         />
       )}
 
+      {guide.open && <SpeciesGuideSheet focus={guide.focus} place={guidePlace} onClose={() => setGuide({ open: false, focus: null })} />}
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {showInstall && <InstallSheet onClose={() => setShowInstall(false)} />}
       {showScan && <ScanTackleSheet onClose={() => setShowScan(false)} onAdd={addScanned} onOpenSettings={() => { setShowScan(false); setShowSettings(true); }} />}
     </div>
   );
@@ -3493,7 +4231,7 @@ function BottomNav({ view, onChange }) {
       aria-label="Main"
       className="absolute bottom-0 left-0 right-0 z-10 flex"
       style={{
-        background: "rgba(4,7,7,0.94)",
+        background: "rgba(var(--tb-bg-rgb),0.94)",
         backdropFilter: "blur(14px)",
         WebkitBackdropFilter: "blur(14px)",
         borderTop: "1px solid var(--tb-line)",
@@ -3507,16 +4245,16 @@ function BottomNav({ view, onChange }) {
             key={id}
             onClick={() => onChange(id)}
             aria-current={active ? "page" : undefined}
-            className="flex-1 relative flex flex-col items-center justify-center gap-1 pt-2.5 pb-2 min-h-[64px] active:opacity-60"
+            className="flex-1 min-w-0 relative flex flex-col items-center justify-center gap-1 pt-2.5 pb-2 px-0.5 min-h-[64px] active:opacity-60"
           >
             {active && (
               <span
                 className="absolute top-0 h-[3px] w-10 rounded-b-full"
-                style={{ background: "var(--tb-brass)", boxShadow: "0 0 14px 2px rgba(45,212,191,0.55)" }}
+                style={{ background: "var(--tb-brass)", boxShadow: "0 0 14px 2px rgba(var(--tb-accent-rgb),0.55)" }}
               />
             )}
             <Icon size={24} strokeWidth={active ? 2.4 : 1.8} style={{ color: active ? "var(--tb-brass)" : "var(--tb-muted)" }} />
-            <span className="text-[12px] font-bold leading-none whitespace-nowrap" style={{ color: active ? "var(--tb-text)" : "var(--tb-muted)" }}>{label}</span>
+            <span className="font-bold leading-none whitespace-nowrap" style={{ fontSize: "clamp(9.5px, 2.9vw, 12px)", letterSpacing: "-0.01em", color: active ? "var(--tb-text)" : "var(--tb-muted)" }}>{label}</span>
           </button>
         );
       })}
@@ -3534,7 +4272,7 @@ function AddFab({ onClick, label }) {
         bottom: "calc(80px + env(safe-area-inset-bottom, 0px))",
         background: "var(--tb-brass)",
         color: "var(--tb-bg)",
-        boxShadow: "0 12px 30px -8px rgba(45,212,191,0.6), inset 0 0 0 1px rgba(255,255,255,0.14)",
+        boxShadow: "0 12px 30px -8px rgba(var(--tb-accent-rgb),0.6), inset 0 0 0 1px rgba(255,255,255,0.14)",
       }}
     >
       <Plus size={28} strokeWidth={2.6} />
@@ -3829,7 +4567,7 @@ function groupCatchesByTrip(sortedCatches) {
     });
 }
 
-function CatchesView({ catches, items, onEdit, onDelete, onToast }) {
+function CatchesView({ catches, items, onEdit, onDelete, onToast, onOpenGuide }) {
   const [groupByTrip, setGroupByTrip] = useState(false);
   const bestIds = personalBestIds(catches || []);
 
@@ -3839,7 +4577,8 @@ function CatchesView({ catches, items, onEdit, onDelete, onToast }) {
 
   if (catches.length === 0) {
     return (
-      <div className="py-10 text-center space-y-3">
+      <div className="py-6 text-center space-y-3">
+        <SpeciesGuideEntry onOpen={onOpenGuide} />
         <Fish size={32} className="mx-auto" style={{ color: "var(--tb-brass)" }} />
         <p className="text-sm" style={{ color: "var(--tb-muted)" }}>
           No catches logged yet. Tap + to record your first fish.
@@ -3867,7 +4606,9 @@ function CatchesView({ catches, items, onEdit, onDelete, onToast }) {
 
   return (
     <div className="space-y-3">
+      <SpeciesGuideEntry onOpen={onOpenGuide} />
       <ProCatchHub catches={catches} />
+      <ProForecastScorecard catches={catches} />
       <div className="grid grid-cols-3 gap-2">
         <StatTile label="Total" value={catches.length} />
         <StatTile label="Top species" value={topSpecies ? topSpecies[0] : "—"} small />
@@ -3961,7 +4702,7 @@ function CatchRow({ record, onEdit, onDelete, isBest, onToast }) {
           <div className="text-[16px] font-bold flex items-center gap-2" style={{ color: "var(--tb-text)" }}>
             <span>{record.species || "Unknown species"}</span>
             {isBest && (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[12px] font-bold" style={{ background: "rgba(45,212,191,0.14)", color: "var(--tb-brass)" }} title="Personal best for this species">
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[12px] font-bold" style={{ background: "rgba(var(--tb-accent-rgb),0.14)", color: "var(--tb-brass)" }} title="Personal best for this species">
                 <Trophy size={12} aria-hidden="true" /> Best
               </span>
             )}
@@ -4042,7 +4783,7 @@ function toDatetimeLocal(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onCancel, onSave }) {
+function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onCancel, onSave, onOpenGuide }) {
   const [species, setSpecies] = useState(initial?.species || "");
   const [length, setLength] = useState(initial?.length || "");
   const [lengthUnit, setLengthUnit] = useState(initial?.lengthUnit || (isMetric() ? "cm" : "in"));
@@ -4059,6 +4800,10 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
   const [shareToCommunity, setShareToCommunity] = useState(false);
   const [shareApproxLocation, setShareApproxLocation] = useState(false);
   const communityAvailable = typeof window !== "undefined" && window.communityAPI && window.communityAPI.configured;
+  const savedLoc = useSavedLocation();
+  const nearbyForId = useProNearbySpecies(gps ? gps.lat : savedLoc ? savedLoc.lat : null, gps ? gps.lon : savedLoc ? savedLoc.lon : null);
+  const formPlace = useProPlace(gps ? gps.lat : savedLoc ? savedLoc.lat : null, gps ? gps.lon : savedLoc ? savedLoc.lon : null);
+  const fishNearby = useMemo(() => (nearbyForId.list || []).map((x) => x.name), [nearbyForId.list]);
 
   const captureGps = useCallback(() => {
     if (!navigator.geolocation) {
@@ -4146,6 +4891,15 @@ function CatchForm({ initial, items, existingTrips = [], recentSpecies = [], onC
           <ProSpeciesSuggest gps={gps} hasPhoto={!!photo} current={species} onPick={setSpecies} />
 
           <PhotoField photo={photo} onChange={setPhoto} label="Catch photo" />
+
+          <FishIdPanel photo={photo} nearbyNames={fishNearby} place={formPlace} onPhoto={setPhoto} onPick={setSpecies} onOpenGuide={onOpenGuide} />
+
+          {species.trim() && (
+            <div className="flex flex-wrap gap-x-4 gap-y-1 -mt-1">
+              <RegsLink species={species.trim()} place={formPlace} />
+              {proGuideFind(species) && <button type="button" onClick={() => onOpenGuide && onOpenGuide(proGuideFind(species).name)} className="text-[13px] font-bold" style={{ color: "var(--tb-blue)" }}>Species guide</button>}
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-3">
             <Field label="Length">
@@ -4437,8 +5191,8 @@ function ConditionsView({ items = [], catches = [], onQuickAdd }) {
   }
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between" style={{ order: -2 }}>
         <button onClick={() => setShowLocationPicker(true)} className="flex items-center gap-1.5 text-sm font-semibold" style={{ color: "var(--tb-text)" }}>
           <MapPin size={15} style={{ color: "var(--tb-brass)" }} />
           {location.name}
@@ -4491,7 +5245,7 @@ function WeatherCard({ weather, loading, error, waterTemp, waterSrc }) {
         <StatRow icon={Sunrise} label="Sunrise" value={fmtTime(sunrise)} />
         <StatRow icon={Sunset} label="Sunset" value={fmtTime(sunset)} />
         {typeof waterTemp === "number" && (
-          <StatRow icon={Waves} label="Water" value={fmtTemp(waterTemp)} sub={waterSrc && waterSrc.kind === "measured" ? `measured · ${waterSrc.name}${waterSrc.miles ? `, ${isMetric() ? Math.round(waterSrc.miles * 1.609) + " km" : waterSrc.miles + " mi"}` : ""}` : "ocean model"} />
+          <StatRow icon={Waves} label="Water" value={fmtTemp(waterTemp)} sub={waterSrc && waterSrc.kind === "measured" ? `measured · ${waterSrc.name}${waterSrc.miles ? `, ${isMetric() ? Math.round(waterSrc.miles * 1.609) + " km" : waterSrc.miles + " mi"}` : ""}` : "nearest sea surface (model)"} />
         )}
       </div>
     </CardShell>
@@ -4672,6 +5426,9 @@ function WaypointsCard() {
         setPoints([]);
       }
     })();
+    const on = (e) => { if (Array.isArray(e.detail)) setPoints(e.detail); };
+    window.addEventListener("tackle-waypoints-changed", on);
+    return () => window.removeEventListener("tackle-waypoints-changed", on);
   }, []);
 
   async function persist(next) {
@@ -4813,7 +5570,7 @@ function WaypointsCard() {
               </div>
             )}
             <div className="tb-mono text-[11px]" style={{ color: "var(--tb-muted)" }}>
-              {new Date(wp.time).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+              {wp.time && Number.isFinite(new Date(wp.time).getTime()) ? new Date(wp.time).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "Saved spot"}
               {" · "}
               {wp.lat.toFixed(5)}, {wp.lon.toFixed(5)}
               {typeof wp.accuracyFt === "number" ? ` · ±${fmtShort(wp.accuracyFt)}` : ""}
@@ -4849,7 +5606,26 @@ function MyMapCard({ catches }) {
   const [filter, setFilter] = useState("all"); // all | catches | waypoints
   const [active, setActive] = useState([]); // ids of Pro layers that are on
   const [showLock, setShowLock] = useState(false);
+  const [offline, setOffline] = useState({ busy: false, msg: null, count: 0 });
   const leafletAvailable = typeof window !== "undefined" && !!window.L;
+
+  useEffect(() => { proSavedTileCount().then((n) => setOffline((o) => ({ ...o, count: n }))); }, []);
+  async function saveOffline() {
+    haptic();
+    if (!ent.unlocked) { setShowLock(true); return; }
+    const map = mapInstance.current;
+    if (!map || typeof caches === "undefined") { setOffline((o) => ({ ...o, msg: "Offline maps aren't available in this browser." })); return; }
+    const bb = map.getBounds();
+    const plan = proTilesForView({ north: bb.getNorth(), south: bb.getSouth(), east: bb.getEast(), west: bb.getWest() }, map.getZoom());
+    if (plan.tooBig) { setOffline((o) => ({ ...o, msg: `That's a big area (${plan.tooBig} map pieces). Zoom in to one lake or bay first and try again.` })); return; }
+    setOffline((o) => ({ ...o, busy: true, msg: `Saving 0 of ${plan.tiles.length}...` }));
+    try {
+      const r = await proSaveTiles(plan.tiles, (d, t) => setOffline((o) => ({ ...o, msg: `Saving ${d} of ${t}...` })));
+      const n = await proSavedTileCount();
+      setOffline({ busy: false, count: n, msg: r.failed ? `Saved ${r.saved} map pieces; ${r.failed} didn't download. Try again with a better signal.` : `Saved. This area now works with no signal.` });
+    } catch (e) { setOffline((o) => ({ ...o, busy: false, msg: "Couldn't save the map. Check your connection and try again." })); }
+  }
+  async function clearOffline() { haptic(); await proClearTiles(); setOffline({ busy: false, count: 0, msg: "Saved maps removed." }); }
 
   useEffect(() => {
     (async () => {
@@ -4967,6 +5743,194 @@ function MyMapCard({ catches }) {
         <button onClick={exportGpx} className="ml-auto font-bold" style={{ color: "var(--tb-blue)" }}>{ent.unlocked ? "" : "🔒 "}Export GPX</button>
         <span>Private to this device</span>
       </div>
+      <div className="px-4 py-2.5 text-[12px] flex flex-wrap items-center gap-x-3 gap-y-1" style={{ color: "var(--tb-muted)", borderTop: "1px solid var(--tb-line)" }}>
+        <button onClick={saveOffline} disabled={offline.busy} className="font-bold" style={{ color: "var(--tb-blue)", opacity: offline.busy ? 0.6 : 1 }}>{ent.unlocked ? "" : "🔒 "}Save this view for offline</button>
+        {offline.count > 0 && <button onClick={clearOffline} className="font-bold" style={{ color: "var(--tb-flare)" }}>Remove saved maps ({offline.count})</button>}
+        <span role="status" aria-live="polite">{offline.msg || (offline.count > 0 ? `${offline.count} map pieces saved on this device` : "Download the map around a spot before you lose signal")}</span>
+      </div>
+    </CardShell>
+  );
+}
+
+function NearbyExplorer({ location, onPickLocation, onUseMyLocation }) {
+  useUnits();
+  const [st, setSt] = useState({ status: "idle", list: [], stale: false, at: 0 });
+  const [kind, setKind] = useState("all");
+  const [sel, setSel] = useState(null);
+  const [more, setMore] = useState(false);
+  const [temps, setTemps] = useState({});
+  const [saved, setSaved] = useState({});
+  const mapEl = useRef(null);
+  const mapRef = useRef(null);
+  const groupRef = useRef(null);
+  const markersRef = useRef({});
+  const leaflet = typeof window !== "undefined" && !!window.L;
+  const lat = location ? location.lat : null, lon = location ? location.lon : null;
+
+  const load = useCallback(async (la, lo, force) => {
+    setSt((s) => ({ ...s, status: "loading" }));
+    try {
+      const r = await proLoadNearbyPlaces(la, lo, force);
+      setSt({ status: "ok", list: r.data || [], stale: r.stale, at: r.at });
+    } catch (e) {
+      setSt({ status: "error", list: [], stale: false, at: 0 });
+    }
+  }, []);
+  useEffect(() => { setSel(null); setMore(false); setTemps({}); if (lat != null) load(lat, lon, false); }, [lat, lon, load]);
+
+  // sea-surface temperature at the closest marinas (quietly skipped where there's no data)
+  useEffect(() => {
+    if (st.status !== "ok") return undefined;
+    let off = false;
+    st.list.filter((x) => x.kind === "marina").slice(0, 6).forEach(async (m) => {
+      try {
+        const d = await proFetchJson(`https://marine-api.open-meteo.com/v1/marine?latitude=${m.lat}&longitude=${m.lon}&current=sea_surface_temperature&temperature_unit=fahrenheit&timezone=auto`, 9000);
+        const t = d && d.current ? d.current.sea_surface_temperature : null;
+        if (!off && typeof t === "number") setTemps((p) => ({ ...p, [m.key]: t }));
+      } catch (e) { /* no reading */ }
+    });
+    return () => { off = true; };
+  }, [st.status, st.at]);
+
+  const counts = {};
+  for (const x of st.list) counts[x.kind] = (counts[x.kind] || 0) + 1;
+  const shown = kind === "all" ? st.list : st.list.filter((x) => x.kind === kind);
+  const colorOf = (k) => (PRO_NEARBY_KINDS.find((d) => d.id === k) || {}).color || "#2dd4bf";
+  const titleOf = (x) => x.name || x.type;
+  const subOf = (x) => [x.name ? x.type : null, x.fee === "free" ? "Free" : x.fee === "fee" ? "Fee" : null, x.hours || null, typeof temps[x.key] === "number" ? `Water ${fmtTemp(temps[x.key])}` : null].filter(Boolean).join(" · ");
+
+  useEffect(() => {
+    if (!leaflet || !mapEl.current || mapRef.current) return undefined;
+    const map = window.L.map(mapEl.current, { attributionControl: true, zoomControl: false }).setView([39, -96], 3);
+    proBaseMap(window.L, map, 18);
+    window.L.control.zoom({ position: "bottomright" }).addTo(map);
+    mapRef.current = map;
+    return () => { map.remove(); mapRef.current = null; groupRef.current = null; markersRef.current = {}; };
+  }, [leaflet, lat == null]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || lat == null) return;
+    if (groupRef.current) map.removeLayer(groupRef.current);
+    const g = window.L.featureGroup();
+    markersRef.current = {};
+    window.L.circleMarker([lat, lon], { radius: 7, color: "#ffffff", weight: 3, fillColor: "#0b1413", fillOpacity: 1 }).bindPopup("<strong>Search centre</strong>").addTo(g);
+    for (const x of shown.slice(0, 80)) {
+      const mk = window.L.circleMarker([x.lat, x.lon], { radius: 7, color: "#040707", weight: 2, fillColor: colorOf(x.kind), fillOpacity: 0.95 })
+        .bindPopup(`<strong>${proEscape(titleOf(x))}</strong><br>${proEscape(x.type)} · ${proEscape(fmtDist(x.distance))}<br><a href="https://www.google.com/maps/dir/?api=1&destination=${x.lat},${x.lon}" target="_blank" rel="noopener noreferrer">Directions</a>`);
+      mk.on("click", () => setSel(x.key));
+      mk.addTo(g);
+      markersRef.current[x.key] = mk;
+    }
+    g.addTo(map);
+    groupRef.current = g;
+    const near = shown.slice(0, 12);
+    try { map.invalidateSize(false); } catch (e) { /* not laid out yet */ }
+    if (near.length) map.fitBounds(window.L.latLngBounds([[lat, lon], ...near.map((x) => [x.lat, x.lon])]).pad(0.2), { maxZoom: 14 });
+    else map.setView([lat, lon], 11);
+    setTimeout(() => { try { map.invalidateSize(); } catch (e) { /* unmounted */ } }, 60);
+  }, [st.at, st.status, kind, lat, lon, leaflet]);
+
+  function focus(x) {
+    haptic();
+    setSel((cur) => (cur === x.key ? null : x.key));
+    const map = mapRef.current, mk = markersRef.current[x.key];
+    if (map && mk) { map.setView([x.lat, x.lon], Math.max(map.getZoom(), 14)); if (mk.openPopup) mk.openPopup(); }
+  }
+  async function saveWaypoint(x) {
+    haptic("success");
+    try {
+      const r = await window.storage.get(WAYPOINT_KEY, false);
+      const cur = r && r.value ? JSON.parse(r.value) : [];
+      const next = [{ id: uid(), lat: x.lat, lon: x.lon, time: new Date().toISOString(), name: titleOf(x) }, ...cur];
+      await window.storage.set(WAYPOINT_KEY, JSON.stringify(next), false);
+      window.dispatchEvent(new CustomEvent("tackle-waypoints-changed", { detail: next }));
+      setSaved((p) => ({ ...p, [x.key]: true }));
+    } catch (e) { /* storage unavailable */ }
+  }
+
+  const list = more ? shown : shown.slice(0, 8);
+  const linkStyle = { color: "var(--tb-blue)" };
+  return (
+    <CardShell title="Explore nearby" subtitle="Waters, ramps, piers, bait shops and marinas around you" noPad>
+      <div className="px-4 pt-3 pb-2 flex items-center justify-between gap-2">
+        <button onClick={onPickLocation} className="flex items-center gap-1.5 text-[14px] font-bold min-w-0" style={{ color: "var(--tb-text)" }}>
+          <MapPin size={15} className="shrink-0" style={{ color: "var(--tb-brass)" }} />
+          <span className="truncate">{location ? location.name : "Set a search location"}</span>
+          <span className="text-[12px] font-normal shrink-0" style={{ color: "var(--tb-blue)" }}>Change</span>
+        </button>
+        {location && (
+          <button onClick={() => load(lat, lon, true)} aria-label="Refresh nearby places" className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{ background: "var(--tb-surface-2)" }}>
+            <RefreshCw size={15} className={st.status === "loading" ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
+          </button>
+        )}
+      </div>
+
+      {!location && (
+        <div className="px-4 pb-4">
+          <button onClick={onUseMyLocation} className="w-full py-3 rounded-xl text-[15px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>Use my current location</button>
+        </div>
+      )}
+
+      {location && st.status === "ok" && st.list.length > 0 && (
+        <div className="px-4 pb-2 flex items-center gap-2 overflow-x-auto tb-scroll" style={{ scrollbarWidth: "none" }} role="group" aria-label="Filter places">
+          <ChipButton active={kind === "all"} onClick={() => { setKind("all"); setMore(false); }} label={`All (${st.list.length})`} />
+          {PRO_NEARBY_KINDS.filter((k) => counts[k.id]).map((k) => (
+            <ChipButton key={k.id} active={kind === k.id} onClick={() => { setKind(k.id); setMore(false); }} label={<span className="inline-flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: k.color }} />{k.label} ({counts[k.id]})</span>} />
+          ))}
+        </div>
+      )}
+
+      {location && leaflet && <div ref={mapEl} style={{ height: st.status === "ok" && st.list.length ? "250px" : "0px" }} />}
+
+      {location && (
+        <div className="px-4 pt-3 pb-3">
+          {st.status === "loading" && st.list.length === 0 && (
+            <div className="space-y-2" aria-label="Searching nearby">
+              {[0, 1, 2, 3].map((i) => <div key={i} className="tb-skeleton" style={{ height: 54, borderRadius: 12 }} />)}
+              <div className="text-[13px]" style={{ color: "var(--tb-muted)" }}>Searching the map around you. This can take up to half a minute.</div>
+            </div>
+          )}
+          {st.status === "error" && (
+            <div>
+              <p className="text-[14px] leading-snug" style={{ color: "var(--tb-muted)" }}>The free OpenStreetMap servers are busy right now. It usually clears up within a few minutes.</p>
+              <button onClick={() => load(lat, lon, true)} className="mt-2 px-4 py-2 rounded-full text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>Try again</button>
+            </div>
+          )}
+          {st.status === "ok" && st.list.length === 0 && <p className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Nothing mapped within about 15 miles. Try a different search location.</p>}
+          {st.status === "ok" && st.stale && <div className="text-[12px] mb-2" style={{ color: "var(--tb-flare)" }}>Map servers are busy. Showing results saved {new Date(st.at).toLocaleDateString([], { month: "short", day: "numeric" })}.</div>}
+          {st.list.length > 0 && (
+            <div className="space-y-1.5">
+              {list.map((x) => {
+                const open = sel === x.key;
+                return (
+                  <div key={x.key} className="rounded-xl overflow-hidden" style={{ background: "var(--tb-surface-2)", border: "1px solid " + (open ? "var(--tb-brass)" : "var(--tb-line)") }}>
+                    <button onClick={() => focus(x)} aria-expanded={open} className="w-full flex items-center gap-3 py-2.5 px-3 text-left active:opacity-70">
+                      <span className="inline-block w-3 h-3 rounded-full shrink-0" style={{ background: colorOf(x.kind) }} aria-hidden="true" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-[15px] font-bold truncate" style={{ color: "var(--tb-text)" }}>{titleOf(x)}</span>
+                        {subOf(x) && <span className="block text-[12px] truncate" style={{ color: "var(--tb-muted)" }}>{subOf(x)}</span>}
+                      </span>
+                      <span className="text-[13px] font-bold shrink-0" style={{ color: "var(--tb-blue)" }}>{fmtDist(x.distance)}</span>
+                    </button>
+                    {open && (
+                      <div className="px-3 pb-2.5 flex flex-wrap gap-x-4 gap-y-1 text-[13px] font-bold">
+                        <a href={`https://www.google.com/maps/dir/?api=1&destination=${x.lat},${x.lon}`} target="_blank" rel="noopener noreferrer" style={linkStyle}>Directions</a>
+                        <button onClick={() => saveWaypoint(x)} disabled={!!saved[x.key]} style={{ color: saved[x.key] ? "var(--tb-muted)" : "var(--tb-blue)" }}>{saved[x.key] ? "Saved to waypoints ✓" : "Save as waypoint"}</button>
+                        {x.web && <a href={x.web} target="_blank" rel="noopener noreferrer" style={linkStyle}>Website</a>}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {shown.length > 8 && (
+            <button onClick={() => setMore((m) => !m)} className="mt-2 w-full py-2 rounded-xl text-[14px] font-bold" style={{ background: "transparent", color: "var(--tb-blue)", border: "1px solid var(--tb-line)" }}>{more ? "Show fewer" : `Show all ${shown.length}`}</button>
+          )}
+          <div className="text-[11px] mt-2" style={{ color: "var(--tb-muted)" }}>Map data © OpenStreetMap contributors. Check access and rules before you fish.</div>
+        </div>
+      )}
     </CardShell>
   );
 }
@@ -4976,14 +5940,6 @@ function SpotsView({ catches }) {
   const [location, setLocation] = useState(null);
   const [locLoading, setLocLoading] = useState(true);
   const [showLocationPicker, setShowLocationPicker] = useState(false);
-
-  const [nearby, setNearby] = useState(null);
-  const [nearbyLoading, setNearbyLoading] = useState(false);
-  const [nearbyError, setNearbyError] = useState(null);
-
-  const [marinas, setMarinas] = useState(null);
-  const [marinasLoading, setMarinasLoading] = useState(false);
-  const [marinasError, setMarinasError] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -5006,93 +5962,6 @@ function SpotsView({ catches }) {
       // ignore, just won't persist
     }
   }, []);
-
-  const loadNearby = useCallback(async (lat, lon) => {
-    setNearbyLoading(true);
-    setNearbyError(null);
-    try {
-      const query = `[out:json][timeout:25];(node["leisure"="fishing"](around:24000,${lat},${lon});way["leisure"="fishing"](around:24000,${lat},${lon});way["natural"="water"](around:24000,${lat},${lon});way["waterway"="river"](around:24000,${lat},${lon}););out center 60;`;
-      const res = await fetch("https://overpass-api.de/api/interpreter", {
-        method: "POST",
-        body: query,
-      });
-      if (!res.ok) throw new Error("overpass request failed");
-      const data = await res.json();
-      const seen = new Set();
-      const spots = [];
-      for (const el of data.elements || []) {
-        const elLat = el.lat ?? el.center?.lat;
-        const elLon = el.lon ?? el.center?.lon;
-        const name = el.tags?.name;
-        if (elLat == null || elLon == null || !name || seen.has(name)) continue;
-        seen.add(name);
-        const type = el.tags?.leisure === "fishing" ? "Fishing spot" : el.tags?.waterway === "river" ? "River" : "Lake / pond";
-        spots.push({ name, type, lat: elLat, lon: elLon, distance: haversineMiles(lat, lon, elLat, elLon) });
-      }
-      spots.sort((a, b) => a.distance - b.distance);
-      setNearby(spots.slice(0, 10));
-    } catch (e) {
-      setNearbyError("Couldn't reach map data right now — try again in a bit.");
-    } finally {
-      setNearbyLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (location) loadNearby(location.lat, location.lon);
-  }, [location, loadNearby]);
-
-  const loadMarinas = useCallback(async (lat, lon) => {
-    setMarinasLoading(true);
-    setMarinasError(null);
-    try {
-      const query = `[out:json][timeout:25];(node["leisure"="marina"](around:40000,${lat},${lon});way["leisure"="marina"](around:40000,${lat},${lon}););out center 20;`;
-      const res = await fetch("https://overpass-api.de/api/interpreter", {
-        method: "POST",
-        body: query,
-      });
-      if (!res.ok) throw new Error("overpass request failed");
-      const data = await res.json();
-      const seen = new Set();
-      const found = [];
-      for (const el of data.elements || []) {
-        const elLat = el.lat ?? el.center?.lat;
-        const elLon = el.lon ?? el.center?.lon;
-        const name = el.tags?.name;
-        if (elLat == null || elLon == null || !name || seen.has(name)) continue;
-        seen.add(name);
-        found.push({ name, lat: elLat, lon: elLon, distance: haversineMiles(lat, lon, elLat, elLon) });
-      }
-      found.sort((a, b) => a.distance - b.distance);
-      const nearest = found.slice(0, 6);
-
-      // Fetch water temp for each nearby marina in parallel; missing data (common for
-      // small/inland marinas) just shows as unavailable rather than failing the whole list.
-      const withTemps = await Promise.all(
-        nearest.map(async (m) => {
-          try {
-            const wres = await fetch(
-              `https://marine-api.open-meteo.com/v1/marine?latitude=${m.lat}&longitude=${m.lon}&current=sea_surface_temperature&temperature_unit=fahrenheit&timezone=auto`
-            );
-            const wdata = await wres.json();
-            const temp = wdata.current?.sea_surface_temperature;
-            return { ...m, waterTemp: typeof temp === "number" ? temp : null };
-          } catch (e) {
-            return { ...m, waterTemp: null };
-          }
-        })
-      );
-      setMarinas(withTemps);
-    } catch (e) {
-      setMarinasError("Couldn't reach map data right now — try again in a bit.");
-    } finally {
-      setMarinasLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (location) loadMarinas(location.lat, location.lon);
-  }, [location, loadMarinas]);
 
   function useMyLocation() {
     setLocLoading(true);
@@ -5117,11 +5986,13 @@ function SpotsView({ catches }) {
   const clusters = clusterCatchesByLocation(catches);
 
   if (locLoading) {
-    return <div className="py-16 text-center" style={{ color: "var(--tb-muted)" }}>Loading spots...</div>;
+    return <div className="space-y-3"><div className="tb-skeleton" style={{ height: 150 }} /><div className="tb-skeleton" style={{ height: 300 }} /></div>;
   }
 
   return (
     <div className="space-y-3">
+      <NearbyExplorer location={location} onPickLocation={() => setShowLocationPicker(true)} onUseMyLocation={useMyLocation} />
+
       <WaypointsCard />
 
       <MyMapCard catches={catches} />
@@ -5160,101 +6031,6 @@ function SpotsView({ catches }) {
               </div>
             ))}
           </div>
-        )}
-      </CardShell>
-
-      <CardShell title="NEARBY WATERS TO TRY" subtitle="pulled live from open map data">
-        <div className="flex items-center justify-between mb-2">
-          <button onClick={() => setShowLocationPicker(true)} className="flex items-center gap-1.5 text-xs tb-mono" style={{ color: "var(--tb-text)" }}>
-            <MapPin size={13} style={{ color: "var(--tb-brass)" }} />
-            {location ? location.name : "Set a search location"}
-          </button>
-          {location && (
-            <button onClick={() => loadNearby(location.lat, location.lon)} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
-              <RefreshCw size={13} className={nearbyLoading ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
-            </button>
-          )}
-        </div>
-
-        {!location && (
-          <button onClick={useMyLocation} className="w-full py-2 rounded-lg text-xs tb-mono" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>
-            Use my current location
-          </button>
-        )}
-
-        {location && nearbyLoading && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Searching nearby waters...</div>}
-        {location && nearbyError && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{nearbyError}</div>}
-        {location && !nearbyLoading && !nearbyError && nearby && nearby.length === 0 && (
-          <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No named waters found nearby — try a different spot.</div>
-        )}
-        {location && !nearbyLoading && nearby && nearby.length > 0 && (
-          <div className="space-y-1.5">
-            {nearby.map((s, idx) => (
-              <a
-                key={idx}
-                href={`https://www.google.com/maps?q=${s.lat},${s.lon}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center justify-between rounded-lg py-2 px-3"
-                style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}
-              >
-                <div className="min-w-0">
-                  <div className="text-xs font-semibold truncate" style={{ color: "var(--tb-text)" }}>{s.name}</div>
-                  <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{s.type}</div>
-                </div>
-                <div className="tb-mono text-[11px] shrink-0" style={{ color: "var(--tb-blue)" }}>{fmtDist(s.distance)}</div>
-              </a>
-            ))}
-          </div>
-        )}
-        <div className="tb-mono text-[9px] mt-2" style={{ color: "var(--tb-muted)" }}>
-          Map data © OpenStreetMap contributors
-        </div>
-      </CardShell>
-
-      <CardShell title="NEARBY MARINAS" subtitle="water temperature at each, where available">
-        {!location && (
-          <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Set a location above to see nearby marinas.</div>
-        )}
-        {location && (
-          <>
-            <div className="flex justify-end mb-2">
-              <button onClick={() => loadMarinas(location.lat, location.lon)} className="w-7 h-7 rounded-md flex items-center justify-center" style={{ background: "var(--tb-surface-2)" }}>
-                <RefreshCw size={13} className={marinasLoading ? "tb-spin" : ""} style={{ color: "var(--tb-muted)" }} />
-              </button>
-            </div>
-            {marinasLoading && <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>Finding nearby marinas...</div>}
-            {marinasError && <div className="tb-mono text-xs" style={{ color: "var(--tb-flare)" }}>{marinasError}</div>}
-            {!marinasLoading && !marinasError && marinas && marinas.length === 0 && (
-              <div className="tb-mono text-xs" style={{ color: "var(--tb-muted)" }}>No named marinas found within about 25 miles.</div>
-            )}
-            {!marinasLoading && marinas && marinas.length > 0 && (
-              <div className="space-y-1.5">
-                {marinas.map((m, idx) => (
-                  <a
-                    key={idx}
-                    href={`https://www.google.com/maps?q=${m.lat},${m.lon}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center justify-between rounded-lg py-2 px-3"
-                    style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}
-                  >
-                    <div className="min-w-0">
-                      <div className="text-xs font-semibold truncate" style={{ color: "var(--tb-text)" }}>{m.name}</div>
-                      <div className="tb-mono text-[10px]" style={{ color: "var(--tb-muted)" }}>{fmtDist(m.distance)} away</div>
-                    </div>
-                    <div className="tb-mono text-xs shrink-0 flex items-center gap-1" style={{ color: typeof m.waterTemp === "number" ? "var(--tb-brass)" : "var(--tb-muted)" }}>
-                      <Waves size={12} />
-                      {typeof m.waterTemp === "number" ? fmtTemp(m.waterTemp) : "no data"}
-                    </div>
-                  </a>
-                ))}
-              </div>
-            )}
-            <div className="tb-mono text-[9px] mt-2" style={{ color: "var(--tb-muted)" }}>
-              Map data © OpenStreetMap contributors · water temps from Open-Meteo
-            </div>
-          </>
         )}
       </CardShell>
 
@@ -7027,6 +7803,8 @@ function SettingsPanel({ onClose }) {
         <div className="h-3" />
 
         <UnitsCard />
+        <AppearanceCard />
+        <NessieSettingsCard />
 
         <div className="h-3" />
 
@@ -7038,6 +7816,165 @@ function SettingsPanel({ onClose }) {
   );
 }
 
+// ---- Appearance (Settings → Appearance): theme, accent colour, text size and which tab opens first. Saved on this device. ----
+const APP_PREFS_KEY = "efapp:v1";
+const APP_PREFS_DEFAULT = { theme: "deep", accent: "teal", custom: "#2dd4bf", size: "normal", start: "tackle" };
+const APP_THEMES = [
+  { id: "deep", label: "Deep water", bg: "#040707", surface: "#0e1514", surface2: "#172321", line: "#234440", text: "#f6fbfa", muted: "#9db6b2" },
+  { id: "midnight", label: "Midnight", bg: "#05070d", surface: "#0d1220", surface2: "#171e33", line: "#2a3558", text: "#f5f7fd", muted: "#a3add0" },
+  { id: "swamp", label: "Swamp", bg: "#060a05", surface: "#10170d", surface2: "#1b2616", line: "#33472a", text: "#f6fbf2", muted: "#a9bc9d" },
+  { id: "sunset", label: "Sunset", bg: "#0c0605", surface: "#1a0f0d", surface2: "#2a1815", line: "#4d2c26", text: "#fdf6f3", muted: "#c9aaa2" },
+  { id: "daylight", label: "Daylight", light: true, bg: "#f3f7f6", surface: "#ffffff", surface2: "#e6efed", line: "#c2d4d0", text: "#0b1413", muted: "#4a625e" },
+];
+const APP_ACCENTS = [
+  { id: "teal", label: "Teal", hex: "#2dd4bf", soft: "#6ee7d8", deep: "#0f766e" },
+  { id: "blue", label: "Blue", hex: "#38bdf8", soft: "#7dd3fc", deep: "#0369a1" },
+  { id: "green", label: "Green", hex: "#4ade80", soft: "#86efac", deep: "#15803d" },
+  { id: "yellow", label: "Yellow", hex: "#facc15", soft: "#fde047", deep: "#a16207" },
+  { id: "orange", label: "Orange", hex: "#fb923c", soft: "#fdba74", deep: "#c2410c" },
+  { id: "pink", label: "Pink", hex: "#f472b6", soft: "#f9a8d4", deep: "#be185d" },
+  { id: "purple", label: "Purple", hex: "#a78bfa", soft: "#c4b5fd", deep: "#6d28d9" },
+  { id: "red", label: "Red", hex: "#f87171", soft: "#fca5a5", deep: "#b91c1c" },
+  { id: "coral", label: "Coral", hex: "#ff8a7a", soft: "#ffb4a8", deep: "#c2412d" },
+  { id: "gold", label: "Gold", hex: "#e8b923", soft: "#f3d671", deep: "#8a6a00" },
+  { id: "lime", label: "Lime", hex: "#a3e635", soft: "#bef264", deep: "#4d7c0f" },
+  { id: "mint", label: "Mint", hex: "#6ee7b7", soft: "#a7f3d0", deep: "#047857" },
+  { id: "cyan", label: "Cyan", hex: "#22d3ee", soft: "#67e8f9", deep: "#0e7490" },
+  { id: "sky", label: "Sky", hex: "#7cc4ff", soft: "#b3dcff", deep: "#1d5fa8" },
+  { id: "indigo", label: "Indigo", hex: "#818cf8", soft: "#a5b4fc", deep: "#4338ca" },
+  { id: "magenta", label: "Magenta", hex: "#e879f9", soft: "#f0abfc", deep: "#a21caf" },
+  { id: "rose", label: "Rose", hex: "#fb7185", soft: "#fda4af", deep: "#be123c" },
+  { id: "silver", label: "Silver", hex: "#cbd5e1", soft: "#e2e8f0", deep: "#475569" },
+];
+// Any colour at all: mixes toward white/black to get the link tint and the dark variant the light theme needs.
+function appMix(hex, to, amt) {
+  const n = parseInt(hex.slice(1), 16), t = parseInt(to.slice(1), 16);
+  const ch = (sh) => Math.round(((n >> sh) & 255) * (1 - amt) + ((t >> sh) & 255) * amt);
+  return "#" + [16, 8, 0].map((sh) => ch(sh).toString(16).padStart(2, "0")).join("");
+}
+function appLuma(hex) { const n = parseInt(hex.slice(1), 16); return (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255; }
+function appCustomAccent(hex) {
+  const src = /^#[0-9a-f]{6}$/i.test(hex || "") ? hex.toLowerCase() : "#2dd4bf";
+  let h = src; for (let i = 0; i < 8 && appLuma(h) < 0.3; i++) h = appMix(h, "#ffffff", 0.15); // too dark to read on the dark themes: lift it
+  let deep = src; for (let i = 0; i < 12 && appLuma(deep) > 0.33; i++) deep = appMix(deep, "#000000", 0.1);
+  return { id: "custom", label: "Custom", hex: h, soft: appMix(h, "#ffffff", 0.35), deep };
+}
+const APP_SIZES = [{ id: "normal", label: "Normal", zoom: 1 }, { id: "large", label: "Large", zoom: 1.12 }, { id: "xl", label: "Extra large", zoom: 1.25 }];
+const APP_STARTS = ["tackle", "conditions", "catches", "spots", "community"];
+function appPrefsClean(o) {
+  const p = Object.assign({}, APP_PREFS_DEFAULT, o && typeof o === "object" ? o : {});
+  return {
+    theme: APP_THEMES.some((t) => t.id === p.theme) ? p.theme : "deep",
+    accent: p.accent === "custom" || APP_ACCENTS.some((t) => t.id === p.accent) ? p.accent : "teal",
+    custom: /^#[0-9a-f]{6}$/i.test(p.custom || "") ? p.custom.toLowerCase() : "#2dd4bf",
+    size: APP_SIZES.some((t) => t.id === p.size) ? p.size : "normal",
+    start: APP_STARTS.includes(p.start) ? p.start : "tackle",
+  };
+}
+function appPrefsGet() { try { return appPrefsClean(JSON.parse(localStorage.getItem(APP_PREFS_KEY) || "null")); } catch (e) { return appPrefsClean(null); } }
+function appPrefsSet(patch) {
+  const next = appPrefsClean(Object.assign({}, appPrefsGet(), patch));
+  try { localStorage.setItem(APP_PREFS_KEY, JSON.stringify(next)); } catch (e) { /* storage blocked */ }
+  try { window.dispatchEvent(new CustomEvent("app-prefs-changed", { detail: next })); } catch (e) { /* ignore */ }
+  return next;
+}
+function useAppPrefs() {
+  const [p, setP] = useState(appPrefsGet);
+  useEffect(() => { const on = () => setP(appPrefsGet()); window.addEventListener("app-prefs-changed", on); return () => window.removeEventListener("app-prefs-changed", on); }, []);
+  return p;
+}
+const appHexRgb = (hex) => { const n = parseInt(hex.slice(1), 16); return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`; };
+function appThemeVars(p) {
+  const t = APP_THEMES.find((x) => x.id === p.theme) || APP_THEMES[0];
+  const a = p.accent === "custom" ? appCustomAccent(p.custom) : APP_ACCENTS.find((x) => x.id === p.accent) || APP_ACCENTS[0];
+  const brass = t.light ? a.deep : a.hex;
+  return {
+    theme: t, accent: a, brass, zoom: (APP_SIZES.find((x) => x.id === p.size) || APP_SIZES[0]).zoom,
+    css: `--tb-bg:${t.bg};--tb-bg-rgb:${appHexRgb(t.bg)};--tb-surface:${t.surface};--tb-surface-2:${t.surface2};--tb-line:${t.line};--tb-brass:${brass};--tb-accent-rgb:${appHexRgb(brass)};--tb-brass-dim:${a.deep};--tb-flare:${t.light ? "#c2331f" : "#ff6f5e"};--tb-text:${t.text};--tb-muted:${t.muted};--tb-blue:${t.light ? a.deep : a.soft};`,
+  };
+}
+function AppearanceCard() {
+  const p = useAppPrefs();
+  const Label = ({ children }) => <div className="text-[13px] font-bold mt-4 mb-2" style={{ color: "var(--tb-muted)" }}>{children}</div>;
+  const pill = (on) => ({ background: on ? "rgba(var(--tb-accent-rgb),0.14)" : "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid " + (on ? "var(--tb-brass)" : "var(--tb-line)") });
+  return (
+    <CardShell title="Appearance" subtitle="Make the whole app look and open the way you like">
+      <Label>Theme</Label>
+      <div className="grid grid-cols-3 gap-2">
+        {APP_THEMES.map((t) => (
+          <button key={t.id} onClick={() => { haptic(); appPrefsSet({ theme: t.id }); }} aria-pressed={p.theme === t.id} className="rounded-xl p-2 text-left" style={{ background: t.bg, border: "2px solid " + (p.theme === t.id ? "var(--tb-brass)" : t.line) }}>
+            <span className="block rounded-md h-7 mb-1.5" style={{ background: t.surface, border: "1px solid " + t.line }}><span className="block h-1.5 w-8 rounded-full mt-1.5 ml-1.5" style={{ background: t.muted }} /></span>
+            <span className="block text-[12px] font-bold truncate" style={{ color: t.text }}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+      <Label>Accent color</Label>
+      <div className="flex flex-wrap gap-2">
+        {APP_ACCENTS.map((c) => (
+          <button key={c.id} onClick={() => { haptic(); appPrefsSet({ accent: c.id }); }} aria-pressed={p.accent === c.id} aria-label={c.label} title={c.label} className="w-10 h-10 rounded-full flex items-center justify-center" style={{ background: c.hex, border: "3px solid " + (p.accent === c.id ? "var(--tb-text)" : "transparent"), boxShadow: "0 0 0 1px var(--tb-line)" }}>
+            {p.accent === c.id && <span style={{ color: "#0b1413", fontWeight: 900, fontSize: 16 }}>✓</span>}
+          </button>
+        ))}
+        <label title="Pick any color" className="relative w-10 h-10 rounded-full flex items-center justify-center overflow-hidden" style={{ background: p.accent === "custom" ? p.custom : "conic-gradient(#f87171,#facc15,#4ade80,#22d3ee,#818cf8,#e879f9,#f87171)", border: "3px solid " + (p.accent === "custom" ? "var(--tb-text)" : "transparent"), boxShadow: "0 0 0 1px var(--tb-line)" }}>
+          <span aria-hidden="true" style={{ color: "#0b1413", fontWeight: 900, fontSize: 18, lineHeight: 1 }}>{p.accent === "custom" ? "✓" : "+"}</span>
+          <input type="color" aria-label="Pick any accent color" value={p.custom} onChange={(e) => appPrefsSet({ accent: "custom", custom: e.target.value })} onClick={() => appPrefsSet({ accent: "custom" })} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }} />
+        </label>
+      </div>
+      <div className="text-[12px] mt-1.5" style={{ color: "var(--tb-muted)" }}>Tap the rainbow circle to pick any color you like.</div>
+      <Label>Text size</Label>
+      <div className="flex gap-2">
+        {APP_SIZES.map((z) => <button key={z.id} onClick={() => { haptic(); appPrefsSet({ size: z.id }); }} aria-pressed={p.size === z.id} className="flex-1 rounded-xl px-2 py-2.5 font-bold" style={{ ...pill(p.size === z.id), fontSize: 13 * z.zoom }}>{z.label}</button>)}
+      </div>
+      <Label>Open the app on</Label>
+      <div className="flex flex-wrap gap-2">
+        {APP_STARTS.map((id) => <button key={id} onClick={() => { haptic(); appPrefsSet({ start: id }); }} aria-pressed={p.start === id} className="rounded-xl px-3 py-2 text-[14px] font-bold" style={pill(p.start === id)}>{id.charAt(0).toUpperCase() + id.slice(1)}</button>)}
+      </div>
+      <div className="flex justify-end mt-4">
+        <button onClick={() => { haptic(); appPrefsSet(APP_PREFS_DEFAULT); }} className="rounded-xl px-3 py-2 text-[14px] font-bold" style={{ color: "var(--tb-blue)" }}>Reset look</button>
+      </div>
+    </CardShell>
+  );
+}
+
+function NessieSettingsCard() {
+  const np = useNessie();
+  const [draft, setDraft] = useState(np.text);
+  const swatch = (list, key) => (
+    <div className="flex flex-wrap gap-2">
+      {list.map((c) => (
+        <button key={c.id} onClick={() => { haptic(); nessieSet({ [key]: c.id }); }} aria-pressed={np[key] === c.id} aria-label={c.label} title={c.label} className="w-10 h-10 rounded-full flex items-center justify-center" style={{ background: c.hex, border: "3px solid " + (np[key] === c.id ? "var(--tb-text)" : "transparent"), boxShadow: "0 0 0 1px var(--tb-line)" }}>
+          {np[key] === c.id && <span style={{ color: "#0b1413", fontWeight: 900, fontSize: 16 }}>✓</span>}
+        </button>
+      ))}
+    </div>
+  );
+  const Label = ({ children }) => <div className="text-[13px] font-bold mt-4 mb-2" style={{ color: "var(--tb-muted)" }}>{children}</div>;
+  return (
+    <CardShell title="Nessie" subtitle="Make the Loch Ness monster your own">
+      <div className="rounded-2xl px-3 py-2.5" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)", opacity: np.show ? 1 : 0.45 }}>
+        <NessieMascot custom note={np.text.trim() ? "" : "(Free while we test it.)"} />
+      </div>
+      <Label>What she says</Label>
+      <input value={draft} maxLength={40} onChange={(e) => { setDraft(e.target.value); nessieSet({ text: e.target.value }); }} placeholder="Pro's about tree fiddy!" aria-label="What Nessie says" className="w-full rounded-xl px-3 py-2.5 text-[15px]" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }} />
+      <div className="text-[12px] mt-1" style={{ color: "var(--tb-muted)" }}>{draft.length}/40 · leave empty for her usual line</div>
+      <Label>Lettering</Label>
+      <div className="flex flex-wrap gap-2">
+        {NESSIE_FONTS.map((f) => (
+          <button key={f.id} onClick={() => { haptic(); nessieSet({ font: f.id }); }} aria-pressed={np.font === f.id} className="rounded-xl px-3.5 py-2" style={{ fontFamily: f.css, fontSize: 18, letterSpacing: f.spacing, background: np.font === f.id ? "rgba(var(--tb-accent-rgb),0.14)" : "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid " + (np.font === f.id ? "var(--tb-brass)" : "var(--tb-line)") }}>{f.label}</button>
+        ))}
+      </div>
+      <Label>Her color</Label>
+      {swatch(NESSIE_COLORS, "color")}
+      <Label>Bubble color</Label>
+      {swatch(NESSIE_BUBBLES, "bubble")}
+      <div className="flex items-center justify-between gap-3 mt-5">
+        <button onClick={() => { haptic(); nessieSet({ show: !np.show }); }} aria-pressed={np.show} className="flex-1 rounded-xl px-3 py-2.5 text-[14px] font-bold" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>{np.show ? "Hide her on the Tackle tab" : "Show her on the Tackle tab"}</button>
+        <button onClick={() => { haptic(); setDraft(""); nessieSet(NESSIE_DEFAULT); }} className="rounded-xl px-3 py-2.5 text-[14px] font-bold" style={{ color: "var(--tb-blue)" }}>Reset</button>
+      </div>
+    </CardShell>
+  );
+}
+
 function UnitsCard() {
   const units = useUnits();
   const opt = (id, label, sub) => (
@@ -7046,7 +7983,7 @@ function UnitsCard() {
       onClick={() => { haptic(); setUnits(id); }}
       aria-pressed={units === id}
       className="flex-1 rounded-xl px-3 py-3 text-left"
-      style={{ background: units === id ? "rgba(45,212,191,0.14)" : "var(--tb-surface-2)", border: "1px solid " + (units === id ? "var(--tb-brass)" : "var(--tb-line)") }}
+      style={{ background: units === id ? "rgba(var(--tb-accent-rgb),0.14)" : "var(--tb-surface-2)", border: "1px solid " + (units === id ? "var(--tb-brass)" : "var(--tb-line)") }}
     >
       <div className="text-[15px] font-bold" style={{ color: "var(--tb-text)" }}>{label}</div>
       <div className="text-[12px] mt-0.5" style={{ color: "var(--tb-muted)" }}>{sub}</div>
@@ -7062,29 +7999,174 @@ function UnitsCard() {
   );
 }
 
-function InstallCard() {
-  const [promptEvent, setPromptEvent] = useState(null);
-  const [installed, setInstalled] = useState(() => window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
-  const [shared, setShared] = useState(null);
-
+// ---- "Add to Home Screen" shortcut: header button + first-visit banner + step-by-step sheet ----
+const INSTALL_DISMISS_KEY = "efinstall:dismissed";
+function appIsInstalled() {
+  try {
+    if (window.matchMedia && ["standalone", "fullscreen", "minimal-ui"].some((m) => window.matchMedia(`(display-mode: ${m})`).matches)) return true;
+    if (navigator.standalone === true) return true;
+    if (String(document.referrer || "").startsWith("android-app://")) { sessionStorage.setItem("ef-twa", "1"); return true; }
+    if (sessionStorage.getItem("ef-twa")) return true;
+  } catch (e) { /* ignore */ }
+  return false;
+}
+function appPlatform() {
+  const ua = navigator.userAgent || "";
+  const iOS = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const inApp = /FBAN|FBAV|FB_IAB|Instagram|Line\/|Snapchat|TikTok|musical_ly|LinkedInApp|GSA\/|Twitter/i.test(ua);
+  const otherIOS = iOS && /CriOS|FxiOS|EdgiOS|OPiOS|DuckDuckGo/.test(ua);
+  return { iOS, inApp, otherIOS, android: /Android/.test(ua), safari: iOS && !otherIOS && !inApp, chromeIOS: /CriOS/.test(ua) };
+}
+function useInstall() {
+  const [bip, setBip] = useState(() => (typeof window !== "undefined" && window.__efBip) || null);
+  const [installed, setInstalled] = useState(appIsInstalled);
   useEffect(() => {
-    const onPrompt = (e) => { e.preventDefault(); setPromptEvent(e); };
-    const onInstalled = () => { setInstalled(true); setPromptEvent(null); };
-    window.addEventListener("beforeinstallprompt", onPrompt);
-    window.addEventListener("appinstalled", onInstalled);
-    return () => {
-      window.removeEventListener("beforeinstallprompt", onPrompt);
-      window.removeEventListener("appinstalled", onInstalled);
-    };
+    const got = () => setBip(window.__efBip || null);
+    const direct = (e) => { e.preventDefault(); window.__efBip = e; setBip(e); };
+    const done = () => { window.__efBip = null; setBip(null); setInstalled(true); };
+    window.addEventListener("ef-bip", got);
+    window.addEventListener("beforeinstallprompt", direct);
+    window.addEventListener("appinstalled", done);
+    window.addEventListener("ef-installed", done);
+    return () => { window.removeEventListener("ef-bip", got); window.removeEventListener("beforeinstallprompt", direct); window.removeEventListener("appinstalled", done); window.removeEventListener("ef-installed", done); };
   }, []);
-
-  async function install() {
-    if (!promptEvent) return;
-    haptic();
-    promptEvent.prompt();
-    try { await promptEvent.userChoice; } catch (e) { /* ignore */ }
-    setPromptEvent(null);
+  async function prompt() {
+    const e = bip || window.__efBip;
+    if (!e) return false;
+    e.prompt();
+    let ok = false;
+    try { const c = await e.userChoice; ok = !!c && c.outcome === "accepted"; } catch (x) { /* ignore */ }
+    window.__efBip = null; setBip(null);
+    try { window.dispatchEvent(new Event(ok ? "ef-installed" : "ef-bip")); } catch (x) { /* ignore */ }
+    return true;
   }
+  return { installed, canPrompt: !!bip, prompt };
+}
+const openInstallSheet = () => { try { window.dispatchEvent(new Event("ef-open-install")); } catch (e) { /* ignore */ } };
+function IosShareGlyph({ size = 20, color = "currentColor" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 3v12" /><path d="M7.5 7.5 12 3l4.5 4.5" /><path d="M8 10H6a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-2" />
+    </svg>
+  );
+}
+function HomeAddGlyph({ size = 20, color = "currentColor" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="6" y="2" width="12" height="20" rx="2.5" /><path d="M12 8.5v7" /><path d="M8.5 12h7" />
+    </svg>
+  );
+}
+function InstallSheet({ onClose }) {
+  const inst = useInstall();
+  const pf = appPlatform();
+  const [copied, setCopied] = useState(false);
+  async function copyLink() {
+    haptic();
+    try { await navigator.clipboard.writeText(APP_URL); setCopied(true); } catch (e) { setCopied(false); }
+  }
+  async function native() { haptic(); const shown = await inst.prompt(); if (shown) onClose(); }
+  const Step = ({ n, children }) => (
+    <div className="flex items-start gap-3 py-2.5" style={{ borderTop: n > 1 ? "1px solid var(--tb-line)" : "none" }}>
+      <span className="shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>{n}</span>
+      <div className="text-[15px] leading-snug pt-0.5" style={{ color: "var(--tb-text)" }}>{children}</div>
+    </div>
+  );
+  const Chip = ({ children }) => <span className="inline-flex items-center gap-1.5 rounded-lg px-2 py-0.5 mx-0.5 align-middle text-[14px] font-bold" style={{ background: "var(--tb-surface-2)", border: "1px solid var(--tb-line)" }}>{children}</span>;
+  let body;
+  if (inst.installed) {
+    body = <p className="text-[15px]" style={{ color: "var(--tb-muted)" }}>Epic Fishy is already on your home screen. You're using the app version right now.</p>;
+  } else if (inst.canPrompt) {
+    body = (
+      <>
+        <p className="text-[15px] mb-3" style={{ color: "var(--tb-muted)" }}>One tap and Epic Fishy gets its own icon. It opens full-screen and works with no signal.</p>
+        <button onClick={native} className="w-full py-3.5 rounded-xl text-[16px] font-bold flex items-center justify-center gap-2" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}><HomeAddGlyph size={20} /> Add to home screen</button>
+      </>
+    );
+  } else if (pf.inApp) {
+    body = (
+      <>
+        <p className="text-[15px] mb-2" style={{ color: "var(--tb-muted)" }}>You opened this inside another app, which can't add home-screen icons.</p>
+        <Step n={1}>Tap <Chip>•••</Chip> or the compass icon, then <strong>Open in {pf.iOS ? "Safari" : "browser"}</strong>.</Step>
+        <Step n={2}>Tap the <Chip><HomeAddGlyph size={15} /> Get app</Chip> button at the top of Epic Fishy.</Step>
+        <button onClick={copyLink} className="mt-3 w-full py-3 rounded-xl text-[15px] font-bold" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>{copied ? "Link copied ✓ paste it into " + (pf.iOS ? "Safari" : "your browser") : "Copy the app link"}</button>
+      </>
+    );
+  } else if (pf.iOS) {
+    body = (
+      <>
+        <p className="text-[15px] mb-2" style={{ color: "var(--tb-muted)" }}>Three taps and it opens full-screen like any other app.</p>
+        <Step n={1}>Tap the Share button <Chip><IosShareGlyph size={16} /></Chip> {pf.chromeIOS ? "next to the address bar at the top." : "in Safari's toolbar. If you don't see it, tap "}{!pf.chromeIOS && <Chip>•••</Chip>}{!pf.chromeIOS && " first."}</Step>
+        <Step n={2}>Scroll down and tap <Chip><HomeAddGlyph size={15} /> Add to Home Screen</Chip>.{pf.otherIOS && !pf.chromeIOS ? " If it isn't there, open this page in Safari." : ""}</Step>
+        <Step n={3}>Tap <strong>Add</strong>. Then open Epic Fishy from your home screen.</Step>
+        <button onClick={copyLink} className="mt-3 w-full py-3 rounded-xl text-[15px] font-bold" style={{ background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" }}>{copied ? "Link copied ✓" : "Copy the app link"}</button>
+      </>
+    );
+  } else {
+    body = (
+      <>
+        <p className="text-[15px] mb-2" style={{ color: "var(--tb-muted)" }}>Your browser will add Epic Fishy as an app.</p>
+        <Step n={1}>Open the browser menu <Chip>⋮</Chip> {pf.android ? "at the top right" : "(or the install icon in the address bar)"}.</Step>
+        <Step n={2}>Tap <Chip>Install app</Chip> or <Chip>Add to Home screen</Chip>.</Step>
+        <Step n={3}>Confirm, then open Epic Fishy from your home screen.</Step>
+      </>
+    );
+  }
+  return (
+    <div className="tb-overlay absolute inset-0 z-40" style={{ background: "rgba(10,16,19,0.65)" }} onClick={onClose}>
+      <div className="tb-tray absolute bottom-0 left-0 right-0 rounded-t-2xl px-5 pt-4" style={{ background: "var(--tb-bg)", border: "1px solid var(--tb-line)", maxHeight: "92%", overflowY: "auto", paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 22px)" }} onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Add Epic Fishy to your home screen">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-3">
+            <img src="icons/icon-192.png" alt="" width="44" height="44" className="rounded-xl" style={{ background: "var(--tb-brass)" }} onError={(e) => { e.currentTarget.style.display = "none"; }} />
+            <div>
+              <h2 className="text-[19px] font-bold leading-tight" style={{ color: "var(--tb-text)" }}>Put Epic Fishy on your home screen</h2>
+              <div className="text-[13px]" style={{ color: "var(--tb-muted)" }}>Free · no app store · no sign-up</div>
+            </div>
+          </div>
+          <button onClick={onClose} aria-label="Close" className="w-10 h-10 -mr-2 flex items-center justify-center"><X size={20} style={{ color: "var(--tb-muted)" }} /></button>
+        </div>
+        {body}
+      </div>
+      {pf.safari && !inst.installed && (
+        <div aria-hidden="true" className="absolute left-1/2 -translate-x-1/2 tb-nudge" style={{ bottom: 4, color: "var(--tb-brass)", fontSize: 28, lineHeight: 1, pointerEvents: "none" }}>↓</div>
+      )}
+    </div>
+  );
+}
+function InstallBanner() {
+  const inst = useInstall();
+  const [hidden, setHidden] = useState(() => {
+    try { const t = +localStorage.getItem(INSTALL_DISMISS_KEY); return !!t && Date.now() - t < 14 * 86400000; } catch (e) { return false; }
+  });
+  if (inst.installed || hidden) return null;
+  const pf = appPlatform();
+  if (!pf.iOS && !pf.android && !inst.canPrompt) return null; // desktop without install support: the header button is enough
+  function dismiss() { haptic(); try { localStorage.setItem(INSTALL_DISMISS_KEY, String(Date.now())); } catch (e) { /* ignore */ } setHidden(true); }
+  return (
+    <div className="mb-4 rounded-2xl px-3 py-3 flex items-center gap-3" style={{ background: "linear-gradient(135deg, rgba(var(--tb-accent-rgb),0.18), var(--tb-surface) 70%)", border: "1px solid var(--tb-line)" }} role="region" aria-label="Get the app">
+      <span className="shrink-0 w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}><HomeAddGlyph size={22} /></span>
+      <div className="min-w-0 flex-1">
+        <div className="text-[15px] font-bold leading-tight" style={{ color: "var(--tb-text)" }}>Add Epic Fishy to your home screen</div>
+        <div className="text-[13px] leading-snug" style={{ color: "var(--tb-muted)" }}>Opens like an app, full-screen, works offline.</div>
+      </div>
+      <button onClick={() => { haptic(); if (inst.canPrompt) inst.prompt(); else openInstallSheet(); }} className="shrink-0 px-3.5 py-2 rounded-full text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>Add</button>
+      <button onClick={dismiss} aria-label="Not now" className="shrink-0 w-8 h-8 -mr-1 flex items-center justify-center"><X size={16} style={{ color: "var(--tb-muted)" }} /></button>
+    </div>
+  );
+}
+function HeaderInstallButton() {
+  const inst = useInstall();
+  if (inst.installed) return null;
+  return (
+    <button onClick={() => { haptic(); openInstallSheet(); }} aria-label="Add to home screen" className="h-9 px-3 rounded-full flex items-center gap-1.5 text-[13px] font-bold active:opacity-60" style={{ background: "rgba(var(--tb-accent-rgb),0.14)", color: "var(--tb-brass)", border: "1px solid rgba(var(--tb-accent-rgb),0.35)" }}>
+      <HomeAddGlyph size={16} /> Get app
+    </button>
+  );
+}
+
+function InstallCard() {
+  const inst = useInstall();
+  const [shared, setShared] = useState(null);
 
   async function shareApp() {
     haptic();
@@ -7096,23 +8178,16 @@ function InstallCard() {
   }
 
   const btn = { background: "var(--tb-surface-2)", color: "var(--tb-text)", border: "1px solid var(--tb-line)" };
-  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
 
   return (
     <CardShell title="Get the app" subtitle="Works offline and opens like any other app">
       <div className="space-y-2">
-        {installed ? (
+        {inst.installed ? (
           <div className="text-[14px]" style={{ color: "var(--tb-muted)" }}>Epic Fishy is installed on this device.</div>
-        ) : promptEvent ? (
-          <button onClick={install} className="w-full py-2.5 rounded-lg text-[14px] font-bold" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
-            Add to home screen
-          </button>
         ) : (
-          <div className="text-[14px] leading-snug" style={{ color: "var(--tb-muted)" }}>
-            {isIOS
-              ? "In Safari, tap the Share button, then \"Add to Home Screen\"."
-              : "In your browser menu, choose \"Install app\" or \"Add to Home screen\"."}
-          </div>
+          <button onClick={() => { haptic(); if (inst.canPrompt) inst.prompt(); else openInstallSheet(); }} className="w-full py-2.5 rounded-lg text-[14px] font-bold flex items-center justify-center gap-2" style={{ background: "var(--tb-brass)", color: "var(--tb-bg)" }}>
+            <HomeAddGlyph size={18} /> Add to home screen
+          </button>
         )}
         <button onClick={shareApp} className="w-full py-2.5 rounded-lg text-[14px] font-bold" style={btn}>
           Share Epic Fishy with a friend

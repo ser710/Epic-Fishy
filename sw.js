@@ -1,10 +1,12 @@
-const CACHE_NAME = "tackle-box-v33";
+const CACHE_NAME = "tackle-box-v46";
+const TILE_CACHE = "epic-fishy-tiles-2"; // saved + recently viewed map tiles; never deleted on update
+const TILE_MAX = 1200;
 const PREFS_CACHE = "epic-fishy-prefs"; // small settings shared with the page (alert prefs); never deleted on update
 const APP_SHELL = ["./", "./index.html", "./manifest.json", "./firebase-config.js", "./firebase-bootstrap.js", "./icons/icon-180.png", "./icons/icon-192.png", "./icons/icon-512.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).catch(() => {})
+    caches.open(CACHE_NAME).then((cache) => Promise.all(APP_SHELL.map((u) => fetch(new Request(u, { cache: "reload" })).then((r) => (r.ok ? cache.put(u, r) : null))))).catch(() => {})
   );
   self.skipWaiting();
 });
@@ -12,17 +14,51 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME && k !== PREFS_CACHE).map((k) => caches.delete(k)))
+      Promise.all(keys.filter((k) => k !== CACHE_NAME && k !== PREFS_CACHE && k !== TILE_CACHE).map((k) => caches.delete(k)))
     )
   );
   self.clients.claim();
 });
 
-// App shell: cache-first. Everything else (weather/tide/radar APIs, CDN modules): network-first,
-// falling back to cache only if available, so live data stays fresh whenever online.
+// Pages (index.html): network-first so a new release shows on the very next open; falls back to the saved copy offline.
+// Other app-shell files: cache-first. Everything else (weather/tide/radar APIs, CDN modules): network-first.
+// Same key the page uses when it saves tiles for offline .
+function tileKey(url) {
+  const m = /^https:\/\/server\.arcgisonline\.com\/ArcGIS\/rest\/services\/World_Topo_Map\/MapServer\/tile\/(\d+)\/(\d+)\/(\d+)/.exec(url);
+  return m ? "https://epicfishy.tiles/topo/" + m[1] + "/" + m[2] + "/" + m[3] : null;
+}
+let tilePuts = 0;
+async function tileResponse(request, key) {
+  const cache = await caches.open(TILE_CACHE);
+  const hit = await cache.match(key);
+  if (hit) return hit;
+  const res = await fetch(new Request(request.url, { mode: "cors" }));
+  if (res && res.ok) {
+    cache.put(key, res.clone());
+    if (++tilePuts % 25 === 0) {
+      cache.keys().then((ks) => { if (ks.length > TILE_MAX) ks.slice(0, ks.length - TILE_MAX + 200).forEach((k) => cache.delete(k)); });
+    }
+  }
+  return res;
+}
+
 self.addEventListener("fetch", (event) => {
-  const isAppShell = APP_SHELL.some((p) => event.request.url.endsWith(p.replace("./", "")));
-  if (isAppShell) {
+  if (event.request.method !== "GET") return;
+  const url = event.request.url;
+  const tk = tileKey(url);
+  if (tk) { event.respondWith(tileResponse(event.request, tk).catch(() => Response.error())); return; }
+  const isPage = event.request.mode === "navigate" || /\/(index\.html)?(\?.*)?$/.test(url);
+  const isAppShell = APP_SHELL.some((p) => url.endsWith(p.replace("./", "")));
+  if (isPage) {
+    event.respondWith(
+      fetch(new Request(event.request, { cache: "no-cache" }))
+        .then((res) => {
+          if (res && res.ok) { const copy = res.clone(); caches.open(CACHE_NAME).then((c) => c.put("./index.html", copy)); }
+          return res;
+        })
+        .catch(() => caches.match("./index.html").then((c) => c || caches.match(event.request)))
+    );
+  } else if (isAppShell) {
     event.respondWith(
       caches.match(event.request).then((cached) => cached || fetch(event.request))
     );
